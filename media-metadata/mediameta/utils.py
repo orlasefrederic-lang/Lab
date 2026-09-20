@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import glob
 import os
 import shutil
 import tempfile
 from contextlib import contextmanager
 from pathlib import Path
+
+from .errors import MediaMetaError
 
 IMAGE_SUFFIXES = {
     ".jpg": "JPEG", ".jpeg": "JPEG", ".jpe": "JPEG", ".jfif": "JPEG",
@@ -157,21 +160,42 @@ def guess_format(path) -> str:
 
 
 def is_media_file(path) -> bool:
-    return Path(path).suffix.lower() in MEDIA_SUFFIXES
+    """True for files we recognise, by name or - if the name is unhelpful -
+    by their first bytes, so ``IMG_0001`` without a suffix still counts."""
+    return effective_suffix(path) in MEDIA_SUFFIXES
+
+
+def _expand_wildcards(entry: Path):
+    """Resolve ``*.jpg`` ourselves.
+
+    Unix shells expand wildcards before we ever see them, but the Windows
+    command prompt hands the pattern through verbatim, so the same command
+    has to work in both places.
+    """
+    pattern = str(entry)
+    if not any(character in pattern for character in "*?[") or entry.exists():
+        return [entry]
+    return [Path(match) for match in sorted(glob.glob(pattern, recursive=True))]
 
 
 def iter_media_files(paths, recursive: bool = False):
-    """Expand a mix of files and directories into concrete media files."""
-    for entry in paths:
-        entry = Path(entry)
-        if entry.is_dir():
-            if not recursive:
-                continue
-            for child in sorted(entry.rglob("*")):
-                if child.is_file() and is_media_file(child):
-                    yield child
-        else:
-            yield entry
+    """Expand a mix of files, directories and patterns into media files."""
+    for raw in paths:
+        for entry in _expand_wildcards(Path(raw)):
+            if entry.is_dir():
+                if not recursive:
+                    continue
+                for child in sorted(entry.rglob("*")):
+                    if child.is_file() and is_media_file(child):
+                        yield child
+            elif _came_from_a_pattern(raw) and not is_media_file(entry):
+                continue  # a broad pattern should not drag in text files
+            else:
+                yield entry
+
+
+def _came_from_a_pattern(raw) -> bool:
+    return any(character in str(raw) for character in "*?[")
 
 
 def make_backup(path, suffix: str = ".bak") -> Path:
@@ -206,7 +230,14 @@ def staged_write(target):
         yield temporary
         if target.exists():
             shutil.copystat(target, temporary)
-        os.replace(temporary, target)
+        try:
+            os.replace(temporary, target)
+        except PermissionError as exc:
+            # Windows refuses to replace a file another program still holds.
+            raise MediaMetaError(
+                f"{target.name} is locked by another program (a viewer or "
+                f"editor with the file open?); close it and try again"
+            ) from exc
     finally:
         if temporary.exists():
             temporary.unlink()

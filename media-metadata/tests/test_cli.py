@@ -187,3 +187,44 @@ def test_video_via_cli(mp4, capsys):
     payload = json.loads(capsys.readouterr().out)
     assert payload[0]["common"]["title"] == "Клип"
     assert payload[0]["common"]["album"] == "Отпуск"
+
+
+def test_wildcards_are_expanded(tmp_path, capsys, monkeypatch):
+    """The Windows shell passes *.jpg through untouched, so we expand it."""
+    from PIL import Image
+
+    for name in ("a.jpg", "b.jpg"):
+        Image.new("RGB", (10, 10)).save(tmp_path / name)
+    (tmp_path / "notes.txt").write_text("not media")
+
+    monkeypatch.chdir(tmp_path)
+    assert run("set", "*.jpg", "-s", "artist=Костя") == 0
+    assert capsys.readouterr().out.count("updated") == 2
+    assert read_metadata(tmp_path / "b.jpg").common["artist"] == "Костя"
+
+
+def test_broad_wildcard_skips_non_media(tmp_path, capsys, monkeypatch):
+    from PIL import Image
+
+    Image.new("RGB", (10, 10)).save(tmp_path / "a.jpg")
+    (tmp_path / "notes.txt").write_text("not media")
+
+    monkeypatch.chdir(tmp_path)
+    assert run("show", "*") == 0
+    out = capsys.readouterr().out
+    assert "a.jpg" in out
+    assert "notes.txt" not in out
+
+
+def test_pattern_without_matches(tmp_path, capsys, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    assert run("show", "*.jpg") == 1
+    assert "no files matched" in capsys.readouterr().err
+
+
+def test_console_configuration_is_harmless(capsys):
+    from mediameta.cli import configure_console
+
+    configure_console()
+    print("кириллица")
+    assert "кириллица" in capsys.readouterr().out

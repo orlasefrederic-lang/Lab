@@ -291,7 +291,35 @@ def _report_error(path, exc: Exception) -> None:
     print(f"{path}: {exc}", file=sys.stderr)
 
 
+def configure_console() -> None:
+    """Make sure non-ASCII output survives the terminal.
+
+    The Windows console still defaults to a legacy code page, where a
+    Cyrillic title or the separator dot would raise UnicodeEncodeError
+    instead of being printed. Switching the console and our own streams to
+    UTF-8 fixes both; everywhere else this is a no-op.
+    """
+    if sys.platform == "win32":
+        try:
+            import ctypes
+
+            ctypes.windll.kernel32.SetConsoleOutputCP(65001)
+            ctypes.windll.kernel32.SetConsoleCP(65001)
+        except Exception:
+            pass  # a redirected or unusual console: the reconfigure below still helps
+
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except (ValueError, OSError):
+            pass
+
+
 def main(argv=None) -> int:
+    configure_console()
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
