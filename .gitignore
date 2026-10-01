@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+hardware_*.txt
+hardware_*.html
+hardware_*.json
+build/
+dist/
+*.spec
