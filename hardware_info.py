@@ -35,7 +35,9 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
+import xml.etree.ElementTree as ET
 from collections import Counter, OrderedDict
 
 try:
@@ -43,8 +45,9 @@ try:
 except ImportError:  # не Windows — работает только режим --load-raw
     winreg = None
 
-VERSION = "1.0"
+VERSION = "1.1"
 IS_WINDOWS = sys.platform == "win32"
+CREATE_NO_WINDOW = 0x08000000 if IS_WINDOWS else 0  # без мелькающего окна консоли
 HIDDEN = "‹скрыто›"
 
 
@@ -114,7 +117,7 @@ Q 'sound' $cim 'Win32_SoundDevice' @('Name','Manufacturer','Status','PNPDeviceID
 Q 'keyboard' $cim 'Win32_Keyboard' @('Name','Description','PNPDeviceID')
 Q 'mouse' $cim 'Win32_PointingDevice' @('Name','Manufacturer','PNPDeviceID')
 Q 'usbctrl' $cim 'Win32_USBController' @('Name','Manufacturer','PNPDeviceID')
-Q 'battery' $cim 'Win32_Battery' @('Name','DeviceID','EstimatedChargeRemaining','EstimatedRunTime','BatteryStatus','Chemistry')
+Q 'battery' $cim 'Win32_Battery' @('Name','DeviceID','EstimatedChargeRemaining','EstimatedRunTime','BatteryStatus','Chemistry','DesignCapacity','FullChargeCapacity')
 Q 'battery_static' $wmi 'BatteryStaticData' @('InstanceName','DeviceName','ManufactureName','SerialNumber','DesignedCapacity')
 Q 'battery_full' $wmi 'BatteryFullChargedCapacity' @('InstanceName','FullChargedCapacity')
 Q 'battery_cycles' $wmi 'BatteryCycleCount' @('InstanceName','CycleCount')
@@ -178,10 +181,9 @@ def collect_wmi(timeout=300):
         raise CollectError("Не найден PowerShell (powershell.exe). Он входит в состав Windows 7 SP1 и новее.")
     cmd = [ps, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command",
            "$s = [Console]::In.ReadToEnd(); & ([scriptblock]::Create($s))"]
-    flags = 0x08000000 if IS_WINDOWS else 0  # CREATE_NO_WINDOW: без мелькающего окна
     try:
         proc = subprocess.run(cmd, input=PS_SCRIPT.encode("ascii"), stdout=subprocess.PIPE,
-                              stderr=subprocess.PIPE, timeout=timeout, creationflags=flags)
+                              stderr=subprocess.PIPE, timeout=timeout, creationflags=CREATE_NO_WINDOW)
     except subprocess.TimeoutExpired:
         raise CollectError(f"PowerShell не ответил за {timeout} с.")
     except OSError as exc:
@@ -378,7 +380,49 @@ def display_modes():
     return result
 
 
-def collect_local():
+def parse_battery_report(data):
+    """Разбор XML-отчёта «powercfg /batteryreport /xml»."""
+    if not data:
+        return []
+    result = []
+    for el in ET.fromstring(data).iter():
+        if el.tag.rsplit("}", 1)[-1] != "Battery":
+            continue
+        fields = {c.tag.rsplit("}", 1)[-1]: (c.text or "").strip() for c in el}
+        if "DesignCapacity" not in fields and "FullChargeCapacity" not in fields:
+            continue
+        result.append({
+            "id": fields.get("Id"), "manufacturer": fields.get("Manufacturer"),
+            "serial": fields.get("SerialNumber"), "chemistry": fields.get("Chemistry"),
+            "design": to_int(fields.get("DesignCapacity")), "full": to_int(fields.get("FullChargeCapacity")),
+            "cycles": to_int(fields.get("CycleCount")),
+        })
+    return result
+
+
+def battery_report():
+    """Паспортная и текущая ёмкость батареи из отчёта powercfg.
+
+    WMI-класс BatteryStaticData на многих ноутбуках отвечает «Общий сбой»,
+    а powercfg получает те же сведения напрямую у драйвера батареи.
+    """
+    exe = shutil.which("powercfg") or os.path.join(os.environ.get("SystemRoot", r"C:\Windows"),
+                                                    "System32", "powercfg.exe")
+    fd, path = tempfile.mkstemp(suffix=".xml")
+    os.close(fd)
+    try:
+        subprocess.run([exe, "/batteryreport", "/xml", "/output", path], stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL, timeout=60, creationflags=CREATE_NO_WINDOW)
+        with open(path, "rb") as fh:
+            return parse_battery_report(fh.read())
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+def collect_local(has_battery=False):
     info = {"is_admin": is_admin()}
     if not IS_WINDOWS:
         return info
@@ -393,6 +437,8 @@ def collect_local():
         "edid": read_edids,
         "displays": display_modes,
     }
+    if has_battery:
+        steps["battery_report"] = battery_report
     for key, func in steps.items():
         try:
             info[key] = func()
@@ -757,6 +803,12 @@ def parse_edid(hexstr):
             info["name"] = text
         elif d[3] == 0xFF and text:
             info["serial"] = text
+        elif d[3] == 0xFE and text:
+            info.setdefault("texts", []).append(text)
+    # У матриц ноутбуков модель обычно лежит в строке 0xFE: «AUO» + «B156HAN08.4»
+    models = [t for t in info.get("texts", []) if re.search(r"\d", t) and len(t) >= 5]
+    if models:
+        info["panel"] = models[-1]
     return info
 
 
@@ -787,10 +839,11 @@ class Table:
     """Табличный блок."""
     kind = "table"
 
-    def __init__(self, title, columns, sensitive=(), collapsible=False):
+    def __init__(self, title, columns, sensitive=(), collapsible=False, masked=()):
         self.title = title
         self.columns = list(columns)
         self.sensitive = set(sensitive)
+        self.masked = set(masked)  # столбцы, где при --anon прячутся только MAC-адреса
         self.collapsible = collapsible
         self.rows = []
 
@@ -810,8 +863,8 @@ class Section:
         self.blocks.append(block)
         return block
 
-    def table(self, title, columns, sensitive=(), collapsible=False):
-        block = Table(title, columns, sensitive, collapsible)
+    def table(self, title, columns, sensitive=(), collapsible=False, masked=()):
+        block = Table(title, columns, sensitive, collapsible, masked)
         self.blocks.append(block)
         return block
 
@@ -827,6 +880,9 @@ class Report:
         self.sections = []
 
 
+MAC_IN_ID = re.compile(r"(?<![0-9A-F])[0-9A-F]{12}(?![0-9A-F])", re.I)
+
+
 def anonymize(report):
     report.computer = HIDDEN
     for sec in report.sections:
@@ -837,10 +893,13 @@ def anonymize(report):
                         row[1] = HIDDEN
             else:
                 idx = [i for i, c in enumerate(block.columns) if c in block.sensitive]
+                masked = [i for i, c in enumerate(block.columns) if c in block.masked]
                 for row in block.rows:
                     for i in idx:
                         if row[i]:
                             row[i] = HIDDEN
+                    for i in masked:
+                        row[i] = MAC_IN_ID.sub("XXXXXXXXXXXX", row[i])
 
 
 # ---------------------------------------------------------------------------
@@ -855,6 +914,7 @@ class Ctx:
         self.local = raw.get("local") or {}
         self.collected_at = parse_dt(raw.get("collected_at")) or dt.datetime.now()
         self.facts = OrderedDict()
+        self.battery_complete = False
         self._drivers = None
 
     def rows(self, key):
@@ -1186,6 +1246,11 @@ def build_gpu(ctx):
     return sec
 
 
+GENERIC_MONITOR_NAMES = {"generic pnp monitor", "generic non-pnp monitor", "универсальный монитор pnp",
+                         "универсальный монитор не pnp", "default monitor", "монитор по умолчанию"}
+INTERNAL_OUTPUTS = {6, 11, 13, 2147483648}  # LVDS, eDP, встроенный UDI, внутреннее подключение
+
+
 def build_monitors(ctx):
     sec = Section("monitors", "Мониторы")
     edids = ctx.local.get("edid") or {}
@@ -1207,8 +1272,16 @@ def build_monitors(ctx):
         vendor_code = wmi_string(m.get("ManufacturerName")) or e.get("vendor")
         vendor = MONITOR_VENDORS.get((vendor_code or "").upper())
         product = wmi_string(m.get("ProductCodeID")) or e.get("product")
-        name = wmi_string(m.get("UserFriendlyName")) or e.get("name") or clean(mode.get("monitor"))
+        name = wmi_string(m.get("UserFriendlyName")) or e.get("name")
         serial = wmi_string(m.get("SerialNumberID")) or e.get("serial")
+        panel = e.get("panel")
+        tech = to_int(c.get("VideoOutputTechnology"))
+        if not name or name.casefold() in GENERIC_MONITOR_NAMES:
+            model = " ".join(x for x in (vendor or vendor_code, panel) if x)
+            if tech in INTERNAL_OUTPUTS:
+                name = "Встроенный экран" + (f" {model}" if model else "")
+            else:
+                name = model or clean(mode.get("monitor"))
 
         size_mm = e.get("size_mm")
         if not size_mm and to_int(p.get("MaxHorizontalImageSize")) and to_int(p.get("MaxVerticalImageSize")):
@@ -1229,7 +1302,6 @@ def build_monitors(ctx):
                 current += f", {mode['frequency']} Гц"
             if mode.get("bpp"):
                 current += f", {mode['bpp']} бит"
-        tech = to_int(c.get("VideoOutputTechnology"))
         year = to_int(m.get("YearOfManufacture")) or e.get("year")
         week = to_int(m.get("WeekOfManufacture")) or e.get("week")
         made = None
@@ -1239,6 +1311,7 @@ def build_monitors(ctx):
         kv = sec.kv(f"Монитор {i}" if len(entries) > 1 else None)
         kv.add("Модель", name)
         kv.add("Производитель", f"{vendor} ({vendor_code})" if vendor else vendor_code)
+        kv.add("Модель матрицы", panel)
         kv.add("Код модели", f"{vendor_code or ''}{product or ''}" or None)
         kv.add("Диагональ (по EDID)", diag)
         kv.add("Родное разрешение", native)
@@ -1250,7 +1323,7 @@ def build_monitors(ctx):
         kv.add("Серийный номер", serial, sensitive=True)
         label = name or " ".join(x for x in (vendor or vendor_code, product) if x)
         if label:
-            extra = [x for x in (diag.split(" ")[0] if diag else None, native.split(",")[0] if native else None) if x]
+            extra = [x for x in (diag.split(" ")[0] if diag else None, native) if x]
             summary.append(label + (f" ({', '.join(extra)})" if extra else ""))
     if summary:
         ctx.facts["Монитор" if len(summary) == 1 else "Мониторы"] = "; ".join(summary)
@@ -1463,12 +1536,80 @@ def build_input(ctx):
     return sec
 
 
-def pnp_status(device):
+PNP_STATUSES = {
+    "ok": "работает", "error": "ошибка", "degraded": "работает с ограничениями",
+    "unknown": "состояние неизвестно", "pred fail": "ожидается сбой", "starting": "запускается",
+    "stopping": "останавливается", "service": "обслуживается", "stressed": "перегружено",
+    "nonrecover": "неустранимая ошибка", "no contact": "нет связи", "lost comm": "связь потеряна",
+}
+
+
+def has_no_driver(ctx, device):
+    """Устройство из группы «Другие устройства»: Windows не нашла для него драйвер."""
+    return not device.get("PNPClass") and not ctx.driver_text(device.get("PNPDeviceID"))
+
+
+def pnp_status(ctx, device):
     code = to_int(device.get("ConfigManagerErrorCode"))
-    if not code:
-        status = clean(device.get("Status"))
-        return "работает" if not status or status.upper() == "OK" else status
-    return CM_ERRORS.get(code, f"ошибка (код {code})")
+    if code:
+        return CM_ERRORS.get(code, f"ошибка (код {code})")
+    if has_no_driver(ctx, device):
+        return "драйвер не установлен"
+    status = str(device.get("Status") or "").strip()
+    return PNP_STATUSES.get(status.lower(), status) if status else "работает"
+
+
+# Стандартные службы Bluetooth: 16-битный код из UUID вида {0000XXXX-0000-1000-8000-00805F9B34FB}
+BT_BASE_UUID = re.compile(r"\{0000([0-9A-F]{4})-0000-1000-8000-00805F9B34FB\}", re.I)
+BT_SERVICES = {
+    "1101": "последовательный порт (SPP)", "1103": "удалённый доступ к сети (DUN)",
+    "1105": "передача файлов (OBEX)", "1106": "передача файлов (FTP)", "1108": "гарнитура (HSP)",
+    "110A": "источник звука (A2DP)", "110B": "приёмник звука (A2DP)", "110C": "пульт управления (AVRCP)",
+    "110E": "пульт управления (AVRCP)", "110F": "пульт управления (AVRCP)", "1112": "шлюз гарнитуры (HSP)",
+    "1115": "личная сеть (PAN)", "1116": "точка доступа (NAP)", "111E": "громкая связь (HFP)",
+    "111F": "шлюз громкой связи (HFP)", "1124": "устройство ввода (HID)", "112F": "телефонная книга (PBAP)",
+    "1132": "сообщения (MAP)", "1133": "уведомления о сообщениях (MAP)", "1134": "сообщения (MAP)",
+    "1200": "сведения об устройстве (PnP)", "1800": "общий доступ (GAP)", "1801": "общие атрибуты (GATT)",
+    "180A": "сведения об устройстве", "180F": "уровень заряда батареи", "1812": "устройство ввода (HID)",
+    "FE2C": "Google Fast Pair", "FE95": "служба Xiaomi",
+}
+
+# Служебные каналы Bluetooth-наушников, которые Windows показывает как неизвестные устройства
+DEVICE_NAME_HINTS = [
+    (r"airoha", "канал наушников (чип Airoha) для приложения на телефоне; драйвер не нужен"),
+    (r"^ota\d*$", "канал обновления прошивки Bluetooth-устройства; драйвер не нужен"),
+    (r"xiao ?ai", "канал голосового помощника Xiaomi «Сяо Ай»; драйвер не нужен"),
+    (r"btnotify", "служба уведомлений Bluetooth-гарнитуры (MediaTek); драйвер не нужен"),
+]
+
+
+def device_hint(device):
+    """Подсказка, что это за устройство: (текст, служебный ли это Bluetooth-канал)."""
+    name = clean(device.get("Name")) or ""
+    pid = str(device.get("PNPDeviceID") or "").upper()
+    bluetooth = pid.startswith(("BTHENUM\\", "BTHLEDEVICE\\", "BTHLE\\", "BTHHFENUM\\"))
+    for pattern, text in DEVICE_NAME_HINTS:
+        if re.search(pattern, name, re.I):
+            return text, True
+    if bluetooth:
+        m = BT_BASE_UUID.search(pid)
+        if m and m.group(1) in BT_SERVICES:
+            return f"служба Bluetooth «{BT_SERVICES[m.group(1)]}» сопряжённого устройства; драйвер обычно не нужен", True
+        if "{" in pid:
+            return "фирменная служба Bluetooth-устройства (наушников, телефона); драйвер не нужен", True
+        return "сопряжённое Bluetooth-устройство", True
+    ids = hw_ids(pid)
+    if pid.startswith("ACPI\\"):
+        acpi = pid.split("\\")[1] if pid.count("\\") else ""
+        return f"устройство системной платы ({acpi}); драйвер — в разделе «Чипсет» на сайте производителя", False
+    if pid.startswith("PCI\\"):
+        vendor = PCI_VENDORS.get(ids.split(":")[0]) if ids else None
+        return f"PCI-устройство {ids or ''}{f' ({vendor})' if vendor else ''}; драйвер ищется по коду VEN:DEV", False
+    if pid.startswith(("USB\\", "HID\\")):
+        return f"USB-устройство {ids or ''}; драйвер ищется по коду VID:PID", False
+    if pid.startswith(("SWD\\", "ROOT\\")):
+        return "программное устройство, созданное Windows или программой", False
+    return None, False
 
 
 def build_pnp_class(ctx, sid, title, classes, fact=None):
@@ -1478,7 +1619,7 @@ def build_pnp_class(ctx, sid, title, classes, fact=None):
         table = sec.table(None, ["Устройство", "Производитель", "ID оборудования", "Драйвер", "Состояние"])
         for d in sorted(devices, key=lambda x: str(x.get("Name"))):
             table.add(clean(d.get("Name")), clean(d.get("Manufacturer")), hw_ids(d.get("PNPDeviceID")),
-                      ctx.driver_text(d.get("PNPDeviceID")), pnp_status(d))
+                      ctx.driver_text(d.get("PNPDeviceID")), pnp_status(ctx, d))
         if fact:
             ctx.facts[fact] = "; ".join(clean(d.get("Name")) or "?" for d in devices)
     return sec
@@ -1505,44 +1646,73 @@ def build_usb(ctx):
         for d in sorted(devices, key=lambda x: str(x.get("Name"))):
             cls = d.get("PNPClass")
             table.add(clean(d.get("Name")), PNP_CLASSES.get(cls, cls), hw_ids(d.get("PNPDeviceID")),
-                      clean(d.get("Manufacturer")), pnp_status(d))
+                      clean(d.get("Manufacturer")), pnp_status(ctx, d))
     return sec
+
+
+BATTERY_REPORT_CHEMISTRY = {"LION": "литий-ионная", "LI-ION": "литий-ионная", "LIP": "литий-полимерная",
+                            "LIPO": "литий-полимерная", "PBAC": "свинцово-кислотная", "NICD": "никель-кадмиевая",
+                            "NIMH": "никель-металлгидридная"}
+# Служебные имена из ACPI-таблиц прошивки вместо модели батареи (например, BIF0_9)
+ACPI_BATTERY_ID = re.compile(r"_?(BIF|BIX|BAT|BST|CMB)\d*(_\d+)?", re.I)
 
 
 def build_battery(ctx):
     sec = Section("battery", "Батарея")
     batteries = ctx.rows("battery")
     static = ctx.rows("battery_static")
-    full = {b.get("InstanceName"): b for b in ctx.rows("battery_full")}
+    full_rows = ctx.rows("battery_full")
+    full = {b.get("InstanceName"): b for b in full_rows}
     cycles = {b.get("InstanceName"): b for b in ctx.rows("battery_cycles")}
-    count = max(len(batteries), len(static))
+    reports = [r for r in as_list(ctx.local.get("battery_report")) if isinstance(r, dict)]
+    laptop = to_int(ctx.first("system").get("PCSystemType")) == 2
+    count = max(len(batteries), len(static), len(reports))
+    ctx.battery_complete = count > 0
     summary = []
     for i in range(count):
         b = batteries[i] if i < len(batteries) else {}
         s = static[i] if i < len(static) else {}
+        r = reports[i] if i < len(reports) else {}
         inst = s.get("InstanceName")
-        f = full.get(inst) or (ctx.rows("battery_full")[i] if not inst and i < len(ctx.rows("battery_full")) else {})
+        f = full.get(inst) or (full_rows[i] if not inst and i < len(full_rows) else {})
         c = cycles.get(inst, {})
-        designed, current = to_int(s.get("DesignedCapacity")), to_int(f.get("FullChargedCapacity"))
+        # Источники по убыванию надёжности: root/wmi, отчёт powercfg, Win32_Battery
+        designed = to_int(s.get("DesignedCapacity")) or to_int(r.get("design")) or to_int(b.get("DesignCapacity"))
+        current = (to_int(f.get("FullChargedCapacity")) or to_int(r.get("full"))
+                   or to_int(b.get("FullChargeCapacity")))
+        cycle_count = to_int(c.get("CycleCount")) or to_int(r.get("cycles"))
         charge = to_int(b.get("EstimatedChargeRemaining"))
         runtime = to_int(b.get("EstimatedRunTime"))
-        wear = None
-        if designed and current:
-            wear = max(0.0, 100 - current * 100 / designed)
+        wear = max(0.0, 100 - current * 100 / designed) if designed and current else None
+        if wear is None:
+            ctx.battery_complete = False
+
+        raw_name = clean(s.get("DeviceName")) or clean(r.get("id")) or clean(b.get("Name"))
+        placeholder = bool(raw_name and ACPI_BATTERY_ID.fullmatch(raw_name))
+        manufacturer = clean(s.get("ManufactureName")) or clean(r.get("manufacturer"))
+        if manufacturer and ACPI_BATTERY_ID.fullmatch(manufacturer):
+            manufacturer = None
+        name = raw_name
+        if not raw_name or placeholder:
+            name = "Встроенная батарея ноутбука" if laptop else "Батарея"
+        chemistry = (BATTERY_CHEMISTRY.get(to_int(b.get("Chemistry")))
+                     or BATTERY_REPORT_CHEMISTRY.get(str(r.get("chemistry") or "").upper()))
 
         kv = sec.kv(f"Батарея {i + 1}" if count > 1 else None)
-        kv.add("Название", clean(s.get("DeviceName")) or clean(b.get("Name")))
-        kv.add("Производитель", clean(s.get("ManufactureName")))
+        kv.add("Название", name)
+        kv.add("Обозначение в прошивке", raw_name if placeholder else None)
+        kv.add("Производитель", manufacturer)
         kv.add("Заряд", f"{charge} %" if charge is not None else None)
         kv.add("Состояние", BATTERY_STATUS.get(to_int(b.get("BatteryStatus"))))
         if runtime and runtime < 71582788:  # 71582788 — работа от сети
             kv.add("Оставшееся время", fduration(dt.timedelta(minutes=runtime)))
-        kv.add("Химия", BATTERY_CHEMISTRY.get(to_int(b.get("Chemistry"))))
-        kv.add("Проектная ёмкость", f"{fint(designed)} мВт·ч" if designed else None)
+        kv.add("Химия", chemistry)
+        kv.add("Паспортная ёмкость", f"{fint(designed)} мВт·ч" if designed else None)
         kv.add("Полная ёмкость сейчас", f"{fint(current)} мВт·ч" if current else None)
-        kv.add("Износ", f"{fnum(wear, 1)} %" if wear is not None else None)
-        kv.add("Циклов заряда", to_int(c.get("CycleCount")) or None)
-        kv.add("Серийный номер", clean(s.get("SerialNumber")), sensitive=True)
+        if wear is not None:
+            kv.add("Износ", f"{fnum(wear, 1)} % (осталось {fnum(100 - wear, 1)} % паспортной ёмкости)")
+        kv.add("Циклов заряда", cycle_count or None)
+        kv.add("Серийный номер", clean(s.get("SerialNumber")) or clean(r.get("serial")), sensitive=True)
         parts = [x for x in (f"заряд {charge} %" if charge is not None else None,
                              f"износ {fnum(wear, 1)} %" if wear is not None else None) if x]
         if parts:
@@ -1617,14 +1787,28 @@ def build_tpm(ctx):
 
 def build_problems(ctx):
     sec = Section("problems", "Устройства с неполадками")
-    bad = [d for d in ctx.pnp() if to_int(d.get("ConfigManagerErrorCode")) not in (0, None, 45)]
+    bad = [d for d in ctx.pnp()
+           if to_int(d.get("ConfigManagerErrorCode")) not in (0, None, 45) or has_no_driver(ctx, d)]
     if bad:
-        table = sec.table(None, ["Устройство", "Класс", "Проблема", "ID устройства"])
+        table = sec.table(None, ["Устройство", "Класс", "Проблема", "Что это", "ID устройства"],
+                          masked=["ID устройства"])
+        harmless = 0
         for d in sorted(bad, key=lambda x: str(x.get("Name"))):
             cls = d.get("PNPClass")
+            hint, service = device_hint(d)
+            if service and to_int(d.get("ConfigManagerErrorCode")) in (0, None, 28):
+                harmless += 1
             table.add(clean(d.get("Name")) or "Неизвестное устройство", PNP_CLASSES.get(cls, cls) or "",
-                      pnp_status(d), d.get("PNPDeviceID"))
-        ctx.facts["Устройства с неполадками"] = str(len(bad))
+                      pnp_status(ctx, d), hint, d.get("PNPDeviceID"))
+        fact = str(len(bad))
+        if harmless == len(bad):
+            fact += " (все — служебные каналы Bluetooth, драйвер им не нужен)"
+            sec.notes.append("Это служебные каналы сопряжённых Bluetooth-устройств (наушников, телефона) "
+                             "для их фирменных приложений. На работу компьютера и звук они не влияют. "
+                             "Исчезнут, если удалить эти устройства в параметрах Bluetooth.")
+        elif harmless:
+            fact += f" (из них {harmless} — служебные каналы Bluetooth, драйвер им не нужен)"
+        ctx.facts["Устройства с неполадками"] = fact
     return sec
 
 
@@ -1637,11 +1821,16 @@ def build_devices(ctx):
         groups.setdefault(PNP_CLASSES.get(cls, cls) or "Другие устройства", []).append(d)
     for title in sorted(groups, key=lambda t: (t == "Другие устройства", t.casefold())):
         items = groups[title]
-        table = sec.table(f"{title} ({len(items)})", ["Устройство", "Производитель", "Драйвер", "Состояние"],
-                          collapsible=True)
+        other = title == "Другие устройства"
+        columns = ["Устройство", "Производитель", "Драйвер", "Состояние"]
+        table = sec.table(f"{title} ({len(items)})", columns + (["Что это", "ID устройства"] if other else []),
+                          collapsible=True, masked=["ID устройства"])
         for d in sorted(items, key=lambda x: str(x.get("Name"))):
-            table.add(clean(d.get("Name")) or "Неизвестное устройство", clean(d.get("Manufacturer")),
-                      ctx.driver_text(d.get("PNPDeviceID")), pnp_status(d))
+            cells = [clean(d.get("Name")) or "Неизвестное устройство", clean(d.get("Manufacturer")),
+                     ctx.driver_text(d.get("PNPDeviceID")), pnp_status(ctx, d)]
+            if other:
+                cells += [device_hint(d)[0], d.get("PNPDeviceID")]
+            table.add(*cells)
     return sec
 
 
@@ -1658,6 +1847,11 @@ QUERY_NAMES = {
     "tpm": "TPM", "pnp": "список устройств", "drivers": "драйверы",
     "disk_health": "SMART-показатели накопителей",
 }
+LOCAL_NAMES = {
+    "firmware": "режим загрузки", "secure_boot": "Secure Boot", "display_version": "выпуск Windows",
+    "ubr": "номер обновления Windows", "gpu_registry": "видеопамять из реестра", "edid": "EDID мониторов",
+    "displays": "режимы мониторов", "battery_report": "отчёт о батарее (powercfg)",
+}
 
 
 def build_notes(ctx, raw):
@@ -1669,7 +1863,7 @@ def build_notes(ctx, raw):
                          "с параметром --elevate или «от имени администратора».")
     has_battery = bool(ctx.rows("battery"))
     for key, message in ctx.errors.items():
-        if key.startswith("battery_") and not has_battery:
+        if key.startswith("battery_") and (not has_battery or ctx.battery_complete):
             continue
         if key in ("tpm", "disk_health") and admin is False:
             continue
@@ -1677,7 +1871,9 @@ def build_notes(ctx, raw):
             continue
         sec.notes.append(f"Не удалось получить данные «{QUERY_NAMES.get(key, key)}»: {str(message).strip()}")
     for key, message in (ctx.local.get("errors") or {}).items():
-        sec.notes.append(f"Ошибка при чтении «{key}»: {message}")
+        if key == "battery_report" and ctx.battery_complete:
+            continue
+        sec.notes.append(f"Ошибка при чтении «{LOCAL_NAMES.get(key, key)}»: {message}")
     info = [f"данные собраны {fdatetime(ctx.collected_at)}"]
     if raw.get("duration"):
         info.append(f"за {fnum(raw['duration'], 1)} с")
@@ -1727,6 +1923,9 @@ def _cut(text, width):
     return text if len(text) <= width else text[:width - 1] + "…"
 
 
+TEXT_COLUMN_LIMITS = {"Что это": 100}
+
+
 def render_text(report, width=80):
     out = ["=" * width, report.title.upper().center(width).rstrip(),
            f"Компьютер: {report.computer}    Дата: {report.generated}".center(width).rstrip(), "=" * width]
@@ -1742,10 +1941,13 @@ def render_text(report, width=80):
                 out += [f"  {(r[0] + ':').ljust(label_w)}  {r[1]}" for r in block.rows]
             else:
                 cols = [i for i, _ in enumerate(block.columns) if any(row[i] for row in block.rows)]
-                widths = [min(60, max(len(block.columns[i]), *(len(row[i]) for row in block.rows))) for i in cols]
+                widths = [min(TEXT_COLUMN_LIMITS.get(block.columns[i], 60),
+                              max(len(block.columns[i]), *(len(row[i]) for row in block.rows))) for i in cols]
 
                 def line(cells):
-                    return "  " + "  ".join(_cut(cells[i], w).ljust(w) for i, w in zip(cols, widths)).rstrip()
+                    parts = [cells[i] if n == len(cols) - 1 else _cut(cells[i], w).ljust(w)
+                             for n, (i, w) in enumerate(zip(cols, widths))]
+                    return ("  " + "  ".join(parts)).rstrip()
 
                 out += [line(block.columns), "  " + "  ".join("-" * w for w in widths)]
                 out += [line(row) for row in block.rows]
@@ -1786,6 +1988,7 @@ table { border-collapse:collapse; width:100%; font-size:14px; }
            border-bottom:1px solid var(--line); padding:6px 14px 6px 0; white-space:nowrap; }
 .data td { border-bottom:1px solid var(--line); padding:5px 14px 5px 0; vertical-align:top; }
 .data tr:last-child td { border-bottom:none; }
+.data td.id { font-family:Consolas, "Cascadia Mono", monospace; font-size:12.5px; word-break:break-all; min-width:220px; }
 details { border-top:1px solid var(--line); }
 details:last-of-type { border-bottom:1px solid var(--line); }
 summary { cursor:pointer; padding:8px 0; font-weight:600; font-size:14px; }
@@ -1823,7 +2026,8 @@ def render_html(report):
                 out.append("</table>")
                 continue
             cols = [i for i, _ in enumerate(block.columns) if any(row[i] for row in block.rows)]
-            status_col = block.columns.index("Состояние") if "Состояние" in block.columns else None
+            status_col = next((block.columns.index(c) for c in ("Состояние", "Проблема") if c in block.columns), None)
+            id_col = block.columns.index("ID устройства") if "ID устройства" in block.columns else None
             body = ['<div class="scroll"><table class="data"><tr>']
             body += [f"<th>{e(block.columns[i])}</th>" for i in cols]
             body.append("</tr>")
@@ -1831,6 +2035,7 @@ def render_html(report):
                 cells = []
                 for i in cols:
                     cls = ' class="bad"' if i == status_col and row[i] not in OK_STATES else ""
+                    cls = ' class="id"' if i == id_col else cls
                     cells.append(f"<td{cls}>{e(row[i])}</td>")
                 body.append("<tr>" + "".join(cells) + "</tr>")
             body.append("</table></div>")
@@ -1947,7 +2152,7 @@ def run(args, argv):
         print("Собираю сведения об оборудовании, это займёт от 10 секунд до минуты…", file=sys.stderr)
         started = time.time()
         wmi = collect_wmi()
-        local = collect_local()
+        local = collect_local(has_battery=bool((wmi.get("data") or {}).get("battery")))
         raw = {"collected_at": dt.datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
                "duration": round(time.time() - started, 1), "python": sys.version.split()[0],
                "wmi": wmi, "local": local}
