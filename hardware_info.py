@@ -45,7 +45,7 @@ try:
 except ImportError:  # не Windows — работает только режим --load-raw
     winreg = None
 
-VERSION = "1.1"
+VERSION = "1.2"
 IS_WINDOWS = sys.platform == "win32"
 CREATE_NO_WINDOW = 0x08000000 if IS_WINDOWS else 0  # без мелькающего окна консоли
 HIDDEN = "‹скрыто›"
@@ -411,10 +411,14 @@ def battery_report():
     fd, path = tempfile.mkstemp(suffix=".xml")
     os.close(fd)
     try:
-        subprocess.run([exe, "/batteryreport", "/xml", "/output", path], stdout=subprocess.DEVNULL,
-                       stderr=subprocess.DEVNULL, timeout=60, creationflags=CREATE_NO_WINDOW)
+        proc = subprocess.run([exe, "/batteryreport", "/output", path, "/xml"], stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE, timeout=60, creationflags=CREATE_NO_WINDOW)
         with open(path, "rb") as fh:
-            return parse_battery_report(fh.read())
+            data = fh.read()
+        if not data:
+            message = decode_console(proc.stdout + proc.stderr).strip()
+            raise RuntimeError(f"powercfg не создал отчёт (код {proc.returncode})" + (f": {message}" if message else ""))
+        return parse_battery_report(data)
     finally:
         try:
             os.remove(path)
@@ -915,6 +919,7 @@ class Ctx:
         self.collected_at = parse_dt(raw.get("collected_at")) or dt.datetime.now()
         self.facts = OrderedDict()
         self.battery_complete = False
+        self.battery_noted = False
         self._drivers = None
 
     def rows(self, key):
@@ -944,7 +949,9 @@ class Ctx:
         return text
 
     def pnp(self):
-        return [d for d in self.rows("pnp") if d.get("Present") is not False]
+        # HTREE\ROOT\0 — служебный корень дерева устройств; Диспетчер устройств его не показывает
+        return [d for d in self.rows("pnp") if d.get("Present") is not False
+                and not str(d.get("PNPDeviceID") or "").upper().startswith("HTREE\\")]
 
 
 def detect_vm(manufacturer, model):
@@ -1686,6 +1693,12 @@ def build_battery(ctx):
         wear = max(0.0, 100 - current * 100 / designed) if designed and current else None
         if wear is None:
             ctx.battery_complete = False
+            if r and not to_int(r.get("design")):
+                sec.notes.append("Прошивка не сообщает Windows паспортную ёмкость батареи (её нет даже в отчёте "
+                                 "powercfg), поэтому износ посчитать нельзя. Паспортная ёмкость указана на "
+                                 "наклейке батареи и в характеристиках ноутбука; износ = 100 % − полная ёмкость "
+                                 "сейчас ÷ паспортная × 100 %.")
+                ctx.battery_noted = True
 
         raw_name = clean(s.get("DeviceName")) or clean(r.get("id")) or clean(b.get("Name"))
         placeholder = bool(raw_name and ACPI_BATTERY_ID.fullmatch(raw_name))
@@ -1717,6 +1730,9 @@ def build_battery(ctx):
                              f"износ {fnum(wear, 1)} %" if wear is not None else None) if x]
         if parts:
             summary.append(", ".join(parts))
+    if count and not ctx.battery_complete and "battery_report" in ctx.local and not reports:
+        sec.notes.append("В отчёте powercfg нет сведений о батарее, поэтому износ посчитать нельзя.")
+        ctx.battery_noted = True
     if summary:
         ctx.facts["Батарея"] = "; ".join(summary)
     return sec
@@ -1863,7 +1879,7 @@ def build_notes(ctx, raw):
                          "с параметром --elevate или «от имени администратора».")
     has_battery = bool(ctx.rows("battery"))
     for key, message in ctx.errors.items():
-        if key.startswith("battery_") and (not has_battery or ctx.battery_complete):
+        if key.startswith("battery_") and (not has_battery or ctx.battery_complete or ctx.battery_noted):
             continue
         if key in ("tpm", "disk_health") and admin is False:
             continue
