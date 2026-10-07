@@ -45,7 +45,7 @@ try:
 except ImportError:  # не Windows — работает только режим --load-raw
     winreg = None
 
-VERSION = "1.2"
+VERSION = "1.3"
 IS_WINDOWS = sys.platform == "win32"
 CREATE_NO_WINDOW = 0x08000000 if IS_WINDOWS else 0  # без мелькающего окна консоли
 HIDDEN = "‹скрыто›"
@@ -417,6 +417,9 @@ def battery_report():
             data = fh.read()
         if not data:
             message = decode_console(proc.stdout + proc.stderr).strip()
+            if "0x422" in message:
+                message += (" Отключена «Служба политики диагностики» (DPS): без неё powercfg не строит "
+                            "отчёт о батарее.")
             raise RuntimeError(f"powercfg не создал отчёт (код {proc.returncode})" + (f": {message}" if message else ""))
         return parse_battery_report(data)
     finally:
@@ -424,6 +427,116 @@ def battery_report():
             os.remove(path)
         except OSError:
             pass
+
+
+BATTERY_CAPACITY_RELATIVE = 0x40000000
+BATTERY_UNKNOWN_CAPACITY = 0xFFFFFFFF
+
+
+def battery_ioctl():
+    """Сведения о батарее напрямую от драйвера (IOCTL_BATTERY_QUERY_INFORMATION).
+
+    Так их получает сама Windows для значка батареи. Способ не зависит ни от
+    WMI-класса BatteryStaticData, ни от службы политики диагностики, без
+    которой не работает отчёт powercfg.
+    """
+    u32, i32, ptr = ctypes.c_uint32, ctypes.c_int32, ctypes.c_void_p
+    setupapi = ctypes.WinDLL("setupapi", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+    class GUID(ctypes.Structure):
+        _fields_ = [("Data1", u32), ("Data2", ctypes.c_uint16), ("Data3", ctypes.c_uint16),
+                    ("Data4", ctypes.c_ubyte * 8)]
+
+    class SP_DEVICE_INTERFACE_DATA(ctypes.Structure):
+        _fields_ = [("cbSize", u32), ("InterfaceClassGuid", GUID), ("Flags", u32), ("Reserved", ctypes.c_size_t)]
+
+    class BATTERY_QUERY_INFORMATION(ctypes.Structure):
+        _fields_ = [("BatteryTag", u32), ("InformationLevel", i32), ("AtRate", i32)]
+
+    class BATTERY_INFORMATION(ctypes.Structure):
+        _fields_ = [("Capabilities", u32), ("Technology", ctypes.c_ubyte), ("Reserved", ctypes.c_ubyte * 3),
+                    ("Chemistry", ctypes.c_ubyte * 4), ("DesignedCapacity", u32), ("FullChargedCapacity", u32),
+                    ("DefaultAlert1", u32), ("DefaultAlert2", u32), ("CriticalBias", u32), ("CycleCount", u32)]
+
+    setupapi.SetupDiGetClassDevsW.restype = ptr
+    setupapi.SetupDiGetClassDevsW.argtypes = [ctypes.POINTER(GUID), ctypes.c_wchar_p, ptr, u32]
+    setupapi.SetupDiEnumDeviceInterfaces.argtypes = [ptr, ptr, ctypes.POINTER(GUID), u32,
+                                                     ctypes.POINTER(SP_DEVICE_INTERFACE_DATA)]
+    setupapi.SetupDiGetDeviceInterfaceDetailW.argtypes = [ptr, ctypes.POINTER(SP_DEVICE_INTERFACE_DATA), ptr, u32,
+                                                          ctypes.POINTER(u32), ptr]
+    setupapi.SetupDiDestroyDeviceInfoList.argtypes = [ptr]
+    kernel32.CreateFileW.restype = ptr
+    kernel32.CreateFileW.argtypes = [ctypes.c_wchar_p, u32, u32, ptr, u32, u32, ptr]
+    kernel32.DeviceIoControl.argtypes = [ptr, u32, ptr, u32, ptr, u32, ctypes.POINTER(u32), ptr]
+    kernel32.CloseHandle.argtypes = [ptr]
+
+    invalid = ctypes.c_void_p(-1).value
+    ioctl_query_tag, ioctl_query_info = 0x294040, 0x294044
+    # GUID_DEVICE_BATTERY {72631E54-78A4-11D0-BCF7-00AA00B7B32A}
+    guid = GUID(0x72631E54, 0x78A4, 0x11D0, (ctypes.c_ubyte * 8)(0xBC, 0xF7, 0x00, 0xAA, 0x00, 0xB7, 0xB3, 0x2A))
+    hdev = setupapi.SetupDiGetClassDevsW(ctypes.byref(guid), None, None, 0x2 | 0x10)  # PRESENT | DEVICEINTERFACE
+    if not hdev or hdev == invalid:
+        raise OSError(ctypes.get_last_error(), "не удалось получить список батарей")
+    result = []
+    try:
+        for index in range(8):
+            did = SP_DEVICE_INTERFACE_DATA()
+            did.cbSize = ctypes.sizeof(did)
+            if not setupapi.SetupDiEnumDeviceInterfaces(hdev, None, ctypes.byref(guid), index, ctypes.byref(did)):
+                break
+            need = u32(0)
+            setupapi.SetupDiGetDeviceInterfaceDetailW(hdev, ctypes.byref(did), None, 0, ctypes.byref(need), None)
+            if need.value < 8:
+                continue
+            detail = ctypes.create_string_buffer(need.value)
+            # cbSize структуры SP_DEVICE_INTERFACE_DETAIL_DATA_W: 8 в 64-битном процессе, 6 в 32-битном
+            ctypes.cast(detail, ctypes.POINTER(u32))[0] = 8 if ctypes.sizeof(ptr) == 8 else 6
+            if not setupapi.SetupDiGetDeviceInterfaceDetailW(hdev, ctypes.byref(did), detail, need, None, None):
+                continue
+            path = ctypes.wstring_at(ctypes.addressof(detail) + 4)
+            handle = None
+            for access in (0xC0000000, 0x80000000):  # чтение и запись, затем только чтение
+                handle = kernel32.CreateFileW(path, access, 0x3, None, 3, 0x80, None)  # OPEN_EXISTING
+                if handle and handle != invalid:
+                    break
+                handle = None
+            if not handle:
+                continue
+            try:
+                returned, wait, tag = u32(0), u32(0), u32(0)
+                if not kernel32.DeviceIoControl(handle, ioctl_query_tag, ctypes.byref(wait), 4, ctypes.byref(tag), 4,
+                                                ctypes.byref(returned), None) or not tag.value:
+                    continue
+
+                def query(level, out):
+                    q = BATTERY_QUERY_INFORMATION(tag.value, level, 0)
+                    return kernel32.DeviceIoControl(handle, ioctl_query_info, ctypes.byref(q), ctypes.sizeof(q),
+                                                    ctypes.byref(out), ctypes.sizeof(out), ctypes.byref(returned), None)
+
+                def text(level):
+                    buf = ctypes.create_unicode_buffer(128)
+                    return clean(buf.value) if query(level, buf) else None
+
+                info = BATTERY_INFORMATION()
+                if not query(0, info):  # уровень BatteryInformation
+                    continue
+
+                def capacity(value):
+                    return value if value and value != BATTERY_UNKNOWN_CAPACITY else None
+
+                result.append({
+                    "id": text(4), "manufacturer": text(6), "serial": text(8),  # имя, производитель, серийный номер
+                    "chemistry": bytes(info.Chemistry).decode("ascii", "ignore").strip("\x00 "),
+                    "design": capacity(info.DesignedCapacity), "full": capacity(info.FullChargedCapacity),
+                    "cycles": info.CycleCount or None,
+                    "relative": bool(info.Capabilities & BATTERY_CAPACITY_RELATIVE),
+                })
+            finally:
+                kernel32.CloseHandle(handle)
+    finally:
+        setupapi.SetupDiDestroyDeviceInfoList(hdev)
+    return result
 
 
 def collect_local(has_battery=False):
@@ -442,10 +555,15 @@ def collect_local(has_battery=False):
         "displays": display_modes,
     }
     if has_battery:
-        steps["battery_report"] = battery_report
+        steps["battery_ioctl"] = battery_ioctl
+        # Отчёт powercfg — запасной путь, если драйвер не отдал паспортную ёмкость
+        steps["battery_report"] = lambda: (None if any(b.get("design") for b in info.get("battery_ioctl") or [])
+                                           else battery_report())
     for key, func in steps.items():
         try:
-            info[key] = func()
+            value = func()
+            if value is not None:
+                info[key] = value
         except Exception as exc:  # отдельная неудача не должна ломать весь отчёт
             info.setdefault("errors", {})[key] = str(exc)
     return info
@@ -1671,7 +1789,14 @@ def build_battery(ctx):
     full_rows = ctx.rows("battery_full")
     full = {b.get("InstanceName"): b for b in full_rows}
     cycles = {b.get("InstanceName"): b for b in ctx.rows("battery_cycles")}
-    reports = [r for r in as_list(ctx.local.get("battery_report")) if isinstance(r, dict)]
+    # Сведения от драйвера батареи, недостающее — из отчёта powercfg
+    ioctl = [x for x in as_list(ctx.local.get("battery_ioctl")) if isinstance(x, dict)]
+    powercfg = [x for x in as_list(ctx.local.get("battery_report")) if isinstance(x, dict)]
+    reports = []
+    for i in range(max(len(ioctl), len(powercfg))):
+        a = ioctl[i] if i < len(ioctl) else {}
+        p = powercfg[i] if i < len(powercfg) else {}
+        reports.append({k: a.get(k) if a.get(k) not in (None, "", 0) else p.get(k) for k in set(a) | set(p)})
     laptop = to_int(ctx.first("system").get("PCSystemType")) == 2
     count = max(len(batteries), len(static), len(reports))
     ctx.battery_complete = count > 0
@@ -1694,8 +1819,8 @@ def build_battery(ctx):
         if wear is None:
             ctx.battery_complete = False
             if r and not to_int(r.get("design")):
-                sec.notes.append("Прошивка не сообщает Windows паспортную ёмкость батареи (её нет даже в отчёте "
-                                 "powercfg), поэтому износ посчитать нельзя. Паспортная ёмкость указана на "
+                sec.notes.append("Прошивка не сообщает Windows паспортную ёмкость батареи (драйвер батареи её "
+                                 "не отдаёт), поэтому износ посчитать нельзя. Паспортная ёмкость указана на "
                                  "наклейке батареи и в характеристиках ноутбука; износ = 100 % − полная ёмкость "
                                  "сейчас ÷ паспортная × 100 %.")
                 ctx.battery_noted = True
@@ -1720,8 +1845,9 @@ def build_battery(ctx):
         if runtime and runtime < 71582788:  # 71582788 — работа от сети
             kv.add("Оставшееся время", fduration(dt.timedelta(minutes=runtime)))
         kv.add("Химия", chemistry)
-        kv.add("Паспортная ёмкость", f"{fint(designed)} мВт·ч" if designed else None)
-        kv.add("Полная ёмкость сейчас", f"{fint(current)} мВт·ч" if current else None)
+        unit = "усл. ед." if r.get("relative") else "мВт·ч"  # некоторые батареи сообщают ёмкость в условных единицах
+        kv.add("Паспортная ёмкость", f"{fint(designed)} {unit}" if designed else None)
+        kv.add("Полная ёмкость сейчас", f"{fint(current)} {unit}" if current else None)
         if wear is not None:
             kv.add("Износ", f"{fnum(wear, 1)} % (осталось {fnum(100 - wear, 1)} % паспортной ёмкости)")
         kv.add("Циклов заряда", cycle_count or None)
@@ -1730,8 +1856,9 @@ def build_battery(ctx):
                              f"износ {fnum(wear, 1)} %" if wear is not None else None) if x]
         if parts:
             summary.append(", ".join(parts))
-    if count and not ctx.battery_complete and "battery_report" in ctx.local and not reports:
-        sec.notes.append("В отчёте powercfg нет сведений о батарее, поэтому износ посчитать нельзя.")
+    if count and not ctx.battery_complete and not reports and (
+            "battery_report" in ctx.local or "battery_ioctl" in ctx.local):
+        sec.notes.append("Драйвер батареи не отдал сведения о ёмкости, поэтому износ посчитать нельзя.")
         ctx.battery_noted = True
     if summary:
         ctx.facts["Батарея"] = "; ".join(summary)
@@ -1867,6 +1994,7 @@ LOCAL_NAMES = {
     "firmware": "режим загрузки", "secure_boot": "Secure Boot", "display_version": "выпуск Windows",
     "ubr": "номер обновления Windows", "gpu_registry": "видеопамять из реестра", "edid": "EDID мониторов",
     "displays": "режимы мониторов", "battery_report": "отчёт о батарее (powercfg)",
+    "battery_ioctl": "сведения о батарее от драйвера",
 }
 
 
@@ -1887,7 +2015,7 @@ def build_notes(ctx, raw):
             continue
         sec.notes.append(f"Не удалось получить данные «{QUERY_NAMES.get(key, key)}»: {str(message).strip()}")
     for key, message in (ctx.local.get("errors") or {}).items():
-        if key == "battery_report" and ctx.battery_complete:
+        if key in ("battery_report", "battery_ioctl") and ctx.battery_complete:
             continue
         sec.notes.append(f"Ошибка при чтении «{LOCAL_NAMES.get(key, key)}»: {message}")
     info = [f"данные собраны {fdatetime(ctx.collected_at)}"]
