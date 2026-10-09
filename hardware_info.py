@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Сведения об оборудовании компьютера (Windows 10/11).
+Сведения об оборудовании компьютера (Windows 10/11 и Linux).
 
 Собирает подробную информацию обо всём установленном железе: система и корпус,
 BIOS/UEFI, материнская плата, процессор, оперативная память (по модулям),
@@ -10,13 +10,17 @@ BIOS/UEFI, материнская плата, процессор, операти
 приводы, TPM, а также полный список устройств из Диспетчера устройств
 с версиями драйверов и отдельным списком неисправных устройств.
 
-Сторонние библиотеки не нужны: данные берутся из WMI/CIM через встроенный
-в Windows PowerShell, а также из реестра и WinAPI (через ctypes).
+Сторонние библиотеки не нужны. В Windows данные берутся из WMI/CIM через
+встроенный PowerShell, а также из реестра и WinAPI (через ctypes). В Linux —
+напрямую из ядра (/sys, /proc), таблиц прошивки SMBIOS и NVMe-контроллера.
+
+Раздел «Проверка состояния» подсказывает, не б/у ли железо: износ батареи,
+наработка и объём записанного на диск, ошибки SMART, память и устройства.
 
 Примеры запуска:
     python hardware_info.py              отчёт в консоль + файлы TXT, HTML, JSON
     python hardware_info.py --open       то же и сразу открыть HTML-отчёт
-    python hardware_info.py --elevate    перезапуск с правами администратора
+    python hardware_info.py --elevate    с правами администратора (в Linux — root через sudo)
     python hardware_info.py --anon       скрыть серийные номера, MAC, IP и т. п.
     python hardware_info.py --help       все параметры
 """
@@ -27,12 +31,17 @@ import argparse
 import codecs
 import ctypes
 import datetime as dt
+import getpass
+import gzip
 import html
 import json
 import math
 import os
+import platform
 import re
 import shutil
+import socket
+import struct
 import subprocess
 import sys
 import tempfile
@@ -45,8 +54,9 @@ try:
 except ImportError:  # не Windows — работает только режим --load-raw
     winreg = None
 
-VERSION = "1.3"
+VERSION = "2.0"
 IS_WINDOWS = sys.platform == "win32"
+IS_LINUX = sys.platform.startswith("linux")
 CREATE_NO_WINDOW = 0x08000000 if IS_WINDOWS else 0  # без мелькающего окна консоли
 HIDDEN = "‹скрыто›"
 
@@ -208,7 +218,7 @@ GPU_CLASS_KEY = r"SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc
 
 def is_admin():
     if not IS_WINDOWS:
-        return False
+        return hasattr(os, "geteuid") and os.geteuid() == 0
     try:
         return bool(ctypes.windll.shell32.IsUserAnAdmin())
     except Exception:
@@ -539,7 +549,44 @@ def battery_ioctl():
     return result
 
 
-def collect_local(has_battery=False):
+def nvme_health_windows(disk_numbers):
+    """Журнал SMART/Health NVMe-дисков напрямую у контроллера (нужны права администратора).
+
+    Стандартные счётчики Windows часто не сообщают наработку и объём записанного,
+    а в журнале самого диска они есть всегда.
+    """
+    u32, ptr = ctypes.c_uint32, ctypes.c_void_p
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.restype = ptr
+    kernel32.CreateFileW.argtypes = [ctypes.c_wchar_p, u32, u32, ptr, u32, u32, ptr]
+    kernel32.DeviceIoControl.argtypes = [ptr, u32, ptr, u32, ptr, u32, ctypes.POINTER(u32), ptr]
+    kernel32.CloseHandle.argtypes = [ptr]
+    invalid = ctypes.c_void_p(-1).value
+    result = {}
+    for number in disk_numbers:
+        handle = kernel32.CreateFileW(f"\\\\.\\PhysicalDrive{number}", 0xC0000000, 0x3, None, 3, 0, None)
+        if not handle or handle == invalid:
+            continue
+        try:
+            # STORAGE_PROPERTY_QUERY (8 байт) + STORAGE_PROTOCOL_SPECIFIC_DATA (40 байт) + журнал (512 байт)
+            buf = ctypes.create_string_buffer(8 + 40 + 512)
+            struct.pack_into("<II", buf, 0, 50, 0)  # StorageDeviceProtocolSpecificProperty, PropertyStandardQuery
+            struct.pack_into("<10I", buf, 8, 3, 2, 2, 0, 40, 512, 0, 0, 0, 0)  # NVMe, лог-страница 02h
+            returned = u32(0)
+            if not kernel32.DeviceIoControl(handle, 0x2D1400, buf, len(buf), buf, len(buf),  # IOCTL_STORAGE_QUERY_PROPERTY
+                                            ctypes.byref(returned), None):
+                continue
+            version, size = struct.unpack_from("<II", buf, 0)
+            offset, length = struct.unpack_from("<II", buf, 8 + 16)
+            if version != 48 or size != 48 or offset < 40 or length < 512:
+                continue
+            result[str(number)] = parse_nvme_health(buf.raw[8 + offset:8 + offset + 512])
+        finally:
+            kernel32.CloseHandle(handle)
+    return result
+
+
+def collect_local(has_battery=False, nvme_disks=()):
     info = {"is_admin": is_admin()}
     if not IS_WINDOWS:
         return info
@@ -554,6 +601,8 @@ def collect_local(has_battery=False):
         "edid": read_edids,
         "displays": display_modes,
     }
+    if nvme_disks and info["is_admin"]:
+        steps["nvme_health"] = lambda: nvme_health_windows(nvme_disks)
     if has_battery:
         steps["battery_ioctl"] = battery_ioctl
         # Отчёт powercfg — запасной путь, если драйвер не отдал паспортную ёмкость
@@ -567,6 +616,888 @@ def collect_local(has_battery=False):
         except Exception as exc:  # отдельная неудача не должна ломать весь отчёт
             info.setdefault("errors", {})[key] = str(exc)
     return info
+
+
+# ---------------------------------------------------------------------------
+# Сбор данных в Linux: напрямую из ядра (/sys, /proc) и таблиц прошивки SMBIOS
+# ---------------------------------------------------------------------------
+
+LINUX_ROOT = "/"  # откуда читаются /sys, /proc, /etc и /run (другой корень — только в тестах)
+
+
+def _lp(path):
+    return os.path.join(LINUX_ROOT, path.lstrip("/"))
+
+
+def lread(path, binary=False):
+    try:
+        with open(_lp(path), "rb") as fh:
+            data = fh.read()
+    except OSError:
+        return None
+    return data if binary else data.decode("utf-8", "replace").strip()
+
+
+def lexists(path):
+    return os.path.exists(_lp(path))
+
+
+def llist(path):
+    try:
+        return sorted(os.listdir(_lp(path)))
+    except OSError:
+        return []
+
+
+def lreal(path):
+    return os.path.realpath(_lp(path))
+
+
+def llink(path):
+    """Имя, на которое указывает ссылка в /sys (например, драйвер устройства)."""
+    try:
+        return os.path.basename(os.readlink(_lp(path)))
+    except OSError:
+        return None
+
+
+def lhex(path):
+    try:
+        return int(lread(path) or "", 16)
+    except ValueError:
+        return None
+
+
+def run_tool(args, timeout=30):
+    """Вывод внешней программы (smartctl, ip, nvidia-smi) или None, если её нет."""
+    if not shutil.which(args[0]):
+        return None
+    try:
+        proc = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return proc.stdout.decode("utf-8", "replace")
+
+
+class SmbiosStruct:
+    """Одна структура SMBIOS: байты формата и набор строк."""
+
+    def __init__(self, raw, strings):
+        self.raw, self.strings = raw, strings
+
+    def _int(self, off, size):
+        return int.from_bytes(self.raw[off:off + size], "little") if off + size <= len(self.raw) else None
+
+    def byte(self, off):
+        return self._int(off, 1)
+
+    def word(self, off):
+        return self._int(off, 2)
+
+    def dword(self, off):
+        return self._int(off, 4)
+
+    def qword(self, off):
+        return self._int(off, 8)
+
+    def text(self, off):
+        idx = self.byte(off)
+        return clean(self.strings[idx - 1]) if idx and idx <= len(self.strings) else None
+
+
+def parse_smbios(data):
+    """Таблицы SMBIOS (те же, что читает dmidecode): [(тип, SmbiosStruct)]."""
+    result, i = [], 0
+    while i + 4 <= len(data):
+        stype, length = data[i], data[i + 1]
+        if length < 4:
+            break
+        end = data.find(b"\x00\x00", i + length)
+        if end < 0:
+            break
+        raw = data[i + length:end]
+        strings = [s.decode("latin-1").strip() for s in raw.split(b"\x00")] if raw else []
+        result.append((stype, SmbiosStruct(data[i:i + length], strings)))
+        if stype == 127:  # конец таблицы
+            break
+        i = end + 2
+    return result
+
+
+def smbios_date(value):
+    m = re.match(r"(\d{1,2})/(\d{1,2})/(\d{2,4})$", value or "")
+    if not m:
+        return None
+    year = int(m.group(3))
+    if year < 100:
+        year += 1900 if year >= 70 else 2000
+    return f"{year:04d}-{int(m.group(1)):02d}-{int(m.group(2)):02d}T00:00:00"
+
+
+def smbios_uuid(b):
+    if len(b) != 16 or b in (b"\x00" * 16, b"\xff" * 16):
+        return None
+    return (f"{int.from_bytes(b[0:4], 'little'):08X}-{int.from_bytes(b[4:6], 'little'):04X}-"
+            f"{int.from_bytes(b[6:8], 'little'):04X}-{b[8:10].hex().upper()}-{b[10:16].hex().upper()}")
+
+
+# Форм-фактор модуля памяти: коды SMBIOS -> коды WMI, по которым строится отчёт
+SMBIOS_TO_CIM_FORM = {3: 7, 9: 8, 11: 21, 12: 11, 13: 12, 14: 13}
+
+
+def linux_smbios(data):
+    out = {"bios": [], "product": [], "baseboard": [], "enclosure": [], "sockets": [], "memarray": [], "memory": []}
+    for stype, s in parse_smbios(data):
+        if stype == 0:
+            out["bios"].append({
+                "Manufacturer": s.text(0x04), "SMBIOSBIOSVersion": s.text(0x05),
+                "ReleaseDate": smbios_date(s.text(0x08)),
+                "EmbeddedControllerMajorVersion": s.byte(0x16), "EmbeddedControllerMinorVersion": s.byte(0x17)})
+        elif stype == 1:
+            out["product"].append({
+                "Vendor": s.text(0x04), "Name": s.text(0x05), "Version": s.text(0x06),
+                "IdentifyingNumber": s.text(0x07), "UUID": smbios_uuid(s.raw[0x08:0x18]),
+                "SKU": s.text(0x19), "Family": s.text(0x1A)})
+        elif stype == 2:
+            out["baseboard"].append({"Manufacturer": s.text(0x04), "Product": s.text(0x05),
+                                     "Version": s.text(0x06), "SerialNumber": s.text(0x07)})
+        elif stype == 3:
+            kind = s.byte(0x05)
+            out["enclosure"].append({"Manufacturer": s.text(0x04), "ChassisTypes": [kind & 0x7F] if kind else [],
+                                     "SerialNumber": s.text(0x07), "SMBIOSAssetTag": s.text(0x08)})
+        elif stype == 4:
+            status = s.byte(0x18)
+            if status is not None and not status & 0x40:  # пустой сокет
+                continue
+            cores, threads = s.byte(0x23), s.byte(0x25)
+            if cores == 0xFF:
+                cores = s.word(0x2A)
+            if threads == 0xFF:
+                threads = s.word(0x2E)
+            out["sockets"].append({"SocketDesignation": s.text(0x04), "Manufacturer": s.text(0x07),
+                                   "Name": s.text(0x10), "MaxSpeed": s.word(0x14), "CurrentSpeed": s.word(0x16),
+                                   "Cores": cores, "Threads": threads})
+        elif stype == 16:
+            max_kb = s.dword(0x07)
+            if max_kb == 0x80000000:
+                ext = s.qword(0x0F)
+                max_kb = ext // 1024 if ext else None
+            out["memarray"].append({"Use": s.byte(0x05), "MaxCapacity": max_kb, "MemoryDevices": s.word(0x0D)})
+        elif stype == 17:
+            size = s.word(0x0C)
+            if not size:  # пустой слот
+                continue
+            if size == 0xFFFF:
+                capacity = None
+            elif size == 0x7FFF:
+                capacity = ((s.dword(0x1C) or 0) & 0x7FFFFFFF) * 1024 * 1024
+            else:
+                capacity = (size & 0x7FFF) * (1024 if size & 0x8000 else 1024 * 1024)
+            speed, configured = s.word(0x15), s.word(0x20)
+            if speed == 0xFFFF:
+                speed = s.dword(0x54)
+            if configured == 0xFFFF:
+                configured = s.dword(0x58)
+            data_width, total_width = s.word(0x0A), s.word(0x08)
+            out["memory"].append({
+                "DeviceLocator": s.text(0x10), "BankLabel": s.text(0x11), "Capacity": capacity,
+                "Speed": speed or None, "ConfiguredClockSpeed": configured or None,
+                "Manufacturer": s.text(0x17), "SerialNumber": s.text(0x18), "PartNumber": s.text(0x1A),
+                "SMBIOSMemoryType": s.byte(0x12), "FormFactor": SMBIOS_TO_CIM_FORM.get(s.byte(0x0E)),
+                "DataWidth": None if data_width in (None, 0xFFFF) else data_width,
+                "TotalWidth": None if total_width in (None, 0xFFFF) else total_width,
+                "ConfiguredVoltage": s.word(0x26) or None})
+    return out
+
+
+def smbios_version():
+    ep = lread("/sys/firmware/dmi/tables/smbios_entry_point", binary=True) or b""
+    if ep.startswith(b"_SM3_") and len(ep) > 8:
+        return ep[7], ep[8]
+    if ep.startswith(b"_SM_") and len(ep) > 7:
+        return ep[6], ep[7]
+    return None, None
+
+
+def dmi_id(name):
+    return clean(lread(f"/sys/class/dmi/id/{name}"))
+
+
+def parse_ids(text):
+    """База названий устройств pci.ids / usb.ids."""
+    vendors, devices, subsystems = {}, {}, {}
+    vendor = device = None
+    for line in text.splitlines():
+        if not line or line.startswith("#"):
+            continue
+        if not line.startswith("\t"):
+            m = re.match(r"([0-9a-fA-F]{4})\s+(.+)", line)
+            if not m:  # начались классы устройств — производители закончились
+                break
+            vendor, device = m.group(1).upper(), None
+            vendors[vendor] = m.group(2).strip()
+        elif line.startswith("\t\t"):
+            m = re.match(r"\t\t([0-9a-fA-F]{4})\s+([0-9a-fA-F]{4})\s+(.+)", line)
+            if m and vendor and device:
+                subsystems[(vendor, device, m.group(1).upper(), m.group(2).upper())] = m.group(3).strip()
+        else:
+            m = re.match(r"\t([0-9a-fA-F]{4})\s+(.+)", line)
+            if m and vendor:
+                device = m.group(1).upper()
+                devices[(vendor, device)] = m.group(2).strip()
+    return {"vendors": vendors, "devices": devices, "subsystems": subsystems}
+
+
+def load_ids(kind):
+    folders = ("/usr/share/hwdata", "/usr/share/misc", "/usr/share", f"/var/lib/{kind}utils")
+    for folder in folders:
+        for suffix in ("", ".gz"):
+            data = lread(f"{folder}/{kind}.ids{suffix}", binary=True)
+            if not data:
+                continue
+            if suffix:
+                try:
+                    data = gzip.decompress(data)
+                except OSError:
+                    continue
+            return parse_ids(data.decode("utf-8", "replace"))
+    return None
+
+
+def pretty_pci_name(name):
+    """«GA106M [GeForce RTX 3060 Mobile / Max-Q]» -> «GeForce RTX 3060 Mobile / Max-Q (GA106M)»."""
+    m = re.fullmatch(r"(.+?)\s*\[(.+)\]", name or "")
+    if m and " " in m.group(2):  # в скобках торговое название, а не короткий код вроде [E18]
+        return f"{m.group(2)} ({m.group(1)})"
+    return name
+
+
+def pci_pnp_class(cls):
+    base, sub = cls >> 16, (cls >> 8) & 0xFF
+    if base == 0x01:
+        return "HDC" if sub == 0x06 else "SCSIAdapter"
+    if (base, sub) == (0x0C, 0x03):
+        return "USB"
+    if (base, sub) == (0x0D, 0x11):
+        return "Bluetooth"
+    return {0x02: "Net", 0x03: "Display", 0x04: "MEDIA", 0x09: "HIDClass", 0x0D: "Net",
+            0x10: "SecurityDevices"}.get(base, "System")
+
+
+def linux_pci(ids):
+    devices = []
+    for addr in llist("/sys/bus/pci/devices"):
+        base = f"/sys/bus/pci/devices/{addr}"
+        ven, dev = lhex(base + "/vendor"), lhex(base + "/device")
+        if ven is None or dev is None:
+            continue
+        sub_ven, sub_dev, cls = lhex(base + "/subsystem_vendor"), lhex(base + "/subsystem_device"), lhex(base + "/class") or 0
+        v, d = f"{ven:04X}", f"{dev:04X}"
+        name = vendor = None
+        if ids:
+            vendor = ids["vendors"].get(v)
+            name = ids["devices"].get((v, d))
+            if sub_ven is not None and cls >> 16 in (0x02, 0x0D):  # у сетевых карт понятнее имя модели
+                name = ids["subsystems"].get((v, d, f"{sub_ven:04X}", f"{sub_dev or 0:04X}")) or name
+        driver = llink(base + "/driver")
+        module = llink(base + "/driver/module")
+        devices.append({
+            "addr": addr, "class": cls, "name": pretty_pci_name(name) or f"PCI-устройство {v}:{d}",
+            "vendor": vendor or PCI_VENDORS.get(v), "short_vendor": PCI_VENDORS.get(v),
+            "driver": driver, "driver_version": lread(f"/sys/module/{module}/version") if module else None,
+            "pnp": f"PCI\\VEN_{v}&DEV_{d}&SUBSYS_{sub_dev or 0:04X}{sub_ven or 0:04X}\\{addr}",
+        })
+    return devices
+
+
+USB_CLASS_PNP = {0x01: "MEDIA", 0x02: "Ports", 0x03: "HIDClass", 0x06: "Image", 0x07: "Printer", 0x08: "USB",
+                 0x09: "USB", 0x0A: "Ports", 0x0B: "SmartCardReader", 0x0E: "Camera"}
+FINGERPRINT_VENDORS = {"06CB", "27C6", "138A", "10A5", "1C7A", "2808", "298D"}
+
+
+def linux_usb(ids):
+    devices = []
+    for name in llist("/sys/bus/usb/devices"):
+        if ":" in name:  # интерфейсы, а не устройства
+            continue
+        base = f"/sys/bus/usb/devices/{name}"
+        vid, pid = (lread(base + "/idVendor") or "").upper(), (lread(base + "/idProduct") or "").upper()
+        if not vid:
+            continue
+        ifaces = []
+        for iface in llist(base):
+            if iface.startswith(name + ":"):
+                ib = f"{base}/{iface}"
+                ifaces.append((lhex(ib + "/bInterfaceClass"), lhex(ib + "/bInterfaceSubClass"), llink(ib + "/driver")))
+        dev_class = lhex(base + "/bDeviceClass") or 0
+        classes = [c for c, _, _ in ifaces if c is not None] or [dev_class]
+        root = name.startswith("usb")
+        speed = to_int((lread(base + "/speed") or "").split(".")[0])
+        if root or dev_class == 0x09:
+            pnp_class = "USB"
+        elif 0x0E in classes:
+            pnp_class = "Camera"
+        elif any(c == 0xE0 and sc == 0x01 for c, sc, _ in ifaces):
+            pnp_class = "Bluetooth"
+        else:
+            pnp_class = next((USB_CLASS_PNP[c] for c in classes if c in USB_CLASS_PNP), None)
+            if not pnp_class:
+                pnp_class = "Biometric" if vid in FINGERPRINT_VENDORS else "USBDevice"
+        product, maker = clean(lread(base + "/product")), clean(lread(base + "/manufacturer"))
+        if ids:
+            product = product or ids["devices"].get((vid, pid))
+            maker = maker or ids["vendors"].get(vid)
+        if root:
+            product = f"Корневой USB-концентратор (USB {'3.x' if speed and speed >= 5000 else '2.0' if speed == 480 else '1.1'})"
+        drivers = [drv for _, _, drv in ifaces if drv]
+        devices.append({
+            "busname": name, "class": pnp_class, "name": product or f"USB-устройство {vid}:{pid}", "vendor": maker,
+            "driver": drivers[0] if drivers else None, "ifaces": ifaces,
+            "pnp": f"USB\\ROOT_HUB\\{name}" if root else f"USB\\VID_{vid}&PID_{pid}\\{name}",
+        })
+    return devices
+
+
+def linux_cpu_caches():
+    totals, seen = {}, set()
+    for cpu in llist("/sys/devices/system/cpu"):
+        if not re.fullmatch(r"cpu\d+", cpu):
+            continue
+        for index in llist(f"/sys/devices/system/cpu/{cpu}/cache"):
+            base = f"/sys/devices/system/cpu/{cpu}/cache/{index}"
+            level, kind = to_int(lread(base + "/level")), lread(base + "/type")
+            m = re.match(r"(\d+)\s*([KMG]?)", lread(base + "/size") or "")
+            if not level or kind == "Instruction" or not m:
+                continue
+            key = (level, kind, lread(base + "/shared_cpu_list"))
+            if key in seen:
+                continue
+            seen.add(key)
+            kb = int(m.group(1)) * {"": 1 / 1024, "K": 1, "M": 1024, "G": 1024 * 1024}[m.group(2)]
+            totals[level] = totals.get(level, 0) + int(kb)
+    return totals
+
+
+def linux_cpu(sockets_smbios):
+    procs = []
+    for block in (lread("/proc/cpuinfo") or "").split("\n\n"):
+        info = {}
+        for line in block.splitlines():
+            if ":" in line:
+                key, value = line.split(":", 1)
+                info[key.strip()] = value.strip()
+        if info.get("processor") is not None:
+            procs.append(info)
+    flags = set()
+    if procs:
+        flags = set(procs[0].get("flags", "").split()) | set(procs[0].get("vmx flags", "").split())
+    machine = platform.machine().lower()
+    x86 = machine in ("x86_64", "amd64", "i386", "i686")
+    sockets = OrderedDict()
+    for p in procs:
+        sockets.setdefault(p.get("physical id", "0"), []).append(p)
+    caches = linux_cpu_caches()
+    base_khz = to_int(lread("/sys/devices/system/cpu/cpu0/cpufreq/base_frequency"))
+    max_khz = to_int(lread("/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq"))
+    rows = []
+    for n, items in enumerate(sockets.values() or [[]]):
+        first = items[0] if items else {}
+        sm = sockets_smbios[n] if n < len(sockets_smbios) else {}
+        name = clean(first.get("model name")) or sm.get("Name") or clean(first.get("Hardware"))
+        core_ids = {p.get("core id") for p in items if p.get("core id") is not None}
+        base_mhz = base_khz // 1000 if base_khz else sm.get("CurrentSpeed")
+        if not base_mhz and name:
+            m = re.search(r"@\s*([\d.]+)\s*GHz", name)
+            base_mhz = round(float(m.group(1)) * 1000) if m else None
+        caption = None
+        if first.get("cpu family"):
+            caption = f"Family {first.get('cpu family')} Model {first.get('model')} Stepping {first.get('stepping')}"
+        rows.append({
+            "Name": name, "Manufacturer": first.get("vendor_id") or sm.get("Manufacturer"), "Caption": caption,
+            "NumberOfCores": len(core_ids) or sm.get("Cores") or len(items) or None,
+            "NumberOfLogicalProcessors": len(items) or sm.get("Threads"),
+            "MaxClockSpeed": base_mhz, "MaxTurboMHz": max_khz // 1000 if max_khz else None,
+            "L2CacheSize": caches.get(2, 0) // max(1, len(sockets)) or None,
+            "L3CacheSize": caches.get(3, 0) // max(1, len(sockets)) or None,
+            "SocketDesignation": sm.get("SocketDesignation"),
+            "Architecture": {"x86_64": 9, "amd64": 9, "i386": 0, "i686": 0, "aarch64": 12, "armv7l": 5}.get(machine),
+            "AddressWidth": 64 if machine in ("x86_64", "amd64", "aarch64") else 32,
+            "VirtualizationFirmwareEnabled": bool(flags & {"vmx", "svm"}) if x86 else None,
+            "SecondLevelAddressTranslationExtensions": bool(flags & {"ept", "npt"}) if x86 else None,
+        })
+    return rows, "hypervisor" in flags
+
+
+def udev_props(devnum):
+    """Свойства устройства из базы udev (тип раздела, файловая система, серийный номер)."""
+    props = {}
+    for line in (lread(f"/run/udev/data/b{devnum}") or "").splitlines() if devnum else []:
+        if line.startswith("E:") and "=" in line:
+            key, value = line[2:].split("=", 1)
+            props[key] = value
+    return props
+
+
+def parse_smartctl(js):
+    r = {}
+    passed = (js.get("smart_status") or {}).get("passed")
+    r["Health"] = None if passed is None else (0 if passed else 2)
+    r["Temperature"] = (js.get("temperature") or {}).get("current")
+    r["PowerOnHours"] = (js.get("power_on_time") or {}).get("hours")
+    r["StartStopCycleCount"] = js.get("power_cycle_count")
+    nv = js.get("nvme_smart_health_information_log") or {}
+    if nv:
+        r["Wear"] = nv.get("percentage_used")
+        r["DataWrittenBytes"] = (nv.get("data_units_written") or 0) * 512000 or None
+        r["ReadErrorsUncorrected"] = nv.get("media_errors")
+        r["CriticalWarning"] = nv.get("critical_warning")
+        r["UnsafeShutdowns"] = nv.get("unsafe_shutdowns")
+    attrs = {a.get("id"): a for a in (js.get("ata_smart_attributes") or {}).get("table", [])}
+    if attrs:
+        def raw(aid):
+            return ((attrs.get(aid) or {}).get("raw") or {}).get("value")
+
+        r["ReallocatedSectors"], r["PendingSectors"] = raw(5), raw(197)
+        r["ReadErrorsUncorrected"] = raw(198)
+        if raw(241):
+            r["DataWrittenBytes"] = raw(241) * (js.get("logical_block_size") or 512)
+        for aid in (231, 233, 177, 169):  # «остаток ресурса» у разных производителей SSD
+            value = (attrs.get(aid) or {}).get("value")
+            if value is not None and 0 <= value <= 100:
+                r["Wear"] = 100 - value
+                break
+    return {k: v for k, v in r.items() if v is not None}
+
+
+def parse_nvme_health(log):
+    """Журнал NVMe SMART/Health (512 байт, лог-страница 02h)."""
+    def u128(off):
+        return int.from_bytes(log[off:off + 16], "little")
+
+    kelvin = int.from_bytes(log[1:3], "little")
+    return {
+        "Health": 1 if log[0] else 0, "CriticalWarning": log[0], "Temperature": kelvin - 273 if kelvin else None,
+        "Wear": log[5], "DataWrittenBytes": u128(48) * 512000, "StartStopCycleCount": u128(112),
+        "PowerOnHours": u128(128), "UnsafeShutdowns": u128(144), "ReadErrorsUncorrected": u128(160),
+    }
+
+
+def nvme_smart_log(controller):
+    """Журнал SMART/Health прямо у NVMe-контроллера (команда Get Log Page, как у nvme-cli)."""
+    import fcntl
+    buf = ctypes.create_string_buffer(512)
+    cmd = bytearray(struct.pack("<BBHIIIQQIIIIIIIIII",
+                                0x02, 0, 0, 0xFFFFFFFF,  # opcode Get Log Page, все пространства имён
+                                0, 0, 0, ctypes.addressof(buf), 0, 512,
+                                (127 << 16) | 0x02,  # 128 двойных слов, журнал 02h SMART/Health
+                                0, 0, 0, 0, 0, 0, 0))
+    fd = os.open(controller, os.O_RDONLY)
+    try:
+        fcntl.ioctl(fd, 0xC0484E41, cmd)  # NVME_IOCTL_ADMIN_CMD
+    finally:
+        os.close(fd)
+    return parse_nvme_health(buf.raw)
+
+
+def linux_smart(name, errors):
+    out = run_tool(["smartctl", "-j", "-a", f"/dev/{name}"])
+    if out:
+        try:
+            parsed = parse_smartctl(json.loads(out))
+            if parsed:
+                return parsed
+        except ValueError:
+            pass
+    m = re.match(r"(nvme\d+)", name)
+    if m:
+        try:
+            return nvme_smart_log(_lp(f"/dev/{m.group(1)}"))
+        except (OSError, ValueError) as exc:
+            errors.setdefault("smart", f"{name}: {exc}")
+    elif not shutil.which("smartctl"):
+        errors.setdefault("smart", "для SMART-показателей SATA- и USB-дисков установите smartmontools "
+                                   "(sudo apt install smartmontools)")
+    return {}
+
+
+def unescape_mount(path):
+    return re.sub(r"\\(\d{3})", lambda m: chr(int(m.group(1), 8)), path)
+
+
+def linux_storage(is_root, errors):
+    mounts = {}
+    for line in (lread("/proc/mounts") or "").splitlines():
+        parts = line.split()
+        if len(parts) >= 3 and parts[0].startswith("/dev/"):
+            mounts.setdefault(parts[0], []).append((unescape_mount(parts[1]), parts[2]))
+    disks, partitions, volumes, health, cdroms = [], [], [], [], []
+
+    def volume(mount, fs, label, disk_id, removable):
+        try:
+            st = os.statvfs(mount)
+            size, free = st.f_blocks * st.f_frsize, st.f_bavail * st.f_frsize
+        except OSError:
+            size = free = None
+        volumes.append({"DeviceID": mount, "VolumeName": label, "FileSystem": fs, "Size": size, "FreeSpace": free,
+                        "DriveType": 2 if removable else 3, "DiskNumber": disk_id})
+
+    for name in llist("/sys/block"):
+        base = f"/sys/block/{name}"
+        if name.startswith("sr"):
+            vendor, model = clean(lread(base + "/device/vendor")), clean(lread(base + "/device/model"))
+            cdroms.append({"Name": " ".join(x for x in (vendor, model) if x) or name, "Drive": f"/dev/{name}",
+                           "Manufacturer": vendor})
+            continue
+        if name.startswith(("loop", "ram", "zram", "dm-", "md", "fd", "nbd", "zd")):
+            continue
+        size = (to_int(lread(base + "/size")) or 0) * 512
+        if not size:
+            continue
+        devpath = lreal(base + "/device")
+        removable = lread(base + "/removable") == "1"
+        udev = udev_props(lread(base + "/dev"))
+        if name.startswith("nvme"):
+            bus, model = 17, clean(lread(base + "/device/model"))
+            serial, firmware = clean(lread(base + "/device/serial")), clean(lread(base + "/device/firmware_rev"))
+        elif name.startswith("mmcblk"):
+            bus, model = 13, clean(lread(base + "/device/name"))
+            serial, firmware = clean(lread(base + "/device/serial")), clean(lread(base + "/device/fwrev"))
+        else:
+            bus = (7 if "/usb" in devpath else 11 if "/ata" in devpath else 14 if "/virtio" in devpath or name.startswith("vd")
+                   else 10 if "/sas" in devpath else 1)
+            vendor, model = clean(lread(base + "/device/vendor")), clean(lread(base + "/device/model"))
+            if vendor and model and vendor.upper() != "ATA" and not model.upper().startswith(vendor.upper()):
+                model = f"{vendor} {model}"
+            serial, firmware = clean(udev.get("ID_SERIAL_SHORT")), clean(lread(base + "/device/rev"))
+        media = None if bus in (7, 14) else (3 if lread(base + "/queue/rotational") == "1" else 4)
+        disk_id = str(len(disks))
+        smart = linux_smart(name, errors) if is_root and bus != 14 else {}  # у виртуальных дисков SMART нет
+        disks.append({"DeviceId": disk_id, "FriendlyName": model or name, "SerialNumber": serial, "MediaType": media,
+                      "BusType": bus, "Size": size, "HealthStatus": smart.pop("Health", None),
+                      "FirmwareVersion": firmware})
+        if smart:
+            health.append(dict(smart, DeviceId=disk_id))
+        for part in llist(base):
+            pbase = f"{base}/{part}"
+            if not part.startswith(name) or not lexists(pbase + "/partition"):
+                continue
+            pu = udev_props(lread(pbase + "/dev"))
+            ptype = (pu.get("ID_PART_ENTRY_TYPE") or "").lower()
+            mps = mounts.get(f"/dev/{part}", [])
+            partitions.append({
+                "DiskNumber": disk_id, "PartitionNumber": to_int(lread(pbase + "/partition")),
+                "MountPoint": mps[0][0] if mps else None, "Size": (to_int(lread(pbase + "/size")) or 0) * 512,
+                "GptType": "{" + ptype + "}" if re.fullmatch(r"[0-9a-f-]{36}", ptype) else None,
+                "MbrType": int(ptype, 16) if re.fullmatch(r"0x[0-9a-f]+", ptype) else None,
+                "IsSystem": ptype == "c12a7328-f81f-11d2-ba4b-00a0c93ec93b",
+                "IsBoot": any(mp == "/" for mp, _ in mps),
+                "FileSystem": pu.get("ID_FS_TYPE"), "Label": pu.get("ID_FS_LABEL"),
+            })
+            for mount, fs in mps:
+                volume(mount, fs, pu.get("ID_FS_LABEL"), disk_id, removable)
+        for mount, fs in mounts.get(f"/dev/{name}", []):  # файловая система на весь диск (бывает у флешек)
+            volume(mount, fs, udev.get("ID_FS_LABEL"), disk_id, removable)
+    return disks, partitions, volumes, health, cdroms
+
+
+def linux_batteries():
+    rows, details = [], []
+    for supply in llist("/sys/class/power_supply"):
+        base = f"/sys/class/power_supply/{supply}"
+        if lread(base + "/type") != "Battery" or lread(base + "/scope") == "Device":  # батареи мышек и т. п.
+            continue
+
+        def num(field):
+            return to_int(lread(f"{base}/{field}"))
+
+        design, full, unit = num("energy_full_design"), num("energy_full"), None  # мкВт·ч
+        if design or full:
+            design, full = (design or 0) / 1000, (full or 0) / 1000
+        else:  # некоторые батареи сообщают ёмкость в мкА·ч
+            design, full, volts = num("charge_full_design") or 0, num("charge_full") or 0, num("voltage_min_design")
+            if volts:
+                design, full = design * volts / 1e9, full * volts / 1e9
+            else:
+                design, full, unit = design / 1000, full / 1000, "мА·ч"
+        rows.append({
+            "Name": clean(lread(base + "/model_name")) or supply, "DeviceID": supply,
+            "EstimatedChargeRemaining": num("capacity"),
+            "BatteryStatus": {"Charging": 6, "Discharging": 1, "Full": 3, "Not charging": 2}.get(lread(base + "/status") or ""),
+            "Chemistry": {"Li-ion": 6, "Li-poly": 8, "NiMH": 5, "NiCd": 4}.get(lread(base + "/technology") or ""),
+        })
+        details.append({
+            "id": clean(lread(base + "/model_name")), "manufacturer": clean(lread(base + "/manufacturer")),
+            "serial": clean(lread(base + "/serial_number")), "design": round(design) or None,
+            "full": round(full) or None, "cycles": num("cycle_count") or None, "unit": unit,
+        })
+    return rows, details
+
+
+CONNECTOR_TECH = {"VGA": 0, "DVI": 4, "HDMI": 5, "LVDS": 6, "DP": 10, "eDP": 11, "DSI": 11}
+
+
+def linux_displays(pci_by_addr):
+    edids, displays, ids, conns = {}, [], [], []
+    for conn in llist("/sys/class/drm"):
+        m = re.fullmatch(r"card(\d+)-(.+)", conn)
+        if not m or lread(f"/sys/class/drm/{conn}/status") != "connected":
+            continue
+        key = conn.upper()
+        edid = lread(f"/sys/class/drm/{conn}/edid", binary=True)
+        if edid and len(edid) >= 128:
+            edids[key] = edid.hex()
+        card = os.path.basename(lreal(f"/sys/class/drm/card{m.group(1)}/device"))
+        kind = re.match(r"[A-Za-z]+", m.group(2))
+        displays.append({"instance": key, "adapter": (pci_by_addr.get(card) or {}).get("name")})
+        ids.append({"InstanceName": key, "Active": True})
+        conns.append({"InstanceName": key, "VideoOutputTechnology": CONNECTOR_TECH.get(kind.group(0) if kind else "")})
+    return edids, displays, ids, conns
+
+
+def linux_input():
+    keyboards, mice = [], []
+    buses = {"0011": "PS/2 (встроенная)", "0003": "USB", "0018": "I2C (встроенная)", "0005": "Bluetooth"}
+    for block in (lread("/proc/bus/input/devices") or "").split("\n\n"):
+        info = {"handlers": [], "ev": 0}
+        for line in block.splitlines():
+            if line.startswith("I:"):
+                info.update(re.findall(r"(\w+)=(\w+)", line))
+            elif line.startswith("N:"):
+                info["name"] = line.split("=", 1)[1].strip().strip('"')
+            elif line.startswith("H:"):
+                info["handlers"] = line.split("=", 1)[1].split()
+            elif line.startswith("B: EV="):
+                info["ev"] = int(line.split("=", 1)[1], 16)
+        if not info.get("name"):
+            continue
+        vid, pid = info.get("Vendor", "0000").upper(), info.get("Product", "0000").upper()
+        bus = info.get("Bus", "")
+        row = {"Name": info["name"], "Description": buses.get(bus),  # у встроенных PS/2-устройств коды условные
+               "PNPDeviceID": f"HID\\VID_{vid}&PID_{pid}" if vid != "0000" and bus in ("0003", "0005", "0018") else None}
+        if "kbd" in info["handlers"] and info["ev"] & 0x100000:  # есть автоповтор клавиш — это клавиатура
+            keyboards.append(row)
+        elif any(h.startswith("mouse") for h in info["handlers"]):
+            mice.append(row)
+    return keyboards, mice
+
+
+def linux_network(pci_by_addr, usb_by_name):
+    addresses = {}
+    out = run_tool(["ip", "-j", "addr"])
+    if out:
+        try:
+            for item in json.loads(out):
+                addresses[item.get("ifname")] = [a.get("local") for a in item.get("addr_info", []) if a.get("local")]
+        except ValueError:
+            pass
+    gateways = {}
+    for line in (lread("/proc/net/route") or "").splitlines()[1:]:
+        f = line.split()
+        if len(f) > 2 and f[1] == "00000000" and f[2] != "00000000":
+            gateways[f[0]] = socket.inet_ntoa(struct.pack("<I", int(f[2], 16)))
+    dns = re.findall(r"^nameserver\s+(\S+)", lread("/etc/resolv.conf") or "", re.M)
+    adapters, configs = [], []
+    for index, ifname in enumerate(llist("/sys/class/net")):
+        base = f"/sys/class/net/{ifname}"
+        if not lexists(base + "/device"):  # виртуальные интерфейсы (lo, docker, VPN)
+            continue
+        dev = os.path.basename(lreal(base + "/device"))
+        src = pci_by_addr.get(dev) or usb_by_name.get(dev.split(":")[0]) or {}
+        wireless = lexists(base + "/wireless") or lexists(base + "/phy80211")
+        state = lread(base + "/operstate")
+        up = state == "up" or (state == "unknown" and lread(base + "/carrier") == "1")
+        speed = to_int(lread(base + "/speed"))
+        adapters.append({
+            "Index": index, "Name": src.get("name") or ifname, "Manufacturer": src.get("vendor"),
+            "MACAddress": (lread(base + "/address") or "").upper() or None,
+            "Speed": speed * 1_000_000 if speed and speed > 0 else None, "NetConnectionID": ifname,
+            "NetConnectionStatus": 2 if up else 7, "AdapterType": "Wi-Fi" if wireless else "Ethernet 802.3",
+            "PNPDeviceID": src.get("pnp"),
+        })
+        if addresses.get(ifname):
+            configs.append({"Index": index, "IPAddress": addresses[ifname], "DefaultIPGateway": gateways.get(ifname),
+                            "DNSServerSearchOrder": dns})
+    return adapters, configs
+
+
+def linux_sound(pci, usb):
+    codecs = {}
+    for card in llist("/proc/asound"):
+        if not re.fullmatch(r"card\d+", card):
+            continue
+        dev = os.path.basename(lreal(f"/sys/class/sound/{card}/device"))
+        for item in llist(f"/proc/asound/{card}"):
+            if item.startswith("codec#"):
+                m = re.match(r"Codec:\s*(.+)", lread(f"/proc/asound/{card}/{item}") or "")
+                if m:
+                    codecs.setdefault(dev.split(":")[0], []).append(m.group(1).strip())
+    rows = []
+    for d in pci:
+        if d["class"] >> 8 in (0x0401, 0x0403):
+            rows.append({"Name": d["name"], "Manufacturer": d["vendor"], "PNPDeviceID": d["pnp"],
+                         "Status": "OK" if d["driver"] else "нет драйвера", "Codecs": codecs.get(d["addr"])})
+    for d in usb:
+        if d["class"] == "MEDIA":
+            rows.append({"Name": d["name"], "Manufacturer": d["vendor"], "PNPDeviceID": d["pnp"],
+                         "Status": "OK" if d["driver"] else "нет драйвера", "Codecs": codecs.get(d["busname"])})
+    return rows
+
+
+def linux_gpus(pci):
+    nvidia = {}
+    out = run_tool(["nvidia-smi", "--query-gpu=pci.bus_id,name,memory.total,driver_version",
+                    "--format=csv,noheader,nounits"])
+    for line in (out or "").splitlines():
+        f = [x.strip() for x in line.split(",")]
+        if len(f) == 4:
+            nvidia[f[0].lower()[-12:]] = f
+    rows = []
+    for d in pci:
+        if d["class"] >> 16 != 0x03:
+            continue
+        nv = nvidia.get(d["addr"].lower()[-12:])
+        name = nv[1] if nv else d["name"]
+        if not nv and d["short_vendor"] and not name.upper().startswith(d["short_vendor"].upper()):
+            name = f"{d['short_vendor']} {name}"
+        vram = to_int(lread(f"/sys/bus/pci/devices/{d['addr']}/mem_info_vram_total"))  # AMD
+        if nv and to_int(nv[2]):
+            vram = to_int(nv[2]) * 1024 * 1024
+        driver = " ".join(x for x in (d["driver"], nv[3] if nv else d["driver_version"]) if x)
+        rows.append({"Name": name, "AdapterCompatibility": d["vendor"], "VRAM": vram, "DriverVersion": driver or None,
+                     "PNPDeviceID": d["pnp"], "Status": "OK" if d["driver"] else "нет драйвера"})
+    return rows
+
+
+LAPTOP_CHASSIS = {8, 9, 10, 11, 14, 30, 31, 32}
+DESKTOP_CHASSIS = {3, 4, 5, 6, 7, 13, 15, 16, 35, 36}
+
+
+def collect_linux():
+    started = time.time()
+    is_root = os.geteuid() == 0
+    data, errors = {}, {}
+    local = {"is_admin": is_root}
+
+    def guard(key, func, default=None):
+        try:
+            return func()
+        except Exception as exc:  # отдельная неудача не должна ломать весь отчёт
+            errors[key] = str(exc)
+            return default
+
+    # Таблицы прошивки: модули памяти, серийные номера, сокет процессора (нужны права root)
+    raw_smbios = lread("/sys/firmware/dmi/tables/DMI", binary=True)
+    sm = guard("smbios", lambda: linux_smbios(raw_smbios), {}) if raw_smbios else {}
+    if not raw_smbios and is_root:
+        errors["smbios"] = "таблицы SMBIOS недоступны"
+
+    def first(key):
+        return (sm.get(key) or [{}])[0]
+
+    product, board, enclosure, bios = first("product"), first("baseboard"), first("enclosure"), first("bios")
+    chassis = [c for c in enclosure.get("ChassisTypes", [])] or [to_int(dmi_id("chassis_type"))]
+    chassis = [c for c in chassis if c]
+    mem = dict(re.findall(r"^(\w+):\s+(\d+)", lread("/proc/meminfo") or "", re.M))
+    cpu_rows, hypervisor = guard("cpu", lambda: linux_cpu(sm.get("sockets", [])), ([], False))
+
+    data["system"] = [{
+        "Name": socket.gethostname(), "Manufacturer": product.get("Vendor") or dmi_id("sys_vendor"),
+        "Model": product.get("Name") or dmi_id("product_name"),
+        "SystemFamily": product.get("Family") or dmi_id("product_family"),
+        "SystemSKUNumber": product.get("SKU") or dmi_id("product_sku"), "SystemType": platform.machine(),
+        "PCSystemType": 2 if set(chassis) & LAPTOP_CHASSIS else 1 if set(chassis) & DESKTOP_CHASSIS else None,
+        "TotalPhysicalMemory": to_int(mem.get("MemTotal", 0)) * 1024 or None, "HypervisorPresent": hypervisor,
+        "UserName": os.environ.get("SUDO_USER") or guard("user", getpass.getuser),
+        "NumberOfProcessors": len(cpu_rows) or None,
+    }]
+    data["product"] = [{
+        "Vendor": product.get("Vendor"), "Name": product.get("Name"),
+        "Version": product.get("Version") or dmi_id("product_version"),
+        "IdentifyingNumber": product.get("IdentifyingNumber") or dmi_id("product_serial"),
+        "UUID": product.get("UUID") or dmi_id("product_uuid"),
+    }]
+    data["enclosure"] = [{"ChassisTypes": chassis, "SerialNumber": enclosure.get("SerialNumber") or dmi_id("chassis_serial"),
+                          "SMBIOSAssetTag": enclosure.get("SMBIOSAssetTag") or dmi_id("chassis_asset_tag")}]
+    major, minor = smbios_version()
+    data["bios"] = [{
+        "Manufacturer": bios.get("Manufacturer") or dmi_id("bios_vendor"),
+        "SMBIOSBIOSVersion": bios.get("SMBIOSBIOSVersion") or dmi_id("bios_version"),
+        "ReleaseDate": bios.get("ReleaseDate") or smbios_date(dmi_id("bios_date")),
+        "SMBIOSMajorVersion": major, "SMBIOSMinorVersion": minor,
+        "EmbeddedControllerMajorVersion": bios.get("EmbeddedControllerMajorVersion"),
+        "EmbeddedControllerMinorVersion": bios.get("EmbeddedControllerMinorVersion"),
+    }]
+    data["baseboard"] = [{
+        "Manufacturer": board.get("Manufacturer") or dmi_id("board_vendor"),
+        "Product": board.get("Product") or dmi_id("board_name"),
+        "Version": board.get("Version") or dmi_id("board_version"),
+        "SerialNumber": board.get("SerialNumber") or dmi_id("board_serial"),
+    }]
+    data["cpu"] = cpu_rows
+    data["memory"], data["memarray"] = sm.get("memory", []), sm.get("memarray", [])
+
+    os_release = dict(re.findall(r'^(\w+)="?([^"\n]*)"?', lread("/etc/os-release") or "", re.M))
+    uptime = to_int((lread("/proc/uptime") or "0").split(".")[0])
+    cmdline = lread("/proc/cmdline") or ""
+    data["os"] = [{
+        "Caption": os_release.get("PRETTY_NAME") or os_release.get("NAME") or "Linux",
+        "Kernel": platform.release(),
+        "OSArchitecture": "64-разрядная" if platform.architecture()[0] == "64bit" else "32-разрядная",
+        "LastBootUpTime": (dt.datetime.now() - dt.timedelta(seconds=uptime)).strftime("%Y-%m-%dT%H:%M:%S") if uptime else None,
+        "LiveSession": any(k in cmdline for k in ("boot=casper", "boot=live", "rd.live.image", "archisobasedir")),
+        "TotalVisibleMemorySize": to_int(mem.get("MemTotal")), "FreePhysicalMemory": to_int(mem.get("MemAvailable")),
+    }]
+
+    ids_pci = guard("pci_ids", lambda: load_ids("pci"))
+    if ids_pci is None and "pci_ids" not in errors and lexists("/sys/bus/pci/devices"):
+        errors["pci_ids"] = "не найдена база pci.ids, поэтому у PCI-устройств показаны только коды"
+    pci = guard("pci", lambda: linux_pci(ids_pci), [])
+    usb = guard("usb", lambda: linux_usb(guard("usb_ids", lambda: load_ids("usb"))), [])
+    pci_by_addr = {d["addr"]: d for d in pci}
+    usb_by_name = {d["busname"]: d for d in usb}
+
+    data["gpu"] = guard("gpu", lambda: linux_gpus(pci), [])
+    edids, displays, monitor_ids, monitor_conns = guard("monitor_id", lambda: linux_displays(pci_by_addr), ({}, [], [], []))
+    local["edid"], local["displays"] = edids, displays
+    data["monitor_id"], data["monitor_conn"] = monitor_ids, monitor_conns
+    disks, partitions, volumes, health, cdroms = guard("physdisk", lambda: linux_storage(is_root, errors), ([], [], [], [], []))
+    data.update(physdisk=disks, partition=partitions, logicaldisk=volumes, disk_health=health, cdrom=cdroms)
+    data["netadapter"], data["netconfig"] = guard("netadapter", lambda: linux_network(pci_by_addr, usb_by_name), ([], []))
+    data["sound"] = guard("sound", lambda: linux_sound(pci, usb), [])
+    data["keyboard"], data["mouse"] = guard("keyboard", linux_input, ([], []))
+    data["usbctrl"] = [{"Name": d["name"], "Manufacturer": d["vendor"], "PNPDeviceID": d["pnp"]}
+                       for d in pci if d["class"] >> 8 == 0x0C03]
+    data["battery"], local["battery_ioctl"] = guard("battery", linux_batteries, ([], []))
+    tpm = lread("/sys/class/tpm/tpm0/tpm_version_major")
+    data["tpm"] = [{"SpecVersion": f"{tpm}.0", "IsEnabled_InitialValue": True}] if tpm else []
+
+    pnp, drivers = [], []
+    for d, is_usb in [(d, False) for d in pci] + [(d, True) for d in usb]:
+        status = "OK" if d["driver"] or (is_usb and d["busname"].startswith("usb")) else "нет драйвера"
+        pnp.append({"Name": d["name"], "PNPClass": d["class"] if is_usb else pci_pnp_class(d["class"]),
+                    "Manufacturer": d["vendor"], "Status": status, "ConfigManagerErrorCode": 0,
+                    "PNPDeviceID": d["pnp"], "Present": True})
+        if d["driver"]:
+            version = d.get("driver_version")
+            drivers.append({"DeviceID": d["pnp"], "DriverVersion": " ".join(x for x in (d["driver"], version) if x)})
+    data["pnp"], data["drivers"] = pnp, drivers
+
+    local["firmware"] = "UEFI" if lexists("/sys/firmware/efi") else "Legacy BIOS"
+    sb = lread("/sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c", binary=True)
+    local["secure_boot"] = bool(sb[4]) if sb and len(sb) >= 5 else None
+    return {"platform": "linux", "collected_at": dt.datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
+            "duration": round(time.time() - started, 1), "python": sys.version.split()[0],
+            "wmi": {"data": data, "errors": errors}, "local": local}
+
+
+def collect_linux_elevated():
+    """Собрать данные с правами root через sudo, а отчёт сохранить от имени пользователя."""
+    cmd = ["sudo", sys.executable] + ([] if getattr(sys, "frozen", False) else [os.path.abspath(__file__)])
+    print("Для полного отчёта нужны права root — sudo может спросить пароль.", file=sys.stderr)
+    proc = subprocess.run(cmd + ["--collect-to", "-"], stdout=subprocess.PIPE)
+    if proc.returncode != 0 or not proc.stdout:
+        raise CollectError("не удалось получить права root через sudo")
+    return json.loads(proc.stdout.decode("utf-8"))
 
 
 # ---------------------------------------------------------------------------
@@ -660,7 +1591,7 @@ GPT_TYPES = {
 }
 MBR_TYPES = {1: "FAT12", 4: "FAT16", 5: "расширенный", 6: "FAT16", 7: "NTFS/exFAT", 11: "FAT32",
              12: "FAT32", 14: "FAT16", 15: "расширенный", 39: "восстановление", 130: "Linux swap",
-             131: "Linux", 238: "защитный GPT"}
+             131: "Linux", 238: "защитный GPT", 239: "системный (EFI)"}
 
 DRIVE_TYPES = {2: "съёмный", 3: "локальный", 4: "сетевой", 5: "оптический", 6: "RAM-диск"}
 
@@ -789,6 +1720,8 @@ def fdisk_size(value):
     n = to_int(value)
     if not n:
         return None
+    if n < 1e9:
+        return fbytes(n)
     label = f"{fnum(n / 1e12, 2)} ТБ" if n >= 1e12 else f"{round(n / 1e9)} ГБ"
     return f"{fbytes(n)} ({label} по маркировке)"
 
@@ -1035,7 +1968,9 @@ class Ctx:
         self.errors = wmi.get("errors") or {}
         self.local = raw.get("local") or {}
         self.collected_at = parse_dt(raw.get("collected_at")) or dt.datetime.now()
+        self.platform = raw.get("platform") or "windows"
         self.facts = OrderedDict()
+        self.checks = []  # (что проверено, вывод) для раздела «Проверка состояния»
         self.battery_complete = False
         self.battery_noted = False
         self._drivers = None
@@ -1070,6 +2005,17 @@ class Ctx:
         # HTREE\ROOT\0 — служебный корень дерева устройств; Диспетчер устройств его не показывает
         return [d for d in self.rows("pnp") if d.get("Present") is not False
                 and not str(d.get("PNPDeviceID") or "").upper().startswith("HTREE\\")]
+
+
+def verdict(items):
+    """Итог проверки: самый серьёзный значок и пояснения. items = [(0 норма | 1 внимание | 2 неисправность, текст)]."""
+    if not items:
+        return None
+    return {0: "✔", 1: "⚠", 2: "✖"}[max(level for level, _ in items)] + " " + "; ".join(t for _, t in items)
+
+
+def admin_hint(ctx):
+    return "запустите через sudo" if ctx.platform == "linux" else "запустите от имени администратора"
 
 
 def detect_vm(manufacturer, model):
@@ -1138,6 +2084,8 @@ def build_os(ctx):
     kv.add("Система", caption)
     kv.add("Выпуск", display_version)
     kv.add("Версия (сборка)", version)
+    kv.add("Ядро Linux", clean(os_.get("Kernel")))
+    kv.add("Запуск", "Live-система с загрузочной флешки" if os_.get("LiveSession") else None)
     kv.add("Разрядность", clean(os_.get("OSArchitecture")))
     kv.add("Установлена", fdatetime(os_.get("InstallDate")))
     kv.add("Последняя загрузка", fdatetime(boot) + (f" (работает {uptime})" if uptime else "") if boot else None)
@@ -1210,7 +2158,9 @@ def build_cpu(ctx):
         l2, l3 = to_int(c.get("L2CacheSize")), to_int(c.get("L3CacheSize"))
         vendor = clean(c.get("Manufacturer"))
 
-        if hypervisor:
+        if hypervisor and ctx.platform == "linux":
+            virt = "система запущена внутри виртуальной машины"
+        elif hypervisor:
             virt = "включена (работает гипервизор Hyper-V/VBS)"
         else:
             virt = fbool(c.get("VirtualizationFirmwareEnabled"), "включена в BIOS/UEFI", "выключена в BIOS/UEFI")
@@ -1221,6 +2171,9 @@ def build_cpu(ctx):
         if enabled and cores and enabled != cores:
             kv.add("Включено ядер", enabled)
         kv.add("Базовая частота", f"{fnum(max_mhz / 1000, 2)} ГГц" if max_mhz else None)
+        turbo = to_int(c.get("MaxTurboMHz"))
+        if turbo and (not max_mhz or turbo > max_mhz + 50):
+            kv.add("Максимальная частота (турбо)", f"{fnum(turbo / 1000, 2)} ГГц")
         if cur_mhz and max_mhz and abs(cur_mhz - max_mhz) > 50:
             kv.add("Текущая частота", f"{fnum(cur_mhz / 1000, 2)} ГГц")
         kv.add("Кэш L2", fbytes(l2 * 1024) if l2 else None)
@@ -1267,7 +2220,8 @@ def build_memory(ctx):
     free_kb = to_int(os_.get("FreePhysicalMemory"))
 
     kv.add("Всего установлено", fbytes(total) if total else None)
-    kv.add("Доступно Windows", fbytes(visible_kb * 1024) if visible_kb else fbytes(cs.get("TotalPhysicalMemory")))
+    kv.add("Доступно Windows" if ctx.platform == "windows" else "Доступно системе",
+           fbytes(visible_kb * 1024) if visible_kb else fbytes(cs.get("TotalPhysicalMemory")))
     kv.add("Свободно сейчас", fbytes(free_kb * 1024) if free_kb else None)
     kv.add("Тип", ", ".join(types) or None)
     if speeds:
@@ -1297,6 +2251,22 @@ def build_memory(ctx):
         table.add(slot or bank, fbytes(m.get("Capacity")), mtype, speed_text,
                   f"{fnum(mv / 1000, 3)} В" if mv else "", memory_vendor(m.get("Manufacturer")),
                   clean(m.get("PartNumber")), clean(m.get("SerialNumber")))
+
+    items = []
+    slow = [(to_int(m.get("ConfiguredClockSpeed")), to_int(m.get("Speed"))) for m in mods
+            if to_int(m.get("ConfiguredClockSpeed")) and to_int(m.get("Speed"))
+            and to_int(m.get("ConfiguredClockSpeed")) < to_int(m.get("Speed"))]
+    if slow:
+        items.append((1, f"память работает на {slow[0][0]} МТ/с вместо паспортных {slow[0][1]}"))
+    if len(mods) == 1 and slots >= 2:
+        items.append((1, "установлен один модуль: память работает в одноканальном режиме, это медленнее"))
+    if mods and not items:
+        items.append((0, f"{fbytes(total)}, {len(mods)} {ru_plural(len(mods), ('модуль', 'модуля', 'модулей'))}, "
+                         "без замечаний"))
+    if not mods and ctx.platform == "linux" and ctx.local.get("is_admin") is False:
+        items.append((1, f"модули памяти не видны — {admin_hint(ctx)}"))
+    if items:
+        ctx.checks.append(("Оперативная память", verdict(items)))
 
     if total or visible_kb:
         text = fbytes(total) if total else fbytes(visible_kb * 1024)
@@ -1337,7 +2307,7 @@ def build_gpu(ctx):
         kv = sec.kv(f"Видеоадаптер {i}" if len(gpus) > 1 else None)
         name = clean(g.get("Name"))
         pnp = g.get("PNPDeviceID")
-        vram = gpu_vram(g, registry)
+        vram = fbytes(g.get("VRAM")) if to_int(g.get("VRAM")) else gpu_vram(g, registry)
         ids = hw_ids(pnp)
         vendor = clean(g.get("AdapterCompatibility"))
         if not vendor and ids:
@@ -1467,6 +2437,9 @@ def build_storage(ctx):
     disks = ctx.rows("physdisk")
     parts = ctx.rows("partition")
     health = {str(h.get("DeviceId")): h for h in ctx.rows("disk_health")}
+    for did, nvme in (ctx.local.get("nvme_health") or {}).items():  # журнал NVMe дополняет счётчики Windows
+        counters = {k: v for k, v in health.get(str(did), {}).items() if v is not None}
+        health[str(did)] = dict({k: v for k, v in nvme.items() if k != "Health"}, **counters)
     letters_by_disk = {}
     disk_by_letter = {}
     for p in parts:
@@ -1474,6 +2447,8 @@ def build_storage(ctx):
         if letter:
             letters_by_disk.setdefault(str(p.get("DiskNumber")), []).append(f"{letter}:")
             disk_by_letter[f"{letter}:"] = str(p.get("DiskNumber"))
+        elif clean(p.get("MountPoint")):
+            letters_by_disk.setdefault(str(p.get("DiskNumber")), []).append(clean(p.get("MountPoint")))
 
     summary = []
     disk_names = {}
@@ -1510,9 +2485,58 @@ def build_storage(ctx):
                 kv.add("Наработка", f"{fint(hours)} ч (≈{fnum(hours / 24 / 365, 1)} г.)")
             if to_int(h.get("StartStopCycleCount")):
                 kv.add("Циклов включения", fint(to_int(h.get("StartStopCycleCount"))))
+            written = to_int(h.get("DataWrittenBytes"))
+            kv.add("Записано за всё время", fbytes(written) if written else None)
             if any(errors):
                 kv.add("Неисправленные ошибки чтения / записи", f"{errors[0]} / {errors[1]}")
+            for field, label in (("ReallocatedSectors", "Переназначенные сектора"),
+                                 ("PendingSectors", "Нестабильные сектора"), ("UnsafeShutdowns", "Аварийных отключений")):
+                if to_int(h.get(field)) is not None:
+                    kv.add(label, fint(to_int(h.get(field))))
+            if to_int(h.get("CriticalWarning")):
+                kv.add("Критическое предупреждение SMART", f"да (код {h.get('CriticalWarning')})")
             kv.add("Тома", ", ".join(sorted(letters_by_disk.get(did, []))) or None)
+
+            items = []
+            state = to_int(d.get("HealthStatus"))
+            if state == 2:
+                items.append((2, "SMART сообщает о неисправности"))
+            elif state == 1 or to_int(h.get("CriticalWarning")):
+                items.append((2, "SMART выдаёт критическое предупреждение"))
+            elif state == 0:
+                items.append((0, "состояние: исправен"))
+            problems = [(errors[0] + errors[1], ("неисправленная ошибка", "неисправленные ошибки", "неисправленных ошибок")),
+                        (to_int(h.get("ReallocatedSectors")) or 0, ("переназначенный сектор", "переназначенных сектора",
+                                                                    "переназначенных секторов")),
+                        (to_int(h.get("PendingSectors")) or 0, ("нестабильный сектор", "нестабильных сектора",
+                                                                "нестабильных секторов"))]
+            for n, forms in problems:
+                if n:
+                    items.append((2, f"{n} {ru_plural(n, forms)}"))
+            if hours is not None:
+                if hours <= 50:
+                    items.append((0, f"наработка {hours} ч — диск новый"))
+                elif hours <= 500:
+                    items.append((1, f"наработка {fint(hours)} ч — диском уже пользовались"))
+                else:
+                    items.append((1, f"наработка {fint(hours)} ч (≈{fint(round(hours / 24))} дн.) — диск явно не новый"))
+            if written:
+                used = written > 200e9
+                items.append((1 if used else 0, f"записано {fbytes(written)}" + (" — диском уже пользовались" if used else "")))
+            wear = to_int(h.get("Wear"))
+            if wear is not None and (wear or media == "SSD"):
+                items.append((1 if wear >= 10 else 0, f"износ {wear} %"))
+            if not h and state is None and bus in ("USB", "виртуальный"):
+                pass  # у флешек и виртуальных дисков SMART обычно нет — не о чем предупреждать
+            elif not h and state is not None and ctx.local.get("is_admin") is False:
+                items.append((1, f"наработка и износ не видны — {admin_hint(ctx)}"))
+            elif not h and state is None:
+                if ctx.local.get("is_admin") is False:
+                    items.append((1, f"нет данных SMART — {admin_hint(ctx)}"))
+                else:
+                    items.append((1, "нет данных SMART"))
+            if items:
+                ctx.checks.append((f"Диск {did}: {name}", verdict(items)))
 
             size = to_int(d.get("Size"))
             if size:
@@ -1537,7 +2561,8 @@ def build_storage(ctx):
                 summary.append(f"{name} ({round(size / 1e9)} ГБ)")
 
     if parts:
-        table = sec.table("Разделы", ["Диск", "Раздел", "Буква", "Назначение", "Размер"])
+        where = "Точка монтирования" if ctx.platform == "linux" else "Буква"
+        table = sec.table("Разделы", ["Диск", "Раздел", where, "Назначение", "Файловая система", "Метка", "Размер"])
         for p in sorted(parts, key=lambda x: (to_int(x.get("DiskNumber")) or 0, to_int(x.get("PartitionNumber")) or 0)):
             purpose = GPT_TYPES.get(str(p.get("GptType") or "").lower()) or MBR_TYPES.get(to_int(p.get("MbrType")))
             flags = [x for x in ("системный" if p.get("IsSystem") and "EFI" not in (purpose or "") else None,
@@ -1545,20 +2570,20 @@ def build_storage(ctx):
             if flags:
                 purpose = f"{purpose or 'раздел'} ({', '.join(flags)})"
             letter = drive_letter(p.get("DriveLetter"))
-            table.add(p.get("DiskNumber"), p.get("PartitionNumber"), f"{letter}:" if letter else "",
-                      purpose, fbytes(p.get("Size")))
+            table.add(p.get("DiskNumber"), p.get("PartitionNumber"), f"{letter}:" if letter else clean(p.get("MountPoint")),
+                      purpose, clean(p.get("FileSystem")), clean(p.get("Label")), fbytes(p.get("Size")))
 
     volumes = ctx.rows("logicaldisk")
     if volumes:
-        table = sec.table("Логические диски", ["Диск", "Метка", "Файловая система", "Объём", "Свободно",
-                                               "Тип", "Физический диск"])
+        table = sec.table("Логические диски", ["Точка монтирования" if ctx.platform == "linux" else "Диск", "Метка",
+                                               "Файловая система", "Объём", "Свободно", "Тип", "Физический диск"])
         for v in sorted(volumes, key=lambda x: str(x.get("DeviceID"))):
             size, free = to_int(v.get("Size")), to_int(v.get("FreeSpace"))
             free_text = fbytes(free) if free is not None else ""
             if size and free is not None:
                 free_text += f" ({round(free * 100 / size)} %)"
             dev = str(v.get("DeviceID") or "")
-            phys = disk_by_letter.get(dev.upper())
+            phys = disk_by_letter.get(dev.upper()) or (str(v["DiskNumber"]) if v.get("DiskNumber") is not None else None)
             kind = DRIVE_TYPES.get(to_int(v.get("DriveType")), "")
             if to_int(v.get("DriveType")) == 4 and clean(v.get("ProviderName")):
                 kind += f": {clean(v.get('ProviderName'))}"
@@ -1629,6 +2654,7 @@ def build_audio(ctx):
         kv = sec.kv(f"Звуковое устройство {i}" if len(devices) > 1 else None)
         kv.add("Устройство", name)
         kv.add("Производитель", clean(s.get("Manufacturer")))
+        kv.add("Аудиокодеки", as_list(s.get("Codecs")))
         kv.add("Драйвер", ctx.driver_text(s.get("PNPDeviceID"), with_provider=True))
         kv.add("ID оборудования", hw_ids(s.get("PNPDeviceID")))
         status = clean(s.get("Status"))
@@ -1845,7 +2871,8 @@ def build_battery(ctx):
         if runtime and runtime < 71582788:  # 71582788 — работа от сети
             kv.add("Оставшееся время", fduration(dt.timedelta(minutes=runtime)))
         kv.add("Химия", chemistry)
-        unit = "усл. ед." if r.get("relative") else "мВт·ч"  # некоторые батареи сообщают ёмкость в условных единицах
+        # некоторые батареи сообщают ёмкость в мА·ч или в условных единицах
+        unit = r.get("unit") or ("усл. ед." if r.get("relative") else "мВт·ч")
         kv.add("Паспортная ёмкость", f"{fint(designed)} {unit}" if designed else None)
         kv.add("Полная ёмкость сейчас", f"{fint(current)} {unit}" if current else None)
         if wear is not None:
@@ -1856,6 +2883,25 @@ def build_battery(ctx):
                              f"износ {fnum(wear, 1)} %" if wear is not None else None) if x]
         if parts:
             summary.append(", ".join(parts))
+
+        items = []
+        if wear is not None:
+            w = fnum(wear, 1)
+            if wear < 5:
+                items.append((0, f"износ {w} % — как у новой"))
+            elif wear < 15:
+                items.append((1, f"износ {w} % — батарея уже немного поработала"))
+            elif wear < 40:
+                items.append((1, f"износ {w} % — батарея заметно изношена, у нового ноутбука так быть не должно"))
+            else:
+                items.append((2, f"износ {w} % — батарея сильно изношена"))
+        else:
+            items.append((1, "износ неизвестен: система не сообщила паспортную ёмкость"))
+        if cycle_count:
+            used = cycle_count > 10
+            items.append((1 if used else 0, f"{cycle_count} {ru_plural(cycle_count, ('цикл', 'цикла', 'циклов'))} "
+                                             "заряда" + (" — батарею уже активно использовали" if used else "")))
+        ctx.checks.append((f"Батарея {i + 1}" if count > 1 else "Батарея", verdict(items)))
     if count and not ctx.battery_complete and not reports and (
             "battery_report" in ctx.local or "battery_ioctl" in ctx.local):
         sec.notes.append("Драйвер батареи не отдал сведения о ёмкости, поэтому износ посчитать нельзя.")
@@ -1952,6 +2998,33 @@ def build_problems(ctx):
         elif harmless:
             fact += f" (из них {harmless} — служебные каналы Bluetooth, драйвер им не нужен)"
         ctx.facts["Устройства с неполадками"] = fact
+
+    real = len(bad) - (harmless if bad else 0)
+    items = []
+    if real:
+        items.append((1, f"{real} {ru_plural(real, ('устройство', 'устройства', 'устройств'))} с неполадками — "
+                         "см. раздел «Устройства с неполадками»"))
+    elif ctx.rows("pnp"):
+        items.append((0, "неисправных устройств нет"))
+    no_driver = [d for d in ctx.pnp() if d.get("Status") == "нет драйвера"]
+    if no_driver and ctx.platform == "linux":
+        names = ", ".join(sorted({clean(d.get("Name")) or "?" for d in no_driver}))
+        items.append((0, f"без драйвера Linux: {names} — обычно это не неисправность, "
+                         "просто для этих устройств в системе нет драйвера"))
+    if items:
+        ctx.checks.append(("Устройства", verdict(items)))
+    return sec
+
+
+def build_checks(ctx):
+    sec = Section("checks", "Проверка состояния")
+    kv = sec.kv()
+    for label, text in ctx.checks:
+        kv.add(label, text)
+    if kv.rows:
+        sec.notes.append("✔ — в порядке, ⚠ — обратите внимание, ✖ — неисправность. У нового компьютера износ "
+                         "батареи 0–5 %, наработка диска — не больше нескольких десятков часов и никаких ошибок "
+                         "SMART. Пороги ориентировочные.")
     return sec
 
 
@@ -1988,12 +3061,15 @@ QUERY_NAMES = {
     "battery": "батарея", "battery_static": "паспортные данные батареи", "battery_full": "ёмкость батареи",
     "battery_cycles": "циклы заряда батареи", "printer": "принтеры", "cdrom": "оптические приводы",
     "tpm": "TPM", "pnp": "список устройств", "drivers": "драйверы",
-    "disk_health": "SMART-показатели накопителей",
+    "disk_health": "SMART-показатели накопителей", "smbios": "таблицы прошивки SMBIOS", "smart": "SMART",
+    "pci_ids": "названия PCI-устройств", "pci": "PCI-устройства", "usb": "USB-устройства", "usb_ids": "названия USB-устройств",
+    "gpu": "видеокарты", "user": "имя пользователя",
 }
 LOCAL_NAMES = {
     "firmware": "режим загрузки", "secure_boot": "Secure Boot", "display_version": "выпуск Windows",
     "ubr": "номер обновления Windows", "gpu_registry": "видеопамять из реестра", "edid": "EDID мониторов",
     "displays": "режимы мониторов", "battery_report": "отчёт о батарее (powercfg)",
+    "nvme_health": "журнал SMART NVMe-дисков",
     "battery_ioctl": "сведения о батарее от драйвера",
 }
 
@@ -2001,7 +3077,11 @@ LOCAL_NAMES = {
 def build_notes(ctx, raw):
     sec = Section("notes", "Примечания")
     admin = ctx.local.get("is_admin")
-    if admin is False:
+    if admin is False and ctx.platform == "linux":
+        sec.notes.append("Программа запущена без прав root, поэтому не показаны модули памяти, серийные номера "
+                         "и SMART-показатели накопителей. Для полного отчёта запустите её так: "
+                         "python3 hardware_info.py --elevate (или через sudo).")
+    elif admin is False:
         sec.notes.append("Программа запущена без прав администратора, поэтому не показаны подробности TPM, "
                          "температура, износ и наработка накопителей. Для полного отчёта запустите её "
                          "с параметром --elevate или «от имени администратора».")
@@ -2055,7 +3135,7 @@ def build_report(raw, include_devices=True):
 
     computer = clean(ctx.first("system").get("Name")) or os.environ.get("COMPUTERNAME") or "компьютер"
     report = Report(computer, fdatetime(ctx.collected_at))
-    report.sections = [s for s in [summary] + sections if not s.is_empty()]
+    report.sections = [s for s in [summary, build_checks(ctx)] + sections if not s.is_empty()]
     return report
 
 
@@ -2166,7 +3246,9 @@ def render_html(report):
                 if block.title:
                     out.append(f"<h3>{e(block.title)}</h3>")
                 out.append('<table class="kv">')
-                out += [f"<tr><th>{e(r[0])}</th><td>{e(r[1])}</td></tr>" for r in block.rows]
+                for r in block.rows:
+                    cls = ' class="bad"' if r[1][:1] in ("⚠", "✖") else ""  # замечания проверки
+                    out.append(f"<tr><th>{e(r[0])}</th><td{cls}>{e(r[1])}</td></tr>")
                 out.append("</table>")
                 continue
             cols = [i for i, _ in enumerate(block.columns) if any(row[i] for row in block.rows)]
@@ -2231,6 +3313,32 @@ def safe_name(text):
     return re.sub(r"[^\w\-]+", "_", text, flags=re.UNICODE).strip("_") or "pc"
 
 
+def give_to_sudo_user(path):
+    """При запуске через sudo отдать файл обычному пользователю, чтобы он мог его открыть и удалить."""
+    uid, gid = os.environ.get("SUDO_UID"), os.environ.get("SUDO_GID")
+    if IS_LINUX and os.geteuid() == 0 and uid and gid:
+        try:
+            os.chown(path, int(uid), int(gid))
+        except (OSError, ValueError):
+            pass
+
+
+def open_report(path):
+    if IS_WINDOWS:
+        os.startfile(path)
+        return
+    cmd = ["xdg-open", path]
+    uid, user = os.environ.get("SUDO_UID"), os.environ.get("SUDO_USER")
+    if os.geteuid() == 0 and uid and user:  # браузер нужно открыть от имени пользователя, а не root
+        env = [f"XDG_RUNTIME_DIR=/run/user/{uid}", f"DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{uid}/bus"]
+        env += [f"{k}={os.environ[k]}" for k in ("DISPLAY", "WAYLAND_DISPLAY", "XAUTHORITY") if os.environ.get(k)]
+        cmd = ["sudo", "-u", user, "env"] + env + cmd
+    try:
+        subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    except OSError:
+        print(f"Не удалось открыть отчёт автоматически, откройте его вручную: {path}", file=sys.stderr)
+
+
 def save_reports(report, formats, out_dir, stamp, anon):
     base = f"hardware_{'report' if anon else safe_name(report.computer)}_{stamp}"
     renderers = {
@@ -2248,6 +3356,7 @@ def save_reports(report, formats, out_dir, stamp, anon):
                 path = os.path.join(folder, f"{base}.{fmt}")
                 with open(path, "w", encoding=encoding, newline="\r\n" if fmt == "txt" else "\n") as fh:
                     fh.write(content)
+                give_to_sudo_user(path)
                 saved.append(path)
                 break
             except OSError as exc:
@@ -2258,7 +3367,7 @@ def save_reports(report, formats, out_dir, stamp, anon):
 def parse_args(argv):
     parser = argparse.ArgumentParser(
         prog="hardware_info.py",
-        description="Собирает подробные сведения об оборудовании компьютера под Windows "
+        description="Собирает подробные сведения об оборудовании компьютера под Windows и Linux "
                     "и сохраняет отчёт в TXT, HTML и JSON.")
     parser.add_argument("-o", "--output", default=os.getcwd(),
                         help="папка для отчётов (по умолчанию — текущая)")
@@ -2271,10 +3380,12 @@ def parse_args(argv):
     parser.add_argument("--no-devices", action="store_true", help="не включать полный список устройств")
     parser.add_argument("--open", action="store_true", help="открыть HTML-отчёт после создания")
     parser.add_argument("--elevate", action="store_true",
-                        help="перезапуститься с правами администратора (больше данных: TPM, SMART и др.)")
+                        help="получить права администратора (в Linux — root через sudo): больше данных — "
+                             "модули памяти, SMART, TPM и др.")
     parser.add_argument("--pause", action="store_true", help="ждать нажатия Enter перед выходом")
     parser.add_argument("--dump-raw", action="store_true", help="сохранить также «сырые» данные (для отладки)")
     parser.add_argument("--load-raw", metavar="FILE", help="построить отчёт из ранее сохранённых сырых данных")
+    parser.add_argument("--collect-to", metavar="FILE", help=argparse.SUPPRESS)  # служебный: сбор под sudo
     parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
     return parser.parse_args(argv)
 
@@ -2283,9 +3394,23 @@ def run(args, argv):
     if args.load_raw:
         with open(args.load_raw, encoding="utf-8") as fh:
             raw = json.load(fh)
+    elif IS_LINUX:
+        if args.elevate and os.geteuid() != 0 and not args.collect_to:
+            raw = collect_linux_elevated()
+        else:
+            print("Собираю сведения об оборудовании…", file=sys.stderr)
+            raw = collect_linux()
+        if args.collect_to:  # служебный режим: отдать сырые данные запустившему процессу
+            text = json.dumps(raw)
+            if args.collect_to == "-":
+                sys.stdout.write(text)
+            else:
+                with open(args.collect_to, "w", encoding="utf-8") as fh:
+                    fh.write(text)
+            return 0
     else:
         if not IS_WINDOWS:
-            print("Эта программа предназначена для Windows.", file=sys.stderr)
+            print("Эта программа работает в Windows и Linux.", file=sys.stderr)
             return 1
         out_dir = os.path.abspath(args.output)
         if args.elevate and not is_admin():
@@ -2296,7 +3421,10 @@ def run(args, argv):
         print("Собираю сведения об оборудовании, это займёт от 10 секунд до минуты…", file=sys.stderr)
         started = time.time()
         wmi = collect_wmi()
-        local = collect_local(has_battery=bool((wmi.get("data") or {}).get("battery")))
+        wmi_data = wmi.get("data") or {}
+        local = collect_local(has_battery=bool(wmi_data.get("battery")),
+                              nvme_disks=[d.get("DeviceId") for d in as_list(wmi_data.get("physdisk"))
+                                          if isinstance(d, dict) and to_int(d.get("BusType")) == 17])
         raw = {"collected_at": dt.datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
                "duration": round(time.time() - started, 1), "python": sys.version.split()[0],
                "wmi": wmi, "local": local}
@@ -2315,6 +3443,7 @@ def run(args, argv):
             path = os.path.join(os.path.abspath(args.output), f"hardware_raw_{stamp}.json")
             with open(path, "w", encoding="utf-8") as fh:
                 json.dump(raw, fh, ensure_ascii=False, indent=1)
+            give_to_sudo_user(path)
             saved.append(path)
             if args.anon:
                 print("Внимание: файл с сырыми данными не обезличивается.", file=sys.stderr)
@@ -2322,10 +3451,10 @@ def run(args, argv):
         print("Отчёт сохранён:")
         for path in saved:
             print(f"  {path}")
-    if args.open and IS_WINDOWS:
+    if args.open and (IS_WINDOWS or IS_LINUX):
         html_files = [p for p in saved if p.endswith(".html")]
         if html_files:
-            os.startfile(html_files[0])
+            open_report(html_files[0])
     return 0
 
 
@@ -2344,6 +3473,8 @@ def main(argv=None):
         code = 1
     except KeyboardInterrupt:
         code = 130
+    except BrokenPipeError:  # вывод передан, например, в head и закрыт раньше времени
+        code = 0
     if args.pause:
         try:
             input("\nНажмите Enter, чтобы закрыть окно…")
