@@ -54,7 +54,7 @@ try:
 except ImportError:  # не Windows — работает только режим --load-raw
     winreg = None
 
-VERSION = "2.0"
+VERSION = "2.1"
 IS_WINDOWS = sys.platform == "win32"
 IS_LINUX = sys.platform.startswith("linux")
 CREATE_NO_WINDOW = 0x08000000 if IS_WINDOWS else 0  # без мелькающего окна консоли
@@ -301,6 +301,7 @@ def gpu_registry():
             "matching_id": reg_value(path, "MatchingDeviceId"),
             "memory": size,
             "chip": _reg_str(reg_value(path, "HardwareInformation.ChipType")),
+            "bios": _reg_str(reg_value(path, "HardwareInformation.BiosString")),
         })
     return result
 
@@ -535,11 +536,19 @@ def battery_ioctl():
                 def capacity(value):
                     return value if value and value != BATTERY_UNKNOWN_CAPACITY else None
 
+                class BATTERY_MANUFACTURE_DATE(ctypes.Structure):
+                    _fields_ = [("Day", ctypes.c_ubyte), ("Month", ctypes.c_ubyte), ("Year", ctypes.c_uint16)]
+
+                made = BATTERY_MANUFACTURE_DATE()
+                manufactured = None
+                if query(5, made) and 1 <= made.Month <= 12 and 1990 <= made.Year <= 2100:  # BatteryManufactureDate
+                    manufactured = f"{made.Year:04d}-{made.Month:02d}-{made.Day or 1:02d}"
+
                 result.append({
                     "id": text(4), "manufacturer": text(6), "serial": text(8),  # имя, производитель, серийный номер
                     "chemistry": bytes(info.Chemistry).decode("ascii", "ignore").strip("\x00 "),
                     "design": capacity(info.DesignedCapacity), "full": capacity(info.FullChargedCapacity),
-                    "cycles": info.CycleCount or None,
+                    "cycles": info.CycleCount or None, "manufactured": manufactured,
                     "relative": bool(info.Capabilities & BATTERY_CAPACITY_RELATIVE),
                 })
             finally:
@@ -808,6 +817,47 @@ def linux_smbios(data):
                 "TotalWidth": None if total_width in (None, 0xFFFF) else total_width,
                 "ConfiguredVoltage": s.word(0x26) or None})
     return out
+
+
+def bcd(value):
+    hi, lo = value >> 4, value & 0x0F
+    return hi * 10 + lo if hi < 10 and lo < 10 else None
+
+
+# Где в SPD лежат производитель модуля, дата, серийный номер и партномер: (тип, смещения…, длина партномера)
+SPD_LAYOUTS = {0x0B: ("DDR3", 117, 120, 122, 128, 18), 0x0C: ("DDR4", 320, 323, 325, 329, 20),
+               0x0E: ("DDR4", 320, 323, 325, 329, 20), 0x12: ("DDR5", 512, 515, 517, 521, 30)}
+
+
+def parse_spd(data):
+    """Данные из микросхемы SPD модуля памяти — то же, что показывают CPU-Z и decode-dimms."""
+    layout = SPD_LAYOUTS.get(data[2]) if data and len(data) > 2 else None
+    if not layout:
+        return None
+    kind, mfr, date, serial, part, part_len = layout
+    if len(data) < part + part_len:
+        return None
+    year, week = bcd(data[date]), bcd(data[date + 1])
+    serial_hex = data[serial:serial + 4].hex().upper()
+    return {
+        "type": kind, "vendor": f"{data[mfr]:02X}{data[mfr + 1]:02X}",
+        "year": 2000 + year if year else None, "week": week if week and 1 <= week <= 53 else None,
+        "serial": serial_hex if serial_hex not in ("00000000", "FFFFFFFF") else None,
+        "part": clean(data[part:part + part_len].decode("ascii", "replace")),
+    }
+
+
+def linux_spd():
+    """Микросхемы SPD модулей памяти (адреса 0x50–0x57 на шине SMBus)."""
+    result = []
+    for driver in ("ee1004", "spd5118", "at24", "eeprom"):
+        for dev in llist(f"/sys/bus/i2c/drivers/{driver}"):
+            if not re.fullmatch(r"\d+-005[0-7]", dev):
+                continue
+            info = parse_spd(lread(f"/sys/bus/i2c/drivers/{driver}/{dev}/eeprom", binary=True))
+            if info:
+                result.append(dict(info, address=dev))
+    return result
 
 
 def smbios_version():
@@ -1229,6 +1279,8 @@ def linux_batteries():
             "id": clean(lread(base + "/model_name")), "manufacturer": clean(lread(base + "/manufacturer")),
             "serial": clean(lread(base + "/serial_number")), "design": round(design) or None,
             "full": round(full) or None, "cycles": num("cycle_count") or None, "unit": unit,
+            "manufactured": (f"{num('manufacture_year'):04d}-{num('manufacture_month') or 1:02d}-{num('manufacture_day') or 1:02d}"
+                             if (num("manufacture_year") or 0) > 1990 else None),
         })
     return rows, details
 
@@ -1345,11 +1397,11 @@ def linux_sound(pci, usb):
 
 def linux_gpus(pci):
     nvidia = {}
-    out = run_tool(["nvidia-smi", "--query-gpu=pci.bus_id,name,memory.total,driver_version",
+    out = run_tool(["nvidia-smi", "--query-gpu=pci.bus_id,name,memory.total,driver_version,vbios_version,serial",
                     "--format=csv,noheader,nounits"])
     for line in (out or "").splitlines():
         f = [x.strip() for x in line.split(",")]
-        if len(f) == 4:
+        if len(f) == 6:
             nvidia[f[0].lower()[-12:]] = f
     rows = []
     for d in pci:
@@ -1363,8 +1415,11 @@ def linux_gpus(pci):
         if nv and to_int(nv[2]):
             vram = to_int(nv[2]) * 1024 * 1024
         driver = " ".join(x for x in (d["driver"], nv[3] if nv else d["driver_version"]) if x)
+        vbios = nv[4] if nv else lread(f"/sys/bus/pci/devices/{d['addr']}/vbios_version")  # NVIDIA / AMD
+        serial = nv[5] if nv and re.search(r"[1-9A-Za-z]", nv[5] or "") and "N/A" not in nv[5] else None
         rows.append({"Name": name, "AdapterCompatibility": d["vendor"], "VRAM": vram, "DriverVersion": driver or None,
-                     "PNPDeviceID": d["pnp"], "Status": "OK" if d["driver"] else "нет драйвера"})
+                     "PNPDeviceID": d["pnp"], "Status": "OK" if d["driver"] else "нет драйвера",
+                     "VideoBios": clean(vbios), "SerialNumber": clean(serial)})
     return rows
 
 
@@ -1435,6 +1490,21 @@ def collect_linux():
     }]
     data["cpu"] = cpu_rows
     data["memory"], data["memarray"] = sm.get("memory", []), sm.get("memarray", [])
+    spd = guard("spd", linux_spd, [])
+    by_serial = {m["serial"]: m for m in spd if m.get("serial")}
+    for i, module in enumerate(data["memory"]):  # SPD сопоставляется с модулем по серийному номеру
+        info = by_serial.get((clean(module.get("SerialNumber")) or "").upper())
+        if not info and not by_serial and len(spd) == len(data["memory"]):
+            info = spd[i]
+        if info:
+            module.update(ManufactureYear=info["year"], ManufactureWeek=info["week"])
+    if spd and not data["memory"]:  # без прав root модули видны только через SPD
+        data["memory"] = [{"Manufacturer": m["vendor"], "PartNumber": m["part"], "SerialNumber": m["serial"],
+                           "ManufactureYear": m["year"], "ManufactureWeek": m["week"],
+                           "SMBIOSMemoryType": {"DDR3": 24, "DDR4": 26, "DDR5": 34}.get(m["type"])} for m in spd]
+    elif not spd and is_root and any(to_int(m.get("FormFactor")) in (8, 12) for m in data["memory"]):
+        errors["spd"] = ("даты изготовления модулей не прочитаны: не загружен драйвер SPD "
+                         "(для DDR4 — sudo modprobe ee1004, для DDR5 — sudo modprobe spd5118, затем запустите снова)")
 
     os_release = dict(re.findall(r'^(\w+)="?([^"\n]*)"?', lread("/etc/os-release") or "", re.M))
     uptime = to_int((lread("/proc/uptime") or "0").split(".")[0])
@@ -1551,6 +1621,99 @@ PCI_VENDORS = {
     "15AD": "VMware", "80EE": "VirtualBox", "1AF4": "Red Hat (virtio)", "1234": "QEMU",
     "5143": "Qualcomm", "1B36": "Red Hat (QEMU)", "102B": "Matrox", "1A03": "ASPEED",
 }
+
+# Поколение процессора по коду модели (CPUID): (название поколения, год выхода)
+INTEL_CPU_MODELS = {
+    0x2A: ("Sandy Bridge", "2011"), 0x2D: ("Sandy Bridge-E", "2011"), 0x3A: ("Ivy Bridge", "2012"),
+    0x3E: ("Ivy Bridge-E", "2013"), 0x3C: ("Haswell", "2013"), 0x45: ("Haswell", "2013"), 0x46: ("Haswell", "2013"),
+    0x3F: ("Haswell-E", "2014"), 0x3D: ("Broadwell", "2015"), 0x47: ("Broadwell", "2015"), 0x4F: ("Broadwell-E", "2016"),
+    0x4E: ("Skylake", "2015"), 0x5E: ("Skylake", "2015"), 0x55: ("Skylake-X / Cascade Lake", "2017–2019"),
+    0x8E: ("Kaby Lake / Whiskey Lake / Comet Lake", "2016–2019"), 0x9E: ("Kaby Lake / Coffee Lake", "2017–2019"),
+    0x66: ("Cannon Lake", "2018"), 0x7D: ("Ice Lake", "2019"), 0x7E: ("Ice Lake", "2019"), 0x6A: ("Ice Lake-SP", "2021"),
+    0xA5: ("Comet Lake", "2020"), 0xA6: ("Comet Lake", "2020"), 0x8C: ("Tiger Lake", "2020"),
+    0x8D: ("Tiger Lake-H", "2021"), 0xA7: ("Rocket Lake", "2021"), 0x97: ("Alder Lake", "2021"),
+    0x9A: ("Alder Lake", "2022"), 0xBE: ("Alder Lake-N", "2023"), 0xB7: ("Raptor Lake", "2022"),
+    0xBA: ("Raptor Lake", "2023"), 0xBF: ("Raptor Lake", "2023"), 0x8F: ("Sapphire Rapids", "2023"),
+    0xCF: ("Emerald Rapids", "2023"), 0xAA: ("Meteor Lake", "2023"), 0xAC: ("Meteor Lake", "2023"),
+    0xBD: ("Lunar Lake", "2024"), 0xC5: ("Arrow Lake", "2024"), 0xC6: ("Arrow Lake", "2024"),
+    0xB5: ("Arrow Lake", "2025"), 0x37: ("Bay Trail", "2013"), 0x4C: ("Cherry Trail / Braswell", "2015"),
+    0x5C: ("Apollo Lake", "2016"), 0x7A: ("Gemini Lake", "2017"), 0x96: ("Elkhart Lake", "2021"),
+    0x9C: ("Jasper Lake", "2021"),
+}
+AMD_CPU_MODELS = {
+    (0x17, 0x01): ("Zen (Summit Ridge)", "2017"), (0x17, 0x08): ("Zen+ (Pinnacle Ridge)", "2018"),
+    (0x17, 0x11): ("Zen (Raven Ridge)", "2018"), (0x17, 0x18): ("Zen+ (Picasso)", "2019"),
+    (0x17, 0x20): ("Zen (Dali)", "2020"), (0x17, 0x31): ("Zen 2 (Rome / Castle Peak)", "2019"),
+    (0x17, 0x60): ("Zen 2 (Renoir)", "2020"), (0x17, 0x68): ("Zen 2 (Lucienne)", "2021"),
+    (0x17, 0x71): ("Zen 2 (Matisse)", "2019"), (0x17, 0x90): ("Zen 2 (Van Gogh)", "2022"),
+    (0x17, 0xA0): ("Zen 2 (Mendocino)", "2022"), (0x19, 0x01): ("Zen 3 (Milan)", "2021"),
+    (0x19, 0x21): ("Zen 3 (Vermeer)", "2020"), (0x19, 0x40): ("Zen 3+ (Rembrandt)", "2022"),
+    (0x19, 0x44): ("Zen 3+ (Rembrandt)", "2023"), (0x19, 0x50): ("Zen 3 (Cezanne / Barcelo)", "2021"),
+    (0x19, 0x11): ("Zen 4 (Genoa)", "2022"), (0x19, 0x61): ("Zen 4 (Raphael)", "2022"),
+    (0x19, 0x74): ("Zen 4 (Phoenix)", "2023"), (0x19, 0x75): ("Zen 4 (Phoenix / Hawk Point)", "2023–2024"),
+    (0x19, 0x78): ("Zen 4 (Phoenix 2)", "2023"), (0x1A, 0x24): ("Zen 5 (Strix Point)", "2024"),
+    (0x1A, 0x44): ("Zen 5 (Granite Ridge)", "2024"),
+}
+AMD_CPU_FAMILIES = {0x17: ("Zen / Zen+ / Zen 2", "2017–2022"), 0x19: ("Zen 3 / Zen 4", "2020–2024"),
+                    0x1A: ("Zen 5", "2024–2025")}
+
+# Архитектура видеочипа по коду устройства: (производитель, от, до, архитектура, годы выхода)
+GPU_ARCHITECTURES = [
+    ("10DE", 0x0FC0, 0x12FF, "Kepler", "2012–2014"), ("10DE", 0x1340, 0x17FF, "Maxwell", "2014–2016"),
+    ("10DE", 0x1B00, 0x1DFF, "Pascal", "2016–2017"), ("10DE", 0x1E00, 0x1FFF, "Turing", "2018–2019"),
+    ("10DE", 0x2180, 0x21FF, "Turing", "2019"), ("10DE", 0x2000, 0x20FF, "Ampere", "2020"),
+    ("10DE", 0x2200, 0x22FF, "Ampere", "2020–2021"), ("10DE", 0x2300, 0x23FF, "Hopper", "2022"),
+    ("10DE", 0x2400, 0x25FF, "Ampere", "2020–2021"), ("10DE", 0x2600, 0x28FF, "Ada Lovelace", "2022–2023"),
+    ("10DE", 0x2900, 0x2FFF, "Blackwell", "2024–2025"),
+    ("1002", 0x67C0, 0x67FF, "Polaris", "2016–2017"), ("1002", 0x6980, 0x699F, "Polaris", "2017"),
+    ("1002", 0x6860, 0x687F, "Vega", "2017"), ("1002", 0x66A0, 0x66AF, "Vega 20", "2018–2019"),
+    ("1002", 0x7310, 0x734F, "RDNA 1", "2019"), ("1002", 0x73A0, 0x73FF, "RDNA 2", "2020–2021"),
+    ("1002", 0x7420, 0x743F, "RDNA 2", "2022"), ("1002", 0x7440, 0x749F, "RDNA 3", "2022–2023"),
+    ("1002", 0x7500, 0x75FF, "RDNA 4", "2025"),
+    ("1002", 0x15DD, 0x15DD, "Vega (Raven Ridge)", "2018"), ("1002", 0x15D8, 0x15D8, "Vega (Picasso)", "2019"),
+    ("1002", 0x1636, 0x1636, "Vega (Renoir)", "2020"), ("1002", 0x1638, 0x1638, "Vega (Cezanne)", "2021"),
+    ("1002", 0x164C, 0x164C, "Vega (Lucienne)", "2021"), ("1002", 0x1681, 0x1681, "RDNA 2 (Rembrandt)", "2022"),
+    ("1002", 0x164E, 0x164E, "RDNA 2 (Raphael)", "2022"), ("1002", 0x163F, 0x163F, "RDNA 2 (Van Gogh)", "2022"),
+    ("1002", 0x1506, 0x1506, "RDNA 2 (Mendocino)", "2022"), ("1002", 0x15BF, 0x15BF, "RDNA 3 (Phoenix)", "2023"),
+    ("1002", 0x15C8, 0x15C8, "RDNA 3 (Phoenix 2)", "2023"), ("1002", 0x150E, 0x150E, "RDNA 3.5 (Strix Point)", "2024"),
+    ("1002", 0x13C0, 0x13C0, "RDNA 2 (Granite Ridge)", "2024"),
+    ("8086", 0x5690, 0x56BF, "Arc Alchemist", "2022"), ("8086", 0xE200, 0xE2FF, "Arc Battlemage", "2024"),
+]
+
+
+def cpu_generation(cpu):
+    m = re.search(r"Family (\d+) Model (\d+)", str(cpu.get("Caption") or ""))
+    if not m:
+        return None
+    family, model = int(m.group(1)), int(m.group(2))
+    vendor = str(cpu.get("Manufacturer") or "")
+    if "Intel" in vendor and family == 6:
+        gen = INTEL_CPU_MODELS.get(model)
+    elif "AMD" in vendor:
+        gen = AMD_CPU_MODELS.get((family, model)) or AMD_CPU_FAMILIES.get(family)
+    else:
+        gen = None
+    return f"{gen[0]}, {gen[1]}" if gen else None
+
+
+def gpu_architecture(pnp_id):
+    ids = hw_ids(pnp_id) if pnp_id and "VEN_" in str(pnp_id).upper() else None
+    if not ids:
+        return None
+    vendor, device = ids.split(":")
+    for ven, lo, hi, arch, years in GPU_ARCHITECTURES:
+        if ven == vendor and lo <= int(device, 16) <= hi:
+            return f"{arch}, {years}"
+    return None
+
+
+def made_text(year, week=None):
+    """«8-я неделя 2020 г.» или «2020 г.»."""
+    year, week = to_int(year), to_int(week)
+    if not year:
+        return None
+    return f"{week}-я неделя {year} г." if week and 1 <= week <= 53 else f"{year} г."
+
 
 MONITOR_VENDORS = {
     "ACI": "ASUS", "ACR": "Acer", "AOC": "AOC", "APP": "Apple", "AUO": "AU Optronics", "AUS": "ASUS",
@@ -1971,6 +2134,7 @@ class Ctx:
         self.platform = raw.get("platform") or "windows"
         self.facts = OrderedDict()
         self.checks = []  # (что проверено, вывод) для раздела «Проверка состояния»
+        self.dates = []  # (компонент, дата текстом, год, неделя) — даты изготовления экземпляров
         self.battery_complete = False
         self.battery_noted = False
         self._drivers = None
@@ -2181,6 +2345,7 @@ def build_cpu(ctx):
         kv.add("Сокет", clean(c.get("SocketDesignation")))
         kv.add("Архитектура", CPU_ARCH.get(to_int(c.get("Architecture"))))
         kv.add("Разрядность", f"{c.get('AddressWidth')} бит" if to_int(c.get("AddressWidth")) else None)
+        kv.add("Поколение (год выхода модели)", cpu_generation(dict(c, Manufacturer=CPU_VENDORS.get(vendor, vendor))))
         kv.add("Семейство / модель / степпинг", clean(c.get("Caption")))
         kv.add("ID процессора (CPUID)", clean(c.get("ProcessorId")))
         kv.add("Аппаратная виртуализация", virt)
@@ -2235,7 +2400,7 @@ def build_memory(ctx):
     kv.add("ECC", "да" if ecc else None)
 
     table = sec.table("Модули памяти", ["Слот", "Объём", "Тип", "Скорость", "Напряжение",
-                                        "Производитель", "Партномер", "Серийный номер"],
+                                        "Производитель", "Партномер", "Дата изготовления", "Серийный номер"],
                       sensitive=["Серийный номер"])
     for m in mods:
         slot = clean(m.get("DeviceLocator"))
@@ -2250,7 +2415,12 @@ def build_memory(ctx):
         mv = to_int(m.get("ConfiguredVoltage"))
         table.add(slot or bank, fbytes(m.get("Capacity")), mtype, speed_text,
                   f"{fnum(mv / 1000, 3)} В" if mv else "", memory_vendor(m.get("Manufacturer")),
-                  clean(m.get("PartNumber")), clean(m.get("SerialNumber")))
+                  clean(m.get("PartNumber")), made_text(m.get("ManufactureYear"), m.get("ManufactureWeek")),
+                  clean(m.get("SerialNumber")))
+        made = made_text(m.get("ManufactureYear"), m.get("ManufactureWeek"))
+        if made:
+            label = f"модуль памяти {mods.index(m) + 1}" if len(mods) > 1 else "память"
+            ctx.dates.append((label, made, to_int(m.get("ManufactureYear")), to_int(m.get("ManufactureWeek")) or 0))
 
     items = []
     slow = [(to_int(m.get("ConfiguredClockSpeed")), to_int(m.get("Speed"))) for m in mods
@@ -2280,13 +2450,17 @@ def build_memory(ctx):
     return sec
 
 
-def gpu_vram(gpu, registry):
+def gpu_registry_entries(gpu, registry):
     name = (clean(gpu.get("Name")) or "").casefold()
     pnp = (gpu.get("PNPDeviceID") or "").lower()
     candidates = [e for e in registry or [] if (e.get("name") or "").casefold() == name]
     if len(candidates) > 1 and pnp:
         candidates = [e for e in candidates if (e.get("matching_id") or "").lower() in pnp] or candidates
-    for e in candidates:
+    return candidates
+
+
+def gpu_vram(gpu, registry):
+    for e in gpu_registry_entries(gpu, registry):
         size = to_int(e.get("memory"))
         if size and size > 0:
             return fbytes(size)
@@ -2328,9 +2502,14 @@ def build_gpu(ctx):
         kv.add("Модель", name)
         kv.add("Производитель", vendor)
         kv.add("Видеопроцессор", clean(g.get("VideoProcessor")))
+        kv.add("Архитектура (год выхода модели)", gpu_architecture(pnp))
         kv.add("Видеопамять", vram)
         kv.add("Текущий режим", mode)
         kv.add("Драйвер", driver)
+        bios = clean(g.get("VideoBios")) or next((clean(e.get("bios")) for e in gpu_registry_entries(g, registry)
+                                                  if clean(e.get("bios"))), None)
+        kv.add("BIOS видеокарты", bios)
+        kv.add("Серийный номер", clean(g.get("SerialNumber")), sensitive=True)
         kv.add("ID оборудования (VEN:DEV)", ids)
         if status and status.upper() != "OK":
             kv.add("Состояние", status)
@@ -2416,6 +2595,8 @@ def build_monitors(ctx):
         kv.add("Видеоадаптер", clean(mode.get("adapter")))
         kv.add("Дата выпуска", made)
         kv.add("Серийный номер", serial, sensitive=True)
+        if year:
+            ctx.dates.append(("экран", made, year, week if week and 1 <= week <= 53 else 0))
         label = name or " ".join(x for x in (vendor or vendor_code, product) if x)
         if label:
             extra = [x for x in (diag.split(" ")[0] if diag else None, native) if x]
@@ -2878,6 +3059,10 @@ def build_battery(ctx):
         if wear is not None:
             kv.add("Износ", f"{fnum(wear, 1)} % (осталось {fnum(100 - wear, 1)} % паспортной ёмкости)")
         kv.add("Циклов заряда", cycle_count or None)
+        made = parse_dt(r.get("manufactured"))
+        if made:
+            kv.add("Дата изготовления", fdate(made))
+            ctx.dates.append(("батарея", fdate(made), made.year, made.isocalendar()[1]))
         kv.add("Серийный номер", clean(s.get("SerialNumber")) or clean(r.get("serial")), sensitive=True)
         parts = [x for x in (f"заряд {charge} %" if charge is not None else None,
                              f"износ {fnum(wear, 1)} %" if wear is not None else None) if x]
@@ -3021,6 +3206,12 @@ def build_checks(ctx):
     kv = sec.kv()
     for label, text in ctx.checks:
         kv.add(label, text)
+    if ctx.dates:
+        latest = max(ctx.dates, key=lambda d: (d[2], d[3]))
+        text = "ℹ " + "; ".join(f"{name} — {made}" for name, made, _, _ in ctx.dates)
+        if len(ctx.dates) > 1:
+            text += f". Значит, компьютер собран не раньше, чем {latest[1]} (самая поздняя дата)"
+        kv.add("Даты изготовления", text)
     if kv.rows:
         sec.notes.append("✔ — в порядке, ⚠ — обратите внимание, ✖ — неисправность. У нового компьютера износ "
                          "батареи 0–5 %, наработка диска — не больше нескольких десятков часов и никаких ошибок "
