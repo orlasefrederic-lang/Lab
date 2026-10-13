@@ -8,6 +8,7 @@
     python main.py --console    текстовый режим
     python main.py --report     отчёт по сохранённой истории
     python main.py --demo       демо с выдуманными данными
+    python main.py --blocked    список программ, которым запрещена сеть
 """
 
 import argparse
@@ -52,6 +53,15 @@ def parse_args(argv=None):
                    help='не запрашивать права администратора')
     p.add_argument('--no-etw-filter', action='store_true',
                    help='не фильтровать события ETW по номерам (для диагностики)')
+    fw = p.add_argument_group('брандмауэр (из консоли администратора)')
+    fw.add_argument('--blocked', action='store_true',
+                    help='показать программы, которым запрещён доступ в сеть')
+    fw.add_argument('--block', metavar='ПУТЬ_К_EXE', help='запретить программе доступ в сеть')
+    fw.add_argument('--unblock', metavar='ПУТЬ_К_EXE', help='убрать запрет (разрешить сеть)')
+    fw.add_argument('--service', action='append', default=[], metavar='СЛУЖБА',
+                    help='для svchost.exe: служба Windows (можно указать несколько раз)')
+    fw.add_argument('--outbound-only', action='store_true',
+                    help='для --block: запретить только исходящие соединения')
     p.add_argument('--include-localhost', action='store_true',
                    help='для --report и --console: учитывать обмен внутри компьютера (localhost)')
     return p.parse_args(argv)
@@ -101,6 +111,19 @@ def main(argv=None):
     db_name = 'demo-history.sqlite3' if args.demo else 'history.sqlite3'
     db_path = args.db or os.path.join(data_dir, db_name)
 
+    if args.blocked or args.block or args.unblock:
+        from console import run_firewall_cli
+        if args.demo:
+            from firewall import DemoFirewall
+            return run_firewall_cli(DemoFirewall(delay=0), args)
+        if not winapi.IS_WINDOWS:
+            return fail('Брандмауэр есть только в Windows.', False)
+        if not winapi.is_admin():
+            return fail('Нужны права администратора: откройте «Терминал (администратор)» '
+                        'и повторите команду.', False)
+        from firewall import WindowsFirewall
+        return run_firewall_cli(WindowsFirewall(), args)
+
     if args.report:
         if not os.path.exists(db_path):
             return fail('История пока пуста: файл %s не найден.' % db_path, False)
@@ -109,10 +132,12 @@ def main(argv=None):
 
     if args.demo:
         from demo import DemoSource, DemoSysInfo
+        from firewall import DemoFirewall
         sysinfo = DemoSysInfo()
+        firewall_backend = DemoFirewall()
 
         def factory(model):
-            return DemoSource(model, sysinfo)
+            return DemoSource(model, sysinfo, firewall_backend)
         rdns = False
     else:
         if not winapi.IS_WINDOWS:
@@ -127,8 +152,12 @@ def main(argv=None):
             log.warning('работаем без прав администратора: байты считаться не будут')
         if not winapi.acquire_single_instance():
             return fail('Программа уже запущена.', gui_mode)
+        if winapi.is_admin() and not winapi.enable_debug_privilege():
+            log.warning('не удалось включить SeDebugPrivilege: у части служб не будет видно пути')
         from etw import EtwSession
+        from firewall import WindowsFirewall
         sysinfo = winapi.WinSysInfo()
+        firewall_backend = WindowsFirewall()
 
         def factory(model):
             return EtwSession(model, use_filter=not args.no_etw_filter)
@@ -158,8 +187,10 @@ def main(argv=None):
         print('Не найден модуль tkinter (%s) — запускаю текстовый режим.' % exc)
         from console import run_console
         return run_console(monitor, keep_days, top=args.top, hide_lo=not args.include_localhost)
+    from firewall import FirewallManager
     gui.run(monitor, keep_days, demo=args.demo,
-            settings_path=os.path.join(data_dir, 'settings.json'))
+            settings_path=os.path.join(data_dir, 'settings.json'),
+            firewall=FirewallManager(firewall_backend))
     return 0
 
 

@@ -103,6 +103,30 @@ class UNICODE_STRING(Structure):
     _fields_ = [('Length', USHORT), ('MaximumLength', USHORT), ('Buffer', ctypes.c_void_p)]
 
 
+class SYSTEM_PROCESS_ID_INFORMATION(Structure):
+    _fields_ = [('ProcessId', ctypes.c_void_p), ('ImageName', UNICODE_STRING)]
+
+
+class LUID(Structure):
+    _fields_ = [('LowPart', DWORD), ('HighPart', LONG)]
+
+
+class LUID_AND_ATTRIBUTES(Structure):
+    _fields_ = [('Luid', LUID), ('Attributes', DWORD)]
+
+
+class TOKEN_PRIVILEGES(Structure):
+    _fields_ = [('PrivilegeCount', DWORD), ('Privileges', LUID_AND_ATTRIBUTES * 1)]
+
+
+SYSTEM_PROCESS_ID_INFORMATION_CLASS = 88
+STATUS_INFO_LENGTH_MISMATCH = -1073741820  # 0xC0000004
+TOKEN_ADJUST_PRIVILEGES = 0x0020
+TOKEN_QUERY = 0x0008
+SE_PRIVILEGE_ENABLED = 0x00000002
+ERROR_NOT_ALL_ASSIGNED = 1300
+
+
 def _proto(func, restype, *argtypes):
     func.restype = restype
     func.argtypes = argtypes
@@ -131,6 +155,15 @@ if IS_WINDOWS:
     _GetTickCount64 = _proto(kernel32.GetTickCount64, ctypes.c_uint64)
     _NtQueryInformationProcess = _proto(ntdll.NtQueryInformationProcess, LONG, HANDLE, ULONG,
                                         ctypes.c_void_p, ULONG, POINTER(ULONG))
+    _NtQuerySystemInformation = _proto(ntdll.NtQuerySystemInformation, LONG, ULONG,
+                                       ctypes.c_void_p, ULONG, POINTER(ULONG))
+    _GetCurrentProcess = _proto(kernel32.GetCurrentProcess, HANDLE)
+    _OpenProcessToken = _proto(advapi32.OpenProcessToken, BOOL, HANDLE, DWORD, POINTER(HANDLE))
+    _LookupPrivilegeValueW = _proto(advapi32.LookupPrivilegeValueW, BOOL, ctypes.c_wchar_p,
+                                    ctypes.c_wchar_p, POINTER(LUID))
+    _AdjustTokenPrivileges = _proto(advapi32.AdjustTokenPrivileges, BOOL, HANDLE, BOOL,
+                                    POINTER(TOKEN_PRIVILEGES), DWORD, ctypes.c_void_p,
+                                    ctypes.c_void_p)
     _OpenSCManagerW = _proto(advapi32.OpenSCManagerW, HANDLE,
                              ctypes.c_wchar_p, ctypes.c_wchar_p, DWORD)
     _EnumServicesStatusExW = _proto(advapi32.EnumServicesStatusExW, BOOL, HANDLE, ctypes.c_int,
@@ -188,6 +221,54 @@ def acquire_single_instance(name='Local\\NetActivityMonitor.SingleInstance'):
     return True
 
 
+def enable_debug_privilege():
+    """Включает SeDebugPrivilege (есть у администраторов, но выключена по умолчанию).
+
+    Без неё Windows не даёт открыть процессы некоторых служб, и у них не видно пути.
+    """
+    if not IS_WINDOWS:
+        return False
+    token = HANDLE()
+    if not _OpenProcessToken(_GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
+                             byref(token)):
+        return False
+    try:
+        luid = LUID()
+        if not _LookupPrivilegeValueW(None, 'SeDebugPrivilege', byref(luid)):
+            return False
+        privileges = TOKEN_PRIVILEGES()
+        privileges.PrivilegeCount = 1
+        privileges.Privileges[0].Luid = luid
+        privileges.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED
+        if not _AdjustTokenPrivileges(token, False, byref(privileges), 0, None, None):
+            return False
+        return ctypes.get_last_error() != ERROR_NOT_ALL_ASSIGNED
+    finally:
+        _CloseHandle(token)
+
+
+def image_path_by_pid(pid):
+    """Путь к exe по PID без открытия процесса (вид \\Device\\HarddiskVolumeN\\...).
+
+    Работает даже для процессов, к которым нет доступа.
+    """
+    chars = 1024
+    for _ in range(3):
+        buf = ctypes.create_unicode_buffer(chars)
+        info = SYSTEM_PROCESS_ID_INFORMATION()
+        info.ProcessId = pid
+        info.ImageName.MaximumLength = min(chars * 2, 0xFFFE)
+        info.ImageName.Buffer = ctypes.addressof(buf)
+        status = _NtQuerySystemInformation(SYSTEM_PROCESS_ID_INFORMATION_CLASS, byref(info),
+                                           sizeof(info), None)
+        if status == 0:
+            return ctypes.wstring_at(info.ImageName.Buffer, info.ImageName.Length // 2)
+        if status != STATUS_INFO_LENGTH_MISMATCH or chars >= 32767:
+            return ''
+        chars = min(max(info.ImageName.MaximumLength // 2 + 1, chars * 2), 32767)
+    return ''
+
+
 def boot_time():
     return time.time() - _GetTickCount64() / 1000.0
 
@@ -240,13 +321,18 @@ def process_details(pid):
                 'started': boot_time(), 'cmdline': ''}
     handle = _OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
     if not handle:
-        return None if ctypes.get_last_error() == ERROR_INVALID_PARAMETER else {}
+        if ctypes.get_last_error() == ERROR_INVALID_PARAMETER:
+            return None
+        path = image_path_by_pid(pid)   # нет доступа: хотя бы путь
+        return {'path': path} if path else {}
     try:
         info = {}
         size = DWORD(32768)
         buf = ctypes.create_unicode_buffer(size.value)
         if _QueryFullProcessImageNameW(handle, 0, buf, byref(size)):
             info['path'] = buf.value
+        else:
+            info['path'] = image_path_by_pid(pid)
         created, exited, kernel, user = FILETIME(), FILETIME(), FILETIME(), FILETIME()
         if _GetProcessTimes(handle, byref(created), byref(exited), byref(kernel), byref(user)):
             info['started'] = filetime_to_unix(created.to_int())

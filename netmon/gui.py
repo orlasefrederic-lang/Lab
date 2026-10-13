@@ -4,6 +4,7 @@ import csv
 import ctypes
 import json
 import logging
+import ntpath
 import os
 import subprocess
 import sys
@@ -13,6 +14,7 @@ import tkinter.font as tkfont
 import webbrowser
 from tkinter import filedialog, messagebox, ttk
 
+from fwgui import BlockDialog, FirewallTab
 from model import display_name, group_views
 from util import (CATEGORY_LABELS, RateTracker, fmt_bytes, fmt_datetime, fmt_rate, fmt_time,
                   ip_category, port_label)
@@ -29,6 +31,7 @@ PROC_COLUMNS = [
     ('name', 'Программа', 250, 'w', True),
     ('pid', 'PID', 70, 'e', False),
     ('status', 'Состояние', 175, 'w', False),
+    ('fw', 'Брандмауэр', 165, 'w', False),
     ('sent', 'Отправлено', 110, 'e', False),
     ('recv', 'Получено', 100, 'e', False),
     ('total', 'Всего', 100, 'e', False),
@@ -69,11 +72,15 @@ def enable_dpi_awareness():
 
 
 class App:
-    def __init__(self, root, monitor, demo=False, settings_path=None):
+    def __init__(self, root, monitor, demo=False, settings_path=None, firewall=None):
         self.root = root
         self.monitor = monitor
         self.model = monitor.model
         self.demo = demo
+        self.firewall = firewall
+        self.fw_tab = None
+        self._flash = None
+        self._fw_watch_job = None
         self.settings_path = settings_path
         self.rates = RateTracker(3.0)
         self.sort = ('total', True)
@@ -126,7 +133,22 @@ class App:
 
     def _build(self):
         root = self.root
-        top = ttk.Frame(root, padding=(8, 6, 8, 0))
+        status = ttk.Frame(root)
+        status.pack(side='bottom', fill='x')
+        self.status_left = ttk.Label(status, style='Status.TLabel', text='Запуск…')
+        self.status_left.pack(side='left', fill='x', expand=True)
+        self.status_right = ttk.Label(status, style='Status.TLabel', text='')
+        self.status_right.pack(side='right')
+
+        self.notebook = ttk.Notebook(root)
+        self.notebook.pack(fill='both', expand=True, padx=4, pady=(4, 0))
+        activity = ttk.Frame(self.notebook)
+        self.notebook.add(activity, text='  Сетевая активность  ')
+        if self.firewall is not None:
+            self.fw_tab = FirewallTab(self.notebook, self, self.firewall)
+            self.notebook.add(self.fw_tab.frame, text='  Брандмауэр  ')
+
+        top = ttk.Frame(activity, padding=(4, 6, 4, 0))
         top.pack(side='top', fill='x')
 
         row1 = ttk.Frame(top)
@@ -158,15 +180,8 @@ class App:
         self.summary = ttk.Label(top, style='Summary.TLabel', text='')
         self.summary.pack(fill='x', pady=(2, 0))
 
-        status = ttk.Frame(root)
-        status.pack(side='bottom', fill='x')
-        self.status_left = ttk.Label(status, style='Status.TLabel', text='Запуск…')
-        self.status_left.pack(side='left', fill='x', expand=True)
-        self.status_right = ttk.Label(status, style='Status.TLabel', text='')
-        self.status_right.pack(side='right')
-
-        self.paned = ttk.Panedwindow(root, orient='vertical')
-        self.paned.pack(fill='both', expand=True, padx=8, pady=(4, 0))
+        self.paned = ttk.Panedwindow(activity, orient='vertical')
+        self.paned.pack(fill='both', expand=True, padx=4, pady=(4, 0))
 
         upper = ttk.Frame(self.paned)
         self.tree = self._make_tree(upper, PROC_COLUMNS, self._sort_by, 'extended')
@@ -190,6 +205,7 @@ class App:
         for tree in (self.tree, self.ep_tree):
             tree.tag_configure('ended', foreground='#8a8a8a')
             tree.tag_configure('active', foreground='#0b7a0b')
+            tree.tag_configure('blocked', foreground='#b00020')
         self._update_headings()
         self._set_details('Выберите программу в списке, чтобы увидеть подробности и адреса, '
                           'с которыми она обменивалась данными.')
@@ -221,6 +237,9 @@ class App:
                 self.paned.sashpos(0, int(self._sash))
             except (tk.TclError, ValueError):
                 pass
+        if self.firewall is not None:
+            self.firewall.refresh()
+            self.watch_firewall()
         self.refresh()
         status = self.monitor.status()
         if not self.demo and not status.get('source_ok'):
@@ -235,9 +254,11 @@ class App:
         if self._closing:
             return
         self._closing = True
-        for job in (self._tick_job, self._search_job):
+        for job in (self._tick_job, self._search_job, self._fw_watch_job):
             if job:
                 self.root.after_cancel(job)
+        if self.firewall is not None:
+            self.firewall.shutdown()
         self._save_settings()
         self.status_left.configure(text='Сохранение истории…')
         self.root.update_idletasks()
@@ -264,6 +285,7 @@ class App:
             now = time.time()
             self._refresh_processes(now)
             self._refresh_endpoints(now)
+            self._poll_firewall()
             self._refresh_status()
         except Exception:
             log.exception('ошибка обновления окна')
@@ -340,9 +362,10 @@ class App:
                 else:
                     status = 'завершена' if g.count == 1 else 'завершена (%d запусков)' % g.count
                 pid_text = str(g.pids[0]) if len(g.pids) == 1 else '%d +%d' % (g.pids[0], len(g.pids) - 1)
+                fw = self._firewall_status(g.path, g.services, g.pids[0])
                 rows.append(self._proc_row(iid, display_name(g.name, g.services), pid_text,
                                            g.pids[0], status, g.running > 0, g, up, down, n_eps,
-                                           now))
+                                           now, fw))
                 info[iid] = {'uids': g.uids, 'group': g,
                              'self_match': any(match.get(u) for u in g.uids)}
                 total_sent += g.sent
@@ -358,8 +381,10 @@ class App:
                 else:
                     status = 'завершена ' + fmt_time(v.ended, now)
                 iid = 'p%d' % v.uid
+                fw = self._firewall_status(v.path, v.services, v.pid)
                 rows.append(self._proc_row(iid, display_name(v.name, v.services), str(v.pid),
-                                           v.pid, status, running, v, up, down, v.n_eps, now))
+                                           v.pid, status, running, v, up, down, v.n_eps, now,
+                                           fw))
                 info[iid] = {'uids': [v.uid], 'view': v, 'self_match': self_match}
                 total_sent += v.sent
                 total_recv += v.recv
@@ -378,17 +403,27 @@ class App:
                fmt_rate(total_up) or '0 Б/с', fmt_rate(total_down) or '0 Б/с',
                '   ·   идёт поиск' if searching else '')))
 
-    def _proc_row(self, iid, name, pid_text, pid, status, running, item, up, down, n_eps, now):
+    def _firewall_status(self, path, services, pid):
+        if self.firewall is None or pid in (0, 4):
+            return '', ''
+        return self.firewall.status(path, services)
+
+    def _proc_row(self, iid, name, pid_text, pid, status, running, item, up, down, n_eps, now,
+                  fw=('', '')):
+        fw_state, fw_label = fw
         active = running and up + down >= 1
         last = 'сейчас' if active else fmt_time(item.last_seen, now)
-        values = (name, pid_text, status, fmt_bytes(item.sent), fmt_bytes(item.recv),
+        values = (name, pid_text, status, fw_label, fmt_bytes(item.sent), fmt_bytes(item.recv),
                   fmt_bytes(item.sent + item.recv), fmt_rate(up), fmt_rate(down), n_eps,
                   fmt_time(item.started, now), last, item.path)
-        sort = {'name': name.lower(), 'pid': pid, 'status': (running, item.ended or 0),
+        sort = {'name': name.lower(), 'pid': pid, 'status': (running, item.ended or 0), 'fw': fw_label,
                 'sent': item.sent, 'recv': item.recv, 'total': item.sent + item.recv,
                 'up': up, 'down': down, 'eps': n_eps, 'started': item.started or 0,
                 'last': item.last_seen or 0, 'path': (item.path or '').lower()}
-        tags = ('active',) if active else (() if running else ('ended',))
+        if fw_state in ('blocked', 'partial'):
+            tags = ('blocked',)
+        else:
+            tags = ('active',) if active else (() if running else ('ended',))
         return iid, values, tags, sort
 
     def _group_endpoints(self, group, hide_lo):
@@ -535,6 +570,8 @@ class App:
         if st.get('error'):
             text += ' · ошибка: %s' % st['error']
             style = 'Error.TLabel'
+        if self._flash and time.time() < self._flash[1]:
+            text, style = self._flash[0], 'Status.TLabel'
         self.status_left.configure(text=text, style=style)
         self.status_right.configure(text=('История: %s' % st['db']) if st.get('db')
                                     else 'История не сохраняется')
@@ -543,7 +580,7 @@ class App:
 
     def _sort_by(self, col):
         current, reverse = self.sort
-        numeric = col not in ('name', 'path', 'status')
+        numeric = col not in ('name', 'path', 'status', 'fw')
         self.sort = (col, not reverse if col == current else numeric)
         self._update_headings()
         self.refresh(tick=False)
@@ -591,7 +628,67 @@ class App:
         menu.add_separator()
         menu.add_command(label='Открыть папку программы', command=lambda: _reveal(item.path),
                          state='normal' if item.path else 'disabled')
+        if self.firewall is not None:
+            pid = item.pid if info.get('view') is not None else item.pids[0]
+            menu.add_separator()
+            menu.add_command(label='Запретить доступ в сеть…',
+                             command=lambda: self.block_dialog(item.path, item.services),
+                             state='disabled' if pid in (0, 4) or not item.path else 'normal')
+            entries = self.firewall.entries_for(item.path, item.services) if item.path else []
+            if entries:
+                menu.add_command(label='Разрешить доступ в сеть (убрать запрет)',
+                                 command=lambda: self._unblock(entries))
         menu.tk_popup(event.x_root, event.y_root)
+
+    # ------------------------------------------------------------ брандмауэр
+
+    def block_candidates(self):
+        """Программы для списка в окне «Запретить»: [(подпись, путь, службы, pid)]."""
+        seen = {}
+        for v in self.model.view():
+            if not v.path or v.pid in (0, 4) or not (v.sent or v.recv or v.n_eps):
+                continue
+            key = (v.path.lower(), v.services)
+            if key not in seen or v.sent + v.recv > seen[key][0]:
+                seen[key] = (v.sent + v.recv, v)
+        items = sorted(seen.values(), key=lambda t: (t[1].name.lower(), t[1].services))
+        return [('%s  —  %s' % (display_name(v.name, v.services), v.path), v.path, v.services, v.pid)
+                for _total, v in items]
+
+    def block_dialog(self, path, services):
+        BlockDialog(self.root, self.firewall, self.block_candidates(), (path, services),
+                    on_submit=self.watch_firewall)
+
+    def _unblock(self, entries):
+        names = ', '.join(e.service or ntpath.basename(e.program) for e in entries)
+        if messagebox.askyesno('Разрешить доступ в сеть',
+                               'Убрать запрет и снова разрешить доступ в сеть: %s?' % names,
+                               parent=self.root):
+            self.firewall.unblock(entries)
+            self.watch_firewall()
+
+    def watch_firewall(self):
+        """Частый опрос, пока выполняются команды брандмауэра."""
+        if self._fw_watch_job:
+            self.root.after_cancel(self._fw_watch_job)
+        self._poll_firewall()
+        if self.firewall is not None and self.firewall.busy:
+            self._fw_watch_job = self.root.after(300, self.watch_firewall)
+        else:
+            self._fw_watch_job = None
+            self.refresh(tick=False)
+
+    def _poll_firewall(self):
+        if self.firewall is None:
+            return
+        if self.fw_tab is not None:
+            self.fw_tab.update()
+        for kind, text in self.firewall.take_messages():
+            if kind == 'error':
+                messagebox.showerror('Брандмауэр', 'Не получилось:\n\n%s' % text, parent=self.root)
+            else:
+                self._flash = (text, time.time() + 8)
+                self._refresh_status()
 
     def _ep_menu(self, event):
         iid = self.ep_tree.identify_row(event.y)
@@ -722,10 +819,10 @@ def _reveal(path):
         log.warning('не удалось открыть папку', exc_info=True)
 
 
-def run(monitor, keep_days=None, demo=False, settings_path=None):
+def run(monitor, keep_days=None, demo=False, settings_path=None, firewall=None):
     enable_dpi_awareness()
     root = tk.Tk()
-    app = App(root, monitor, demo=demo, settings_path=settings_path)
+    app = App(root, monitor, demo=demo, settings_path=settings_path, firewall=firewall)
     root.update()
     monitor.start(keep_days)
     app.start()

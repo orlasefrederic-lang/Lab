@@ -4,6 +4,8 @@ import os
 import sys
 import time
 
+from firewall import (FirewallError, block_plan, check_blockable, directions_label, group_rules,
+                      normalize_path, stale_rule_ids, warnings_for)
 from model import Model, display_name, group_views
 from util import RateTracker, fmt_bytes, fmt_datetime, fmt_rate, fmt_time, ip_category
 
@@ -107,4 +109,54 @@ def run_report(storage, days=None, top=30, include_lo=False, destinations=5):
         print()
     if len(groups) > top:
         print('…и ещё программ: %d (параметр --top)' % (len(groups) - top))
+    return 0
+
+
+def run_firewall_cli(backend, args):
+    """--blocked / --block / --unblock: управление запретами из консоли."""
+    services = [s for item in args.service for s in item.replace(';', ',').split(',') if s.strip()]
+    services = [s.strip() for s in services]
+    try:
+        if args.block:
+            path = os.path.abspath(args.block) if os.name == 'nt' else args.block
+            error = check_blockable(path, services)
+            if error:
+                print(error)
+                return 1
+            for note in warnings_for(path, services):
+                print('Внимание:', note)
+            directions = ('out',) if args.outbound_only else ('out', 'in')
+            plan = block_plan(path, services, directions)
+            stale = stale_rule_ids(group_rules(backend.state()[0]), plan)
+            if stale:
+                backend.remove(stale)
+            backend.add(plan)
+            print('Запрещено: %s%s — %s' % (path, ' (службы: %s)' % ', '.join(services)
+                                             if services else '', directions_label(directions)))
+        if args.unblock:
+            target = normalize_path(os.path.abspath(args.unblock) if os.name == 'nt' else args.unblock)
+            wanted = {s.lower() for s in services}
+            rules, _profiles = backend.state()
+            ids = [r.id for r in rules if normalize_path(r.program) == target
+                   and (not wanted or r.service.lower() in wanted)]
+            if not ids:
+                print('Для %s запретов в списке нет.' % args.unblock)
+                return 1
+            backend.remove(ids)
+            print('Запрет снят: %s (правил удалено: %d)' % (args.unblock, len(ids)))
+        rules, profiles = backend.state()
+    except FirewallError as exc:
+        print('Ошибка брандмауэра: %s' % exc)
+        return 1
+    entries = group_rules(rules)
+    print()
+    print('Программы, которым запрещён доступ в сеть: %d' % len(entries))
+    for e in entries:
+        state = {True: 'запрещено', False: 'временно разрешено'}.get(e.enabled, 'частично')
+        print('  %s%s — %s, %s' % (e.program, ' [служба %s]' % e.service if e.service else '',
+                                  directions_label(e.directions), state))
+    off = [name for name, enabled in profiles if not enabled]
+    if off:
+        print('\nВнимание: брандмауэр Windows выключен для профилей: %s — запреты не действуют.'
+              % ', '.join(off))
     return 0

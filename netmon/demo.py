@@ -113,9 +113,10 @@ class DemoSysInfo:
 class DemoSource:
     """Генерирует события так же, как это делает EtwSession."""
 
-    def __init__(self, model, sysinfo):
+    def __init__(self, model, sysinfo, firewall=None):
         self.model = model
         self.sysinfo = sysinfo
+        self.firewall = firewall   # DemoFirewall: запрещённые программы молчат
         self.events = 0
         self._stop = threading.Event()
         self._thread = None
@@ -158,8 +159,12 @@ class DemoSource:
         short_lived = []
         while not self._stop.wait(0.05):
             with self.sysinfo._lock:
-                procs = [(pid, p['flows']) for pid, p in self.sysinfo.procs.items() if p['alive']]
-            for pid, flows in procs:
+                procs = [(pid, p['flows'], p['path'], p['services'])
+                         for pid, p in self.sysinfo.procs.items() if p['alive']]
+            for pid, flows, path, services in procs:
+                if self.firewall is not None and path and self.firewall.blocks(
+                        path, [s for s in services.split(', ') if s]):
+                    continue
                 for i, flow in enumerate(flows):
                     if self._rand.random() < 0.25 * flow[4] / 4:
                         self._emit(pid, flow, i)
