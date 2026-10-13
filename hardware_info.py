@@ -54,7 +54,7 @@ try:
 except ImportError:  # не Windows — работает только режим --load-raw
     winreg = None
 
-VERSION = "2.1"
+VERSION = "2.1.1"
 IS_WINDOWS = sys.platform == "win32"
 IS_LINUX = sys.platform.startswith("linux")
 CREATE_NO_WINDOW = 0x08000000 if IS_WINDOWS else 0  # без мелькающего окна консоли
@@ -2502,13 +2502,18 @@ def build_gpu(ctx):
         kv.add("Модель", name)
         kv.add("Производитель", vendor)
         kv.add("Видеопроцессор", clean(g.get("VideoProcessor")))
-        kv.add("Архитектура (год выхода модели)", gpu_architecture(pnp))
+        arch = gpu_architecture(pnp)
+        if not arch and ids and ids.startswith("8086:") and ctx.rows("cpu"):  # встроенная графика Intel
+            gen = cpu_generation(dict(ctx.rows("cpu")[0], Manufacturer="Intel"))
+            arch = f"встроена в процессор ({gen})" if gen else None
+        kv.add("Архитектура (год выхода модели)", arch)
         kv.add("Видеопамять", vram)
         kv.add("Текущий режим", mode)
         kv.add("Драйвер", driver)
         bios = clean(g.get("VideoBios")) or next((clean(e.get("bios")) for e in gpu_registry_entries(g, registry)
                                                   if clean(e.get("bios"))), None)
-        kv.add("BIOS видеокарты", bios)
+        bios = re.sub(r"^Version\s*", "", bios or "", flags=re.I)  # NVIDIA пишет «Version94.6.16.0.4b»
+        kv.add("BIOS видеокарты", bios if re.search(r"\d", bios) else None)  # «Intel Video BIOS» — без версии
         kv.add("Серийный номер", clean(g.get("SerialNumber")), sensitive=True)
         kv.add("ID оборудования (VEN:DEV)", ids)
         if status and status.upper() != "OK":
