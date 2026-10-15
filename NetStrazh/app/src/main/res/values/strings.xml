@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Сетевой страж</string>
+    <string name="channel_status">Состояние защиты</string>
+    <string name="notif_on">Защита включена</string>
+    <string name="notif_no_rules">Наблюдаю за сетью · блок-лист пуст</string>
+    <string name="notif_blocked">Наблюдаю за сетью · в блок-листе: %1$d</string>
+    <string name="notif_stop">Выключить</string>
+</resources>
