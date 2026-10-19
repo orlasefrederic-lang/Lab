@@ -60,6 +60,7 @@ class Upstream(private val host: EngineHost) {
     @Volatile var proxyUid = UID_UNKNOWN
         private set
     @Volatile private var proxyUidCheckedAt = 0L
+    @Volatile private var probeFailedAt = 0L
     @Volatile private var udpUnsupportedAt = 0L
     @Volatile var lastError: String? = null
         private set
@@ -84,6 +85,7 @@ class Upstream(private val host: EngineHost) {
             proxyAddr = null
             proxyUid = UID_UNKNOWN
             proxyUidCheckedAt = 0L
+            probeFailedAt = 0L
             udpUnsupportedAt = 0L
             lastError = null
             lastErrorAt = 0L
@@ -119,6 +121,8 @@ class Upstream(private val host: EngineHost) {
         if (!cfg.enabled) return
         val now = System.currentTimeMillis()
         if (proxyUid != UID_UNKNOWN && now - proxyUidCheckedAt < PROXY_UID_TTL_MS) return
+        // An unreachable proxy (e.g. a LAN proxy dropping packets) must not stall every DNS setup.
+        if (now - probeFailedAt < PROXY_UID_RETRY_MS) return
         if (!probing.compareAndSet(false, true)) return
         var ch: SocketChannel? = null
         try {
@@ -127,6 +131,7 @@ class Upstream(private val host: EngineHost) {
             ch.socket().connect(proxyEndpoint(), 2000)
             learnProxyUid(ch)
         } catch (e: Exception) {
+            probeFailedAt = System.currentTimeMillis()
             noteError("прокси недоступен: ${e.message ?: e.javaClass.simpleName}", down = true)
         } finally {
             Engine.closeQuietly(ch)
