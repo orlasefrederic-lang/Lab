@@ -111,6 +111,7 @@ class FirewallService : VpnService(), EngineHost {
         }
         engine = e
         running = true
+        Prefs.revokedAt = 0L
         Db.pruneAsync()
         updateNotification()
     }
@@ -129,7 +130,9 @@ class FirewallService : VpnService(), EngineHost {
             .setConfigureIntent(mainIntent())
         if (cfg.v6) {
             b.addAddress(TunConfig.T6, 64)
-            b.addRoute("2000::", 3) // global unicast only
+            // All IPv6 except link-local fe80::/10 and multicast ff00::/8 (local discovery), like IPv4.
+            // That includes NAT64 prefixes (IPv4-only hosts on IPv6-only mobile networks) and ULA.
+            for ((a, n) in V6_ROUTES) b.addRoute(a, n)
         }
         b.setMetered(false)
         net.best?.let { b.setUnderlyingNetworks(arrayOf(it)) }
@@ -271,6 +274,10 @@ class FirewallService : VpnService(), EngineHost {
     companion object {
         const val ACTION_START = "lab.netstrazh.START"
         const val ACTION_STOP = "lab.netstrazh.STOP"
+        private val V6_ROUTES = listOf(
+            "::" to 1, "8000::" to 2, "c000::" to 3, "e000::" to 4, "f000::" to 5,
+            "f800::" to 6, "fc00::" to 7, "fe00::" to 9, "fec0::" to 10,
+        )
         private const val CHANNEL = "status"
         private const val NOTIF_ID = 1
 

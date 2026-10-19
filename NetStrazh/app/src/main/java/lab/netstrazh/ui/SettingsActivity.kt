@@ -310,7 +310,10 @@ class SettingsActivity : Activity() {
     private fun otherVpnActive(): Boolean {
         val cm = getSystemService(ConnectivityManager::class.java)
         @Suppress("DEPRECATION")
-        return cm.allNetworks.any { cm.getNetworkCapabilities(it)?.hasTransport(NetworkCapabilities.TRANSPORT_VPN) == true }
+        return cm.allNetworks.any {
+            val caps = cm.getNetworkCapabilities(it)
+            caps != null && caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN) && caps.ownerUid != android.os.Process.myUid()
+        }
     }
 
     private fun toast(s: String) = Toast.makeText(this, s, Toast.LENGTH_LONG).show()

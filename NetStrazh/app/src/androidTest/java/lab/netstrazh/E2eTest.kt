@@ -215,15 +215,18 @@ class E2eTest {
 
     @Test fun t06_blockingAndUnblocking() {
         Rules.set(ctx.packageName, Rules.BLOCK_ALL)
-        Thread.sleep(500)
-        val start = SystemClock.uptimeMillis()
-        val got = try { httpGet("example.com") } catch (e: IOException) { "" }
-        assertEquals("blocked app must not get data", "", got)
-        assertTrue("blocked quickly", SystemClock.uptimeMillis() - start < 10_000)
-        waitSeen("blocked TCP") { it.blocked && it.proto == "TCP" && it.port == 80 && it.uid == myUid }
-        assertEquals("blocked UDP gets no answer", null, dnsQueryUdp("8.8.8.8", "example.com"))
-
-        Rules.set(ctx.packageName, 0)
+        try {
+            Thread.sleep(500)
+            val start = SystemClock.uptimeMillis()
+            val got = try { httpGet("example.com") } catch (e: IOException) { "" }
+            assertEquals("blocked app must not get data", "", got)
+            assertTrue("blocked quickly", SystemClock.uptimeMillis() - start < 10_000)
+            waitSeen("blocked TCP") { it.blocked && it.proto == "TCP" && it.port == 80 && it.uid == myUid }
+            assertEquals("blocked UDP gets no answer", null, dnsQueryUdp("8.8.8.8", "example.com"))
+        } finally {
+            // Later tests must not run blocked if an assertion above fails.
+            Rules.set(ctx.packageName, 0)
+        }
         Thread.sleep(500)
         assertTrue(httpGet("example.com").startsWith("HTTP/1."))
     }

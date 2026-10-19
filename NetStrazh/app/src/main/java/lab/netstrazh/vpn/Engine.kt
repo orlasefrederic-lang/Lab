@@ -115,6 +115,8 @@ class Engine(val host: EngineHost, private val pfd: ParcelFileDescriptor, val cf
         threads += thread(name = "ns-accept4", isDaemon = true) { acceptLoop(s4) }
         tcp6?.let { s6 -> threads += thread(name = "ns-accept6", isDaemon = true) { acceptLoop(s6) } }
         house.scheduleWithFixedDelay({ housekeeping() }, 5, 5, TimeUnit.SECONDS)
+        // Learn the proxy app early, so its first lookups after a (re)start go directly.
+        if (upstream.enabled) house.execute { upstream.ensureProxyUid() }
     }
 
     fun stop() {
@@ -270,12 +272,15 @@ class Engine(val host: EngineHost, private val pfd: ParcelFileDescriptor, val cf
                 Thread.sleep(50)
                 continue
             }
-            val e = nat.byPort(ch.socket().port)
+            // Only connections rewritten by tcpFromTun come from the fake peer; any other local
+            // socket reaching the server address is not an app flow.
+            val from = ch.socket().inetAddress?.address
+            val peer = if (from?.size == 16) cfg.p6 else cfg.p4
+            val e = if (from != null && from.contentEquals(peer)) nat.claim(ch.socket().port) else null
             if (e == null) {
                 closeQuietly(ch)
                 continue
             }
-            e.accepted = true
             try {
                 pool.execute { relayTcp(e, ch) }
             } catch (ex: RejectedExecutionException) {
@@ -314,6 +319,7 @@ class Engine(val host: EngineHost, private val pfd: ParcelFileDescriptor, val cf
             val o: SocketChannel
             if (fakeDns) {
                 // DNS over TCP to our fake resolver (e.g. truncated answers): same route as UDP DNS.
+                upstream.awaitProxyUid()
                 if (upstream.dnsViaProxy(uid)) {
                     o = upstream.openTcp(InetSocketAddress(host.resolve(upstream.cfg.dnsServer), 53), uid, CONNECT_TIMEOUT_MS) { out.set(it) }.ch
                     conn.via = VIA_PROXY
@@ -325,12 +331,17 @@ class Engine(val host: EngineHost, private val pfd: ParcelFileDescriptor, val cf
                 // the host name: the proxy then connects by name and its routing rules by domain work.
                 var name: String? = null
                 if (upstream.proxied(uid)) {
-                    val (bytes, sniffed) = preread(client)
+                    val (bytes, sniffer) = preread(client)
                     first = bytes
+                    val sniffed = sniffer.host
                     if (sniffed != null) {
                         if (!isIpLiteral(sniffed) || conn.host == null) conn.host = sniffed
-                        // Only a name the app itself sent (SNI/Host) is exact enough to connect by.
-                        if (!isIpLiteral(sniffed) && sniffed.length <= 253) name = sniffed
+                        // Only a name the app itself sent is exact enough to connect by. SNI is bound to
+                        // the server by its certificate; a plain HTTP Host only when the app got this IP
+                        // for that name from our resolver. Local addresses always go by IP, so the proxy
+                        // app's "bypass LAN" rules see them.
+                        if (isHostName(sniffed) && !isLocal(dst) &&
+                            (sniffer.tls || sniffed.equals(DnsCache.get(uid, ip), ignoreCase = true))) name = sniffed
                     }
                 }
                 val opened = upstream.openTcp(InetSocketAddress(dst, e.dstPort), uid, CONNECT_TIMEOUT_MS, name) { out.set(it) }
@@ -373,7 +384,7 @@ class Engine(val host: EngineHost, private val pfd: ParcelFileDescriptor, val cf
      * Reads the app's first bytes for up to [PREREAD_MS] (client-first protocols send them at once;
      * server-first ones like SMTP/SSH simply time out) and extracts the host name from them.
      */
-    private fun preread(client: SocketChannel): Pair<ByteArray, String?> {
+    private fun preread(client: SocketChannel): Pair<ByteArray, HostSniffer> {
         val sniffer = HostSniffer()
         val buf = java.io.ByteArrayOutputStream()
         val chunk = ByteArray(BUF_SIZE)
@@ -394,7 +405,7 @@ class Engine(val host: EngineHost, private val pfd: ParcelFileDescriptor, val cf
         } finally {
             try { sock.soTimeout = 0 } catch (_: Exception) {}
         }
-        return buf.toByteArray() to sniffer.host
+        return buf.toByteArray() to sniffer
     }
 
     private fun pump(src: SocketChannel, dst: SocketChannel, conn: Conn, up: Boolean, sniff: Boolean = true) {
@@ -485,5 +496,21 @@ class Engine(val host: EngineHost, private val pfd: ParcelFileDescriptor, val cf
         }
 
         fun isIpLiteral(h: String): Boolean = h.contains(':') || h.all { it.isDigit() || it == '.' }
+
+        /** A DNS name (not an IP literal) safe to put into a SOCKS or HTTP CONNECT request. */
+        fun isHostName(h: String): Boolean = h.length in 1..253 && !isIpLiteral(h) && h[0] != '.' &&
+            h.all { it in 'a'..'z' || it in 'A'..'Z' || it in '0'..'9' || it == '.' || it == '-' || it == '_' }
+
+        /**
+         * Not a public address: private, link-local, loopback, multicast, carrier-grade NAT (100.64/10,
+         * also used by mesh VPNs) or IPv6 unique local (fc00::/7).
+         */
+        fun isLocal(a: InetAddress): Boolean {
+            val b = a.address
+            return a.isSiteLocalAddress || a.isLinkLocalAddress || a.isLoopbackAddress || a.isAnyLocalAddress ||
+                a.isMulticastAddress ||
+                (b.size == 4 && b[0].toInt() == 100 && (b[1].toInt() and 0xC0) == 64) ||
+                (b.size == 16 && (b[0].toInt() and 0xFE) == 0xFC)
+        }
     }
 }

@@ -165,6 +165,8 @@ class UdpRelay(private val eng: Engine) {
     private fun openPath(s: Session, uid: Int, dstInet: InetAddress, directOnly: Boolean = false): Boolean {
         val up = eng.upstream
         try {
+            // DNS and HTTP-proxy UDP decide by the proxy app's UID without connecting to the proxy first.
+            if (!directOnly) up.awaitProxyUid()
             if (directOnly) {
                 s.path = up.directUdp(InetSocketAddress(if (s.isDns) eng.host.upstreamDns() else dstInet, s.remotePort))
             } else if (s.isDns) {
@@ -185,7 +187,13 @@ class UdpRelay(private val eng: Engine) {
                     } else {
                         s.conn.note = up.udpDropReason()
                         // Re-evaluate later: the proxy may come back (soon) or gain UDP (after the recheck).
-                        s.retryAt = System.currentTimeMillis() + if (up.udpUnsupported) Upstream.UDP_RECHECK_MS else 5_000L
+                        // An HTTP proxy never carries UDP: keep one dropped session until the flow goes idle
+                        // (a settings change closes it anyway) instead of re-creating it every few seconds.
+                        s.retryAt = when {
+                            up.cfg.type == ProxyType.HTTP -> 0L
+                            up.udpUnsupported -> System.currentTimeMillis() + Upstream.UDP_RECHECK_MS
+                            else -> System.currentTimeMillis() + 5_000L
+                        }
                         synchronized(s) {
                             s.queue.clear()
                             s.state = DROP

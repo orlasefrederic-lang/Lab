@@ -65,6 +65,9 @@ class Upstream(private val host: EngineHost) {
         private set
     @Volatile var lastErrorAt = 0L
         private set
+    /** Last time the proxy as a whole failed (unreachable, login refused), unlike one refused destination. */
+    @Volatile var downAt = 0L
+        private set
     @Volatile var lastOkAt = 0L
         private set
     private val lock = Any()
@@ -84,6 +87,7 @@ class Upstream(private val host: EngineHost) {
             udpUnsupportedAt = 0L
             lastError = null
             lastErrorAt = 0L
+            downAt = 0L
             lastOkAt = 0L
         }
         dnsPipe.close()
@@ -123,7 +127,7 @@ class Upstream(private val host: EngineHost) {
             ch.socket().connect(proxyEndpoint(), 2000)
             learnProxyUid(ch)
         } catch (e: Exception) {
-            noteError("прокси недоступен: ${e.message ?: e.javaClass.simpleName}")
+            noteError("прокси недоступен: ${e.message ?: e.javaClass.simpleName}", down = true)
         } finally {
             Engine.closeQuietly(ch)
             probing.set(false)
@@ -132,15 +136,41 @@ class Upstream(private val host: EngineHost) {
 
     private val probing = java.util.concurrent.atomic.AtomicBoolean(false)
 
-    /** Finds which app owns the proxy's end of [ch] (local = proxy endpoint, remote = our socket). */
-    private fun learnProxyUid(ch: SocketChannel) {
+    /**
+     * For routing decisions that cannot learn the proxy app's UID themselves (DNS answered through
+     * the proxy, UDP an HTTP proxy cannot carry): finds it first if still unknown, e.g. right after
+     * the engine started, so the proxy app's own lookups never go into its proxy. May block ~2 s.
+     */
+    fun awaitProxyUid() {
+        if (!cfg.enabled || proxyUid != UID_UNKNOWN) return
+        ensureProxyUid()
+        // Another thread's probe may still be running.
+        val end = System.currentTimeMillis() + 2_500
+        while (proxyUid == UID_UNKNOWN && probing.get() && System.currentTimeMillis() < end) Thread.sleep(20)
+    }
+
+    /**
+     * Finds which app owns the proxy's end of [ch] (local = proxy endpoint, remote = our socket).
+     * Returns the value stored in [proxyUid], or null if the lookup was not possible.
+     */
+    private fun learnProxyUid(ch: SocketChannel): Int? {
         val c = cfg
-        val local = ch.socket().localSocketAddress as? InetSocketAddress ?: return
-        val remote = ch.socket().remoteSocketAddress as? InetSocketAddress ?: return
-        val uid = host.ownerUid(OsConstants.IPPROTO_TCP, remote, local)
-        if (cfg !== c) return
-        proxyUid = if (uid >= 0 && uid != host.selfUid) uid else UID_NONE
+        val local = ch.socket().localSocketAddress as? InetSocketAddress ?: return null
+        val remote = ch.socket().remoteSocketAddress as? InetSocketAddress ?: return null
+        var uid = host.ownerUid(OsConstants.IPPROTO_TCP, remote, local)
+        // Right after connect() the proxy's end can still be a half-open request socket, which the
+        // kernel reports as owned by uid 0. Ask again until its handshake is done; a proxy that really
+        // runs as root (rooted phones) keeps answering 0 and is accepted after that, once.
+        var tries = 0
+        while (uid == 0 && proxyUid != 0 && tries++ < 5) {
+            Thread.sleep(10)
+            uid = host.ownerUid(OsConstants.IPPROTO_TCP, remote, local)
+        }
+        if (cfg !== c) return null
+        val learned = if (uid >= 0 && uid != host.selfUid) uid else UID_NONE
+        proxyUid = learned
         proxyUidCheckedAt = System.currentTimeMillis()
+        return learned
     }
 
     private fun newChannel(track: (SocketChannel) -> Unit): SocketChannel {
@@ -157,8 +187,9 @@ class Upstream(private val host: EngineHost) {
     class IsProxyApp : IOException("proxy app")
 
     /**
-     * Connects to the proxy for a flow of [uid]. The proxy app's UID is (re)learned from this very
-     * connection when unknown or stale, so the proxy app's own traffic is never sent into its proxy.
+     * Connects to the proxy for a flow of [uid]. The proxy app's UID is learned from this very
+     * connection every time (another app may have taken over the port), so the proxy app's own
+     * traffic is never sent into its proxy.
      */
     private fun proxyChannel(uid: Int, track: (SocketChannel) -> Unit): SocketChannel {
         val ch = newChannel(track)
@@ -168,10 +199,9 @@ class Upstream(private val host: EngineHost) {
             Engine.closeQuietly(ch)
             throw ProxyDown(e)
         }
-        if (proxyUid == UID_UNKNOWN || System.currentTimeMillis() - proxyUidCheckedAt > PROXY_UID_TTL_MS) {
-            try { learnProxyUid(ch) } catch (_: Exception) {}
-        }
-        if (uid == proxyUid) {
+        // Compare with what this very connection found, not the shared field another thread may be writing.
+        val owner = try { learnProxyUid(ch) } catch (_: Exception) { null } ?: proxyUid
+        if (uid == owner) {
             Engine.closeQuietly(ch)
             throw IsProxyApp()
         }
@@ -205,11 +235,12 @@ class Upstream(private val host: EngineHost) {
             } catch (e: IsProxyApp) {
                 // fall through to a direct connection
             } catch (e: ProxyDown) {
-                noteError("прокси недоступен: ${e.cause?.message ?: "нет соединения"}")
+                noteError("прокси недоступен: ${e.cause?.message ?: "нет соединения"}", down = true)
                 if (!c.directIfDown) throw e
             } catch (e: ProxyException) {
                 // The proxy is up but refused: the destination is unreachable through it. Never fall back.
-                if (e.code !in 3..6) noteError(e.message ?: "ошибка прокси")
+                // No reply code (not a proxy, login refused) or HTTP 407 means every connection fails.
+                if (e.code !in 3..6) noteError(e.message ?: "ошибка прокси", down = e.code == -1 || e.code == 407)
                 throw e
             }
         }
@@ -256,7 +287,7 @@ class Upstream(private val host: EngineHost) {
                     Engine.closeQuietly(ctl)
                     return directUdp(dst)
                 } catch (e: ProxyDown) {
-                    noteError("прокси недоступен: ${e.cause?.message ?: "нет соединения"}")
+                    noteError("прокси недоступен: ${e.cause?.message ?: "нет соединения"}", down = true)
                     if (!c.directIfDown) return null
                 } catch (e: Exception) {
                     Engine.closeQuietly(dc)
@@ -314,9 +345,10 @@ class Upstream(private val host: EngineHost) {
 
     fun close() = dnsPipe.close()
 
-    private fun noteError(msg: String) {
+    private fun noteError(msg: String, down: Boolean = false) {
         lastError = msg
         lastErrorAt = System.currentTimeMillis()
+        if (down) downAt = lastErrorAt
     }
 
     /** The proxy itself could not be reached. */

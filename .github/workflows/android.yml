@@ -42,26 +42,13 @@ jobs:
         run: ./gradlew --no-daemon assembleRelease
 
       - name: Name the APK
-        run: cp app/build/outputs/apk/release/app-release.apk "NetStrazh-1.0.${{ github.run_number }}.apk"
+        # Same number as versionName in app/build.gradle.kts (1.1.<build>).
+        run: cp app/build/outputs/apk/release/app-release.apk "NetStrazh-1.1.${{ github.run_number }}.apk"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: NetStrazh-1.0.${{ github.run_number }}
+          name: NetStrazh-1.1.${{ github.run_number }}
           path: NetStrazh/NetStrazh-*.apk
-
-      - name: Publish to Releases
-        if: >-
-          (github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))) ||
-          (github.event_name == 'workflow_dispatch' && inputs.release)
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: build-${{ github.run_number }}
-          name: Сетевой страж 1.0.${{ github.run_number }}
-          target_commitish: ${{ github.sha }}
-          files: NetStrazh/NetStrazh-*.apk
-          body: |
-            Сборка ${{ github.run_number }} из `${{ github.ref_name }}` (${{ github.sha }}).
-            Скачайте файл `.apk` на телефон и установите его (разрешите установку из этого источника).
 
   e2e:
     # End-to-end tests on a real Android emulator: VPN, DNS, HTTPS, UDP, blocking, proxy chaining, screens.
@@ -112,3 +99,26 @@ jobs:
             NetStrazh/app/build/reports/androidTests/
             NetStrazh/app/build/outputs/androidTest-results/
             NetStrazh/logcat-api*.txt
+
+  release:
+    # Publishes only an APK that also passed the emulator tests.
+    needs: [build, e2e]
+    if: >-
+      (github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))) ||
+      (github.event_name == 'workflow_dispatch' && inputs.release)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: NetStrazh-1.1.${{ github.run_number }}
+
+      - name: Publish to Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: Сетевой страж 1.1.${{ github.run_number }}
+          target_commitish: ${{ github.sha }}
+          files: NetStrazh-*.apk
+          body: |
+            Сборка ${{ github.run_number }} из `${{ github.ref_name }}` (${{ github.sha }}).
+            Скачайте файл `.apk` на телефон и установите его (разрешите установку из этого источника).

@@ -42,6 +42,14 @@ class NatTable(private val portMin: Int = 10000, private val portMax: Int = 6500
 
     @Synchronized fun byPort(p: Int): NatEntry? = if (p in 0..65535) byPort[p] else null
 
+    /** Hands an open entry to the server socket once; a second or late accept gets null. */
+    @Synchronized fun claim(p: Int): NatEntry? {
+        val e = byPort(p) ?: return null
+        if (e.accepted || e.closedAt != 0L) return null
+        e.accepted = true
+        return e
+    }
+
     @Synchronized fun create(k: FlowKey, v6: Boolean, srcPort: Int, dstAddr: ByteArray, dstPort: Int, now: Long): NatEntry? {
         val span = portMax - portMin + 1
         for (i in 0 until span) {

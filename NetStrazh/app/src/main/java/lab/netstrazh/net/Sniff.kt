@@ -67,6 +67,9 @@ class HostSniffer {
         private set
     var host: String? = null
         private set
+    /** The host came from TLS SNI (bound to the server by its certificate), not an HTTP Host header. */
+    var tls = false
+        private set
 
     /** Feeds the next chunk; returns true once sniffing is finished. */
     fun feed(data: ByteArray, off: Int, len: Int): Boolean {
@@ -78,6 +81,7 @@ class HostSniffer {
         when {
             Sniff.looksLikeTls(buf, n) -> if (Sniff.tlsRecordComplete(buf, n) || n >= LIMIT) {
                 host = Sniff.tlsSni(buf, n)
+                tls = true
                 finish()
             }
             Sniff.looksLikeHttp(buf, n) -> {

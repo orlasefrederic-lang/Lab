@@ -144,16 +144,18 @@ class MainActivity : Activity() {
         val up = FirewallService.instance?.upstream
         val proxy = Prefs.proxy.enabled
         val now = System.currentTimeMillis()
-        val proxyDown = on && proxy && up != null && up.lastErrorAt > up.lastOkAt && now - up.lastErrorAt < 30_000
+        val proxyDown = on && proxy && up != null && up.downAt > up.lastOkAt && now - up.downAt < 30_000
+        val direct = Prefs.proxy.directIfDown
         headerAction = null
         status.text = when {
             on && proxyDown -> {
                 headerAction = { startActivity(Intent(this, SettingsActivity::class.java)) }
-                "⚠ Прокси недоступен — интернета нет. Нажмите, чтобы проверить"
+                if (direct) "⚠ Прокси недоступен — трафик идёт напрямую, без прокси. Нажмите, чтобы проверить"
+                else "⚠ Прокси недоступен — интернета нет. Нажмите, чтобы проверить"
             }
             on -> "Защита включена" + (if (proxy) " · через прокси" else "") + " · соединений: ${Live.active.size}"
             pendingStart -> "Включаю…"
-            now - Prefs.revokedAt < 15 * 60_000L -> {
+            now - Prefs.revokedAt < 15 * 60_000L && otherVpnActive() -> {
                 headerAction = { startActivity(Intent(this, SettingsActivity::class.java)) }
                 "Выключено: включился другой VPN. Как работать вместе ›"
             }
@@ -164,7 +166,7 @@ class MainActivity : Activity() {
             else -> "Защита выключена"
         }
         status.setTextColor(when {
-            proxyDown -> Pal.danger
+            proxyDown -> if (direct) Pal.warn else Pal.danger
             on -> Pal.ok
             headerAction != null -> Pal.warn
             else -> Pal.sub
@@ -180,7 +182,11 @@ class MainActivity : Activity() {
     private fun otherVpnActive(): Boolean = try {
         val cm = getSystemService(android.net.ConnectivityManager::class.java)
         @Suppress("DEPRECATION")
-        cm.allNetworks.any { cm.getNetworkCapabilities(it)?.hasTransport(android.net.NetworkCapabilities.TRANSPORT_VPN) == true }
+        cm.allNetworks.any {
+            val caps = cm.getNetworkCapabilities(it)
+            // Our own VPN network (still registered for a moment after stopping) is not "another VPN".
+            caps != null && caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_VPN) && caps.ownerUid != android.os.Process.myUid()
+        }
     } catch (_: Exception) {
         false
     }

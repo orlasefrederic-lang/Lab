@@ -72,12 +72,18 @@ class ProxyTester(
         else "✓ соединение через прокси работает"
 
         // 2. DNS over TCP through the proxy, if enabled (some HTTP proxies only allow CONNECT to port 443).
+        // Without DNS no name resolves, so a failure here fails the whole check.
+        var ok = true
         if (c.dnsViaProxy) {
-            lines += try {
-                if (dnsWorks(c, proxy)) "✓ DNS через прокси (${c.dnsServer}) работает"
-                else "✗ DNS через прокси не отвечает: снимите галочку «DNS через прокси» или смените DNS-сервер"
+            val err = try {
+                if (dnsWorks(c, proxy)) null else "не отвечает"
             } catch (e: Exception) {
-                "✗ DNS через прокси не работает (${e.message ?: "ошибка"}): снимите галочку «DNS через прокси» или смените DNS-сервер"
+                "не работает (${e.message ?: "ошибка"})"
+            }
+            if (err == null) lines += "✓ DNS через прокси (${c.dnsServer}) работает"
+            else {
+                ok = false
+                lines += "✗ DNS через прокси $err: без него не откроется ни один сайт. Снимите галочку «DNS через прокси» или смените DNS-сервер"
             }
         }
 
@@ -94,7 +100,7 @@ class ProxyTester(
             lines += "⚠ прокси без пароля: любое приложение на телефоне может подключиться к нему напрямую, " +
                 "мимо Стража и его блокировок. Задайте логин и пароль для прокси в VPN-приложении и здесь."
         }
-        return Result(true, lines, udp)
+        return Result(ok, lines, udp)
     }
 
     private fun dnsQuery(): ByteArray = byteArrayOf(0x12, 0x34, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 7) + "example".toByteArray() +
