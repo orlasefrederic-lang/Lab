@@ -9,6 +9,8 @@ import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
+import java.nio.ByteBuffer
+import java.nio.channels.SocketChannel
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicReference
@@ -64,14 +66,19 @@ class TestSocks(
                 1 -> {
                     connects += "${name ?: addr!!.hostAddress}:$port"
                     val target = addr ?: resolve(name!!)
-                    val out = java.nio.channels.SocketChannel.open()
-                    protectTcp(out.socket())
-                    out.socket().connect(InetSocketAddress(target, port), 10_000)
-                    o.write(byteArrayOf(5, 0, 0, 1, 0, 0, 0, 0, 0, 0))
-                    val s = out.socket()
-                    pool.execute { copy(s, c) }
-                    copy(c, s)
-                    s.close()
+                    val out = SocketChannel.open()
+                    try {
+                        protectTcp(out.socket())
+                        out.socket().connect(InetSocketAddress(target, port), 10_000)
+                        o.write(byteArrayOf(5, 0, 0, 1, 0, 0, 0, 0, 0, 0))
+                        // Channel I/O on the upstream side: the stream adaptors of a SocketChannel share
+                        // one lock, so a blocked read would stall the write in the other direction.
+                        val back = pool.submit { fromChannel(out, c) }
+                        toChannel(c, out)
+                        back.get()
+                    } finally {
+                        out.close()
+                    }
                 }
                 3 -> associate(c, i, o)
                 else -> o.write(byteArrayOf(5, 7, 0, 1, 0, 0, 0, 0, 0, 0))
@@ -128,15 +135,31 @@ class TestSocks(
         ext.close()
     }
 
-    private fun copy(from: Socket, to: Socket) {
+    private fun toChannel(from: Socket, to: SocketChannel) {
         try {
             val b = ByteArray(16384)
             val inp = from.getInputStream()
-            val out = to.getOutputStream()
             while (true) {
                 val n = inp.read(b)
                 if (n < 0) break
-                out.write(b, 0, n)
+                val bb = ByteBuffer.wrap(b, 0, n)
+                while (bb.hasRemaining()) to.write(bb)
+            }
+            to.shutdownOutput()
+        } catch (_: Exception) {
+            try { to.close() } catch (_: Exception) {}
+        }
+    }
+
+    private fun fromChannel(from: SocketChannel, to: Socket) {
+        try {
+            val bb = ByteBuffer.allocate(16384)
+            val out = to.getOutputStream()
+            while (true) {
+                bb.clear()
+                val n = from.read(bb)
+                if (n < 0) break
+                out.write(bb.array(), 0, n)
             }
             to.shutdownOutput()
         } catch (_: Exception) {
