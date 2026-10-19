@@ -93,6 +93,62 @@ object Dns {
         return Pair(sb.toString(), next)
     }
 
+    /** Skips a (possibly compressed) name at [p]; returns the offset after it or -1. */
+    private fun skipName(b: ByteArray, p0: Int, end: Int): Int {
+        var p = p0
+        while (p < end) {
+            val l = B.u8(b, p)
+            if (l == 0) return p + 1
+            if (l and 0xC0 == 0xC0) return if (p + 2 <= end) p + 2 else -1
+            if (l and 0xC0 != 0) return -1
+            p += 1 + l
+        }
+        return -1
+    }
+
+    /**
+     * Largest UDP response the asking resolver accepts: the EDNS(0) UDP payload size from the OPT
+     * record of the query, or 512 bytes without one (RFC 1035 / RFC 6891).
+     */
+    fun udpLimit(q: ByteArray, off: Int, len: Int): Int {
+        if (len < 12) return 512
+        val end = off + len
+        val counts = IntArray(4) { B.u16(q, off + 4 + it * 2) }
+        var p = off + 12
+        for (i in 0 until counts[0]) {
+            p = skipName(q, p, end)
+            if (p < 0 || p + 4 > end) return 512
+            p += 4
+        }
+        for (sec in 1..3) for (i in 0 until counts[sec]) {
+            p = skipName(q, p, end)
+            if (p < 0 || p + 10 > end) return 512
+            val type = B.u16(q, p)
+            if (type == 41) return maxOf(512, B.u16(q, p + 2))
+            p += 10 + B.u16(q, p + 8)
+        }
+        return 512
+    }
+
+    /** Header + question of [r] with the TC bit set and no records: tells the stub to retry over TCP. */
+    fun truncated(r: ByteArray, len: Int): ByteArray {
+        if (len < 12) return r.copyOf(len)
+        var p = 12
+        val qd = B.u16(r, 4)
+        for (i in 0 until qd) {
+            val e = skipName(r, p, len)
+            if (e < 0 || e + 4 > len) { p = 12; break }
+            p = e + 4
+        }
+        val out = r.copyOf(p)
+        out[2] = (out[2].toInt() or 0x02).toByte() // TC
+        if (p == 12) B.put16(out, 4, 0)
+        B.put16(out, 6, 0)
+        B.put16(out, 8, 0)
+        B.put16(out, 10, 0)
+        return out
+    }
+
     fun typeName(t: Int): String = when (t) {
         TYPE_A -> "A"
         TYPE_AAAA -> "AAAA"

@@ -45,7 +45,7 @@ class Upstream(private val host: EngineHost) {
     class Opened(val ch: SocketChannel, val viaProxy: Boolean)
 
     /** A UDP path: a datagram channel, plus the SOCKS control connection and header when proxied. */
-    class UdpPath(val ch: DatagramChannel, private val control: SocketChannel?, val header: ByteArray?) : Closeable {
+    class UdpPath(val ch: DatagramChannel, val control: SocketChannel?, val header: ByteArray?) : Closeable {
         val viaProxy: Boolean get() = header != null
         override fun close() {
             Engine.closeQuietly(ch)
@@ -68,6 +68,9 @@ class Upstream(private val host: EngineHost) {
     @Volatile var lastOkAt = 0L
         private set
     private val lock = Any()
+    private val dnsPipe = DnsPipe {
+        openTcp(InetSocketAddress(host.resolve(cfg.dnsServer), 53), UID_DNS, PROXY_CONNECT_MS) {}.ch
+    }
 
     val enabled: Boolean get() = cfg.enabled
     val udpUnsupported: Boolean get() = udpUnsupportedAt != 0L && System.currentTimeMillis() - udpUnsupportedAt < UDP_RECHECK_MS
@@ -83,7 +86,12 @@ class Upstream(private val host: EngineHost) {
             lastErrorAt = 0L
             lastOkAt = 0L
         }
+        dnsPipe.close()
     }
+
+    /** A connection to the proxy itself (e.g. a LAN proxy) is never sent through that proxy. */
+    private fun isProxyEndpoint(dst: InetSocketAddress): Boolean =
+        try { proxyEndpoint() == dst } catch (_: Exception) { false }
 
     private fun proxyEndpoint(): InetSocketAddress {
         proxyAddr?.let { return it }
@@ -151,7 +159,7 @@ class Upstream(private val host: EngineHost) {
 
     /** Opens a TCP connection to [dst] for [uid]. [track] gets the channel early so a kill can close it. */
     fun openTcp(dst: InetSocketAddress, uid: Int, timeoutMs: Int, track: (SocketChannel) -> Unit): Opened {
-        if (proxied(uid)) {
+        if (proxied(uid) && !isProxyEndpoint(dst)) {
             val c = cfg
             try {
                 val ch = proxyChannel(track)
@@ -253,16 +261,20 @@ class Upstream(private val host: EngineHost) {
     /** True when DNS queries of [uid] are resolved through the proxy. */
     fun dnsViaProxy(uid: Int): Boolean = cfg.enabled && cfg.dnsViaProxy && proxied(uid)
 
-    /** Resolves one DNS query (wire format) over TCP through the proxy; returns the response. */
-    fun dnsQuery(q: ByteArray, off: Int, len: Int): ByteArray {
-        val server = InetSocketAddress(host.resolve(cfg.dnsServer), 53)
-        val o = openTcp(server, UID_DNS, PROXY_CONNECT_MS) {}
+    /** Resolves one DNS query (wire format) over a pipelined TCP connection through the proxy. */
+    fun dnsQuery(q: ByteArray, off: Int, len: Int): ByteArray = try {
+        dnsPipe.query(q, off, len, DNS_TIMEOUT_MS)
+    } catch (e: IOException) {
+        // Resolvers that answer only one query per connection: fall back to a dedicated connection.
+        val o = openTcp(InetSocketAddress(host.resolve(cfg.dnsServer), 53), UID_DNS, PROXY_CONNECT_MS) {}
         try {
-            return withDeadline(o.ch, DNS_TIMEOUT_MS) { DnsTcp.query(o.ch, q, off, len) }
+            withDeadline(o.ch, DNS_TIMEOUT_MS) { DnsTcp.query(o.ch, q, off, len) }
         } finally {
             Engine.closeQuietly(o.ch)
         }
     }
+
+    fun close() = dnsPipe.close()
 
     private fun noteError(msg: String) {
         lastError = msg

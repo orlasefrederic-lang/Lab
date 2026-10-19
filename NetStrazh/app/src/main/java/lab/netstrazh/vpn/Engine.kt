@@ -124,6 +124,7 @@ class Engine(val host: EngineHost, private val pfd: ParcelFileDescriptor, val cf
         closeQuietly(tcp4)
         closeQuietly(tcp6)
         udp.stop()
+        upstream.close()
         house.shutdownNow()
         for (c in Live.active.values.toList()) c.kill()
         pool.shutdown()
@@ -356,7 +357,13 @@ class Engine(val host: EngineHost, private val pfd: ParcelFileDescriptor, val cf
                 bb.clear()
                 val n = src.read(bb)
                 if (n < 0) {
-                    try { dst.shutdownOutput() } catch (_: Exception) {}
+                    if (!up && conn.via == VIA_PROXY && conn.rx == 0L) {
+                        // Many proxies confirm CONNECT before dialing: "success, then EOF" means the dial failed.
+                        conn.note = "сервер недоступен через прокси"
+                        reset(dst)
+                    } else {
+                        try { dst.shutdownOutput() } catch (_: Exception) {}
+                    }
                     return
                 }
                 if (n == 0) continue

@@ -44,6 +44,8 @@ class UdpRelay(private val eng: Engine) {
         val queue = ArrayDeque<ByteArray>()
     }
 
+    private class Control(val s: Session)
+
     private val selector: Selector = Selector.open()
     private val sessions = ConcurrentHashMap<FlowKey, Session>()
     private val pending = ConcurrentLinkedQueue<Session>()
@@ -201,11 +203,13 @@ class UdpRelay(private val eng: Engine) {
         try {
             setup.execute {
                 try {
-                    val r = eng.upstream.dnsQuery(query, 0, query.size)
+                    val full = eng.upstream.dnsQuery(query, 0, query.size)
                     s.last = System.currentTimeMillis()
                     s.conn.addTx(query.size.toLong())
-                    s.conn.addRx(r.size.toLong())
-                    onDnsResponse(s, r, r.size)
+                    s.conn.addRx(full.size.toLong())
+                    onDnsResponse(s, full, full.size)
+                    // A TCP answer can be bigger than the stub accepts over UDP: then say "truncated" so it retries over TCP.
+                    val r = if (full.size > Dns.udpLimit(query, 0, query.size)) Dns.truncated(full, full.size) else full
                     val pk = PacketBuilder.udp(s.v6, s.remoteAddr, s.remotePort, s.appAddr, s.appPort, r, 0, r.size)
                     eng.write(pk, pk.size)
                 } catch (e: Exception) {
@@ -228,11 +232,16 @@ class UdpRelay(private val eng: Engine) {
             }
             while (true) {
                 val s = pending.poll() ?: break
-                val ch = s.path?.ch ?: continue
+                val path = s.path ?: continue
                 if (s.closed.get()) continue
                 try {
-                    ch.configureBlocking(false)
-                    ch.register(selector, SelectionKey.OP_READ, s)
+                    path.ch.configureBlocking(false)
+                    path.ch.register(selector, SelectionKey.OP_READ, s)
+                    // SOCKS: the association ends when its TCP control connection closes (Xray closes it after idling).
+                    path.control?.let {
+                        it.configureBlocking(false)
+                        it.register(selector, SelectionKey.OP_READ, Control(s))
+                    }
                 } catch (e: Exception) {
                     close(s)
                 }
@@ -242,8 +251,18 @@ class UdpRelay(private val eng: Engine) {
             while (it.hasNext()) {
                 val k = it.next()
                 it.remove()
-                val s = k.attachment() as Session
                 if (!k.isValid) continue
+                val att = k.attachment()
+                if (att is Control) {
+                    try {
+                        bb.clear()
+                        if ((k.channel() as java.nio.channels.SocketChannel).read(bb) < 0) close(att.s)
+                    } catch (e: Exception) {
+                        close(att.s)
+                    }
+                    continue
+                }
+                val s = att as Session
                 val path = s.path ?: continue
                 try {
                     while (true) {

@@ -21,6 +21,7 @@ import lab.netstrazh.ui.SettingsActivity
 import lab.netstrazh.vpn.FirewallService
 import lab.netstrazh.vpn.Live
 import lab.netstrazh.vpn.ProxyConfig
+import lab.netstrazh.vpn.ProxyTester
 import lab.netstrazh.vpn.ProxyType
 import lab.netstrazh.vpn.Upstream
 import lab.netstrazh.vpn.VIA_PROXY
@@ -82,8 +83,18 @@ class E2eTest {
             shell("pm grant $pkg android.permission.POST_NOTIFICATIONS")
             Rules.set(pkg, 0)
             Prefs.proxy = ProxyConfig.OFF
-            Log.i(TAG, "start: " + shell("am start-foreground-service -n $pkg/lab.netstrazh.vpn.FirewallService -a lab.netstrazh.START"))
-            waitFor(20_000, "VPN running") { FirewallService.running }
+            val prepared = android.net.VpnService.prepare(ctx) == null
+            // Start like the app's own switch does: from a visible activity (FGS start from the
+            // background is restricted, and the service needs BIND_VPN_SERVICE, which the shell lacks).
+            ActivityScenario.launch(MainActivity::class.java).use { sc ->
+                sc.onActivity { FirewallService.start(it) }
+                try {
+                    waitFor(25_000, "VPN running") { FirewallService.running }
+                } catch (e: AssertionError) {
+                    throw AssertionError("VPN did not start; vpn pre-consented=$prepared\n" +
+                        shell("logcat -d -t 300 -s NetStrazh:V AndroidRuntime:E ActivityManager:W Vpn:V ConnectivityService:W"), e)
+                }
+            }
             val cm = ctx.getSystemService(ConnectivityManager::class.java)
             waitFor(10_000, "default network is our VPN") {
                 cm.getNetworkCapabilities(cm.activeNetwork)?.hasTransport(NetworkCapabilities.TRANSPORT_VPN) == true
@@ -232,6 +243,15 @@ class E2eTest {
 
                 // The proxy runs in our own process: it must not be mistaken for an external proxy app.
                 assertEquals(Upstream.UID_NONE, svc.upstream?.proxyUid)
+
+                // The "Проверить" button of the settings screen, end to end.
+                val res = ProxyTester({ svc.protect(it) }, { svc.protect(it) })
+                    .run(Prefs.proxy, InetSocketAddress(InetAddress.getByAddress(byteArrayOf(127, 0, 0, 1)), socks.port))
+                Log.i(TAG, "proxy test: ${res.lines}")
+                assertTrue(res.lines.joinToString(), res.ok)
+                assertTrue(res.lines.joinToString(), res.lines.any { it.contains("выход в интернет") })
+                assertTrue(res.lines.joinToString(), res.lines.any { it.startsWith("✓ DNS через прокси") })
+                assertEquals(res.lines.joinToString(), true, res.udp)
             } finally {
                 Prefs.proxy = ProxyConfig.OFF
                 FirewallService.applyProxy()

@@ -1,6 +1,7 @@
 package lab.netstrazh.vpn
 
 import lab.netstrazh.net.Dns
+import lab.netstrazh.net.DnsTcp
 import lab.netstrazh.net.HttpConnect
 import lab.netstrazh.net.ProxyException
 import lab.netstrazh.net.Socks5
@@ -64,7 +65,17 @@ class ProxyTester(
         lines += if (ip != null) "✓ выход в интернет: $ip" + (if (loc != null) " (${countryName(loc)})" else "")
         else "✓ соединение через прокси работает"
 
-        // 2. UDP (SOCKS5 only): a DNS query through UDP ASSOCIATE.
+        // 2. DNS over TCP through the proxy, if enabled (some HTTP proxies only allow CONNECT to port 443).
+        if (c.dnsViaProxy) {
+            lines += try {
+                if (dnsWorks(c, proxy)) "✓ DNS через прокси (${c.dnsServer}) работает"
+                else "✗ DNS через прокси не отвечает: снимите галочку «DNS через прокси» или смените DNS-сервер"
+            } catch (e: Exception) {
+                "✗ DNS через прокси не работает (${e.message ?: "ошибка"}): снимите галочку «DNS через прокси» или смените DNS-сервер"
+            }
+        }
+
+        // 3. UDP (SOCKS5 only): a DNS query through UDP ASSOCIATE.
         var udp: Boolean? = null
         if (c.type == ProxyType.SOCKS5) {
             udp = try { udpWorks(c, proxy) } catch (_: Exception) { false }
@@ -73,7 +84,33 @@ class ProxyTester(
         } else {
             lines += "• HTTP-прокси не передаёт UDP: " + if (c.udpDirect) "UDP пойдёт напрямую" else "UDP будет заблокирован"
         }
+        if (c.user.isEmpty() && lab.netstrazh.net.isLoopback(proxy.address)) {
+            lines += "⚠ прокси без пароля: любое приложение на телефоне может подключиться к нему напрямую, " +
+                "мимо Стража и его блокировок. Задайте логин и пароль для прокси в VPN-приложении и здесь."
+        }
         return Result(true, lines, udp)
+    }
+
+    private fun dnsQuery(): ByteArray = byteArrayOf(0x12, 0x34, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 7) + "example".toByteArray() +
+        byteArrayOf(3) + "com".toByteArray() + byteArrayOf(0, 0, 1, 0, 1)
+
+    private fun dnsWorks(c: ProxyConfig, proxy: InetSocketAddress): Boolean {
+        val server = Upstream.ipOrNull(c.dnsServer) ?: return false
+        val ch = SocketChannel.open()
+        try {
+            protectTcp(ch.socket())
+            ch.socket().connect(proxy, 4000)
+            return withDeadline(ch, 10_000) {
+                val dst = InetSocketAddress(server, 53)
+                if (c.type == ProxyType.HTTP) HttpConnect.connect(ch, c.user, c.pass, dst)
+                else Socks5.connect(ch, c.user, c.pass, dst)
+                val q = dnsQuery()
+                val r = DnsTcp.query(ch, q, 0, q.size)
+                Dns.parse(r, 0, r.size)?.id == 0x1234
+            }
+        } finally {
+            Engine.closeQuietly(ch)
+        }
     }
 
     private fun udpWorks(c: ProxyConfig, proxy: InetSocketAddress): Boolean {
@@ -86,9 +123,7 @@ class ProxyTester(
             protectUdp(dc.socket())
             dc.connect(relay)
             dc.socket().soTimeout = 4000
-            val q = byteArrayOf(0x12, 0x34, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 7) + "example".toByteArray() +
-                byteArrayOf(3) + "com".toByteArray() + byteArrayOf(0, 0, 1, 0, 1)
-            val out = Socks5.udpHeader(cloudflare, 53) + q
+            val out = Socks5.udpHeader(cloudflare, 53) + dnsQuery()
             repeat(2) {
                 dc.socket().send(java.net.DatagramPacket(out, out.size))
                 val buf = ByteArray(2048)
