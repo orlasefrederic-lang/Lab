@@ -300,6 +300,7 @@ class Engine(val host: EngineHost, private val pfd: ParcelFileDescriptor, val cf
             if (fakeDns) null else DnsCache.get(uid, ip), host.netType().label)
         Live.open(conn)
         val out = AtomicReference<SocketChannel?>()
+        var first: ByteArray? = null
         conn.killer = {
             reset(client)
             closeQuietly(out.get())
@@ -320,14 +321,33 @@ class Engine(val host: EngineHost, private val pfd: ParcelFileDescriptor, val cf
                     o = upstream.openTcpDirect(InetSocketAddress(host.upstreamDns(), 53), CONNECT_TIMEOUT_MS) { out.set(it) }
                 }
             } else {
-                val opened = upstream.openTcp(InetSocketAddress(dst, e.dstPort), uid, CONNECT_TIMEOUT_MS) { out.set(it) }
+                // Through a proxy, first read what the app sends (TLS ClientHello / HTTP request) to learn
+                // the host name: the proxy then connects by name and its routing rules by domain work.
+                var name: String? = null
+                if (upstream.proxied(uid)) {
+                    val (bytes, sniffed) = preread(client)
+                    first = bytes
+                    if (sniffed != null) {
+                        if (!isIpLiteral(sniffed) || conn.host == null) conn.host = sniffed
+                        // Only a name the app itself sent (SNI/Host) is exact enough to connect by.
+                        if (!isIpLiteral(sniffed) && sniffed.length <= 253) name = sniffed
+                    }
+                }
+                val opened = upstream.openTcp(InetSocketAddress(dst, e.dstPort), uid, CONNECT_TIMEOUT_MS, name) { out.set(it) }
                 o = opened.ch
                 if (opened.viaProxy) conn.via = VIA_PROXY
             }
             o.socket().tcpNoDelay = true
             client.socket().tcpNoDelay = true
+            first?.let { b ->
+                if (b.isNotEmpty()) {
+                    val bb = ByteBuffer.wrap(b)
+                    while (bb.hasRemaining()) o.write(bb)
+                    conn.addTx(b.size.toLong())
+                }
+            }
             val down = pool.submit { pump(o, client, conn, false) }
-            pump(client, o, conn, true)
+            pump(client, o, conn, true, sniff = first == null)
             down.get()
         } catch (ex: Exception) {
             if (conn.tx == 0L && conn.rx == 0L) conn.note = failureNote(ex)
@@ -349,9 +369,37 @@ class Engine(val host: EngineHost, private val pfd: ParcelFileDescriptor, val cf
         else -> ex.message?.take(80) ?: ex.javaClass.simpleName
     }
 
-    private fun pump(src: SocketChannel, dst: SocketChannel, conn: Conn, up: Boolean) {
+    /**
+     * Reads the app's first bytes for up to [PREREAD_MS] (client-first protocols send them at once;
+     * server-first ones like SMTP/SSH simply time out) and extracts the host name from them.
+     */
+    private fun preread(client: SocketChannel): Pair<ByteArray, String?> {
+        val sniffer = HostSniffer()
+        val buf = java.io.ByteArrayOutputStream()
+        val chunk = ByteArray(BUF_SIZE)
+        val sock = client.socket()
+        val end = System.currentTimeMillis() + PREREAD_MS
+        try {
+            val ins = sock.getInputStream()
+            while (!sniffer.done && buf.size() < HostSniffer.LIMIT) {
+                val left = end - System.currentTimeMillis()
+                if (left <= 0) break
+                sock.soTimeout = left.toInt()
+                val n = ins.read(chunk)
+                if (n < 0) break
+                buf.write(chunk, 0, n)
+                sniffer.feed(chunk, 0, n)
+            }
+        } catch (_: java.net.SocketTimeoutException) {
+        } finally {
+            try { sock.soTimeout = 0 } catch (_: Exception) {}
+        }
+        return buf.toByteArray() to sniffer.host
+    }
+
+    private fun pump(src: SocketChannel, dst: SocketChannel, conn: Conn, up: Boolean, sniff: Boolean = true) {
         val bb = ByteBuffer.allocate(BUF_SIZE)
-        val sniffer = if (up && conn.proto == "TCP") HostSniffer() else null
+        val sniffer = if (up && sniff && conn.proto == "TCP") HostSniffer() else null
         try {
             while (true) {
                 bb.clear()
@@ -417,6 +465,7 @@ class Engine(val host: EngineHost, private val pfd: ParcelFileDescriptor, val cf
     companion object {
         const val TAG = "NetStrazh"
         const val CONNECT_TIMEOUT_MS = 15_000
+        const val PREREAD_MS = 400L
         const val BUF_SIZE = 32 * 1024
 
         fun closeQuietly(c: Closeable?) {

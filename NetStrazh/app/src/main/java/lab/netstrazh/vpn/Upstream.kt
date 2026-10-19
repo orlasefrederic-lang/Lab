@@ -157,17 +157,22 @@ class Upstream(private val host: EngineHost) {
         return ch
     }
 
-    /** Opens a TCP connection to [dst] for [uid]. [track] gets the channel early so a kill can close it. */
-    fun openTcp(dst: InetSocketAddress, uid: Int, timeoutMs: Int, track: (SocketChannel) -> Unit): Opened {
+    /**
+     * Opens a TCP connection to [dst] for [uid]. Through the proxy, the destination is sent as [name]
+     * when known (so the proxy app can route by domain), otherwise as the IP. [track] gets the channel
+     * early so a kill can close it.
+     */
+    fun openTcp(dst: InetSocketAddress, uid: Int, timeoutMs: Int, name: String? = null, track: (SocketChannel) -> Unit): Opened {
         if (proxied(uid) && !isProxyEndpoint(dst)) {
             val c = cfg
             try {
                 val ch = proxyChannel(track)
                 try {
+                    val target = if (name != null) InetSocketAddress.createUnresolved(name, dst.port) else dst
                     withDeadline(ch, HANDSHAKE_MS) {
                         when (c.type) {
-                            ProxyType.HTTP -> HttpConnect.connect(ch, c.user, c.pass, dst)
-                            else -> Socks5.connect(ch, c.user, c.pass, dst)
+                            ProxyType.HTTP -> HttpConnect.connect(ch, c.user, c.pass, target)
+                            else -> Socks5.connect(ch, c.user, c.pass, target)
                         }
                     }
                 } catch (e: Exception) {

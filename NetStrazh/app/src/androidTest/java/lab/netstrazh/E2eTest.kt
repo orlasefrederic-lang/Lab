@@ -158,7 +158,12 @@ class E2eTest {
         val name = "e2e-${SystemClock.uptimeMillis()}.example.com"
         try { InetAddress.getAllByName(name) } catch (_: IOException) {} // NXDOMAIN is fine
         val s = waitSeen("DNS $name") { it.proto == "DNS" && it.host == name }
-        assertEquals("DNS query should be attributed to the asking app", myUid, s.uid)
+        if (android.os.Build.VERSION.SDK_INT >= 30) {
+            assertEquals("DNS query should be attributed to the asking app", myUid, s.uid)
+        } else {
+            // Android 10 sends lookups from the system resolver's own UID (1051, AID_DNS).
+            assertTrue("DNS attributed to the app or the system resolver: ${s.uid}", s.uid == myUid || s.uid == 1051)
+        }
         InetAddress.getAllByName("example.org")
         waitSeen("DNS example.org") { it.proto == "DNS" && it.host == "example.org" }
     }
@@ -226,6 +231,10 @@ class E2eTest {
     @Test fun t07_proxyChaining() {
         val svc = FirewallService.instance!!
         TestSocks({ svc.protect(it) }, { svc.protect(it) }).use { socks ->
+            fun diag(): String = "\nsocks connects=${socks.connects} udp=${socks.udp}" +
+                "\nupstream: proxyUid=${svc.upstream?.proxyUid} err=${svc.upstream?.lastError} udpUnsupported=${svc.upstream?.udpUnsupported}" +
+                "\nrecent: " + seen().take(12).joinToString("\n  ") +
+                "\nlogcat:\n" + shell("logcat -d -t 80 -s NetStrazh:V AndroidRuntime:E")
             try {
                 Prefs.proxy = ProxyConfig(ProxyType.SOCKS5, "127.0.0.1", socks.port, dnsServer = "1.1.1.1")
                 FirewallService.applyProxy()
@@ -252,6 +261,8 @@ class E2eTest {
                 assertTrue(res.lines.joinToString(), res.lines.any { it.contains("выход в интернет") })
                 assertTrue(res.lines.joinToString(), res.lines.any { it.startsWith("✓ DNS через прокси") })
                 assertEquals(res.lines.joinToString(), true, res.udp)
+            } catch (e: Throwable) {
+                throw AssertionError("proxy chaining failed: $e" + diag(), e)
             } finally {
                 Prefs.proxy = ProxyConfig.OFF
                 FirewallService.applyProxy()

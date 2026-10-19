@@ -82,6 +82,13 @@ object Socks5 {
     fun request(cmd: Int, addr: InetAddress, port: Int): ByteArray =
         byteArrayOf(5, cmd.toByte(), 0) + address(addr, port)
 
+    /** Request with a domain name (ATYP 3): the proxy resolves it, and can route by it. */
+    fun requestDomain(cmd: Int, host: String, port: Int): ByteArray {
+        val h = host.toByteArray(Charsets.US_ASCII)
+        require(h.size in 1..255) { "host name too long" }
+        return byteArrayOf(5, cmd.toByte(), 0, 3, h.size.toByte()) + h + byteArrayOf((port ushr 8).toByte(), port.toByte())
+    }
+
     /** Greeting and (optional) authentication. */
     fun handshake(ch: SocketChannel, user: String, pass: String) {
         val auth = user.isNotEmpty()
@@ -102,8 +109,11 @@ object Socks5 {
     }
 
     /** Sends a request and reads the reply; returns the BND address. */
-    fun command(ch: SocketChannel, cmd: Int, addr: InetAddress, port: Int): InetSocketAddress {
-        ch.writeAll(request(cmd, addr, port))
+    fun command(ch: SocketChannel, cmd: Int, addr: InetAddress, port: Int): InetSocketAddress =
+        command(ch, request(cmd, addr, port))
+
+    private fun command(ch: SocketChannel, req: ByteArray): InetSocketAddress {
+        ch.writeAll(req)
         val head = ch.readFully(4)
         if (head[0].toInt() != 5) throw ProxyException("некорректный ответ прокси")
         val rep = head[1].toInt() and 0xFF
@@ -127,9 +137,11 @@ object Socks5 {
         return InetSocketAddress(a, ((p[0].toInt() and 0xFF) shl 8) or (p[1].toInt() and 0xFF))
     }
 
+    /** CONNECT; an unresolved [dst] (InetSocketAddress.createUnresolved) is sent as a domain name. */
     fun connect(ch: SocketChannel, user: String, pass: String, dst: InetSocketAddress) {
         handshake(ch, user, pass)
-        command(ch, CMD_CONNECT, dst.address, dst.port)
+        if (dst.isUnresolved) command(ch, requestDomain(CMD_CONNECT, dst.hostString, dst.port))
+        else command(ch, CMD_CONNECT, dst.address, dst.port)
     }
 
     /**
@@ -165,7 +177,11 @@ object Socks5 {
 object HttpConnect {
     fun request(dst: InetSocketAddress, user: String, pass: String): ByteArray {
         val a = dst.address
-        val hostPort = if (a is Inet6Address) "[${a.hostAddress}]:${dst.port}" else "${a.hostAddress}:${dst.port}"
+        val hostPort = when {
+            dst.isUnresolved -> "${dst.hostString}:${dst.port}"
+            a is Inet6Address -> "[${a.hostAddress}]:${dst.port}"
+            else -> "${a.hostAddress}:${dst.port}"
+        }
         val sb = StringBuilder()
         sb.append("CONNECT ").append(hostPort).append(" HTTP/1.1\r\n")
         sb.append("Host: ").append(hostPort).append("\r\n")

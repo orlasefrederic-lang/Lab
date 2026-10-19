@@ -85,6 +85,12 @@ class SettingsActivity : Activity() {
                 "Если ваше приложение умеет режим прокси, укажите его адрес и порт ниже вручную.", 13f, Pal.sub))
         }
         for (a in found) appsCard.addView(appRow(a))
+        val vpnOnly = ProxyApps.vpnOnlyInstalled(this)
+        if (vpnOnly.isNotEmpty()) {
+            appsCard.addView(text("${vpnOnly.joinToString()} — только VPN, режима прокси нет. Выход: импортируйте тот же ключ " +
+                "или конфиг (ss://, vless://, WireGuard) в v2rayNG, Hiddify или NekoBox и включите там «только прокси».",
+                12.5f, Pal.sub), lp().apply { topMargin = dp(10) })
+        }
         col.addView(appsCard, lp().apply { topMargin = dp(12) })
 
         // --- proxy form

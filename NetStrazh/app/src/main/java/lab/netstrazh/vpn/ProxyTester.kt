@@ -34,19 +34,25 @@ class ProxyTester(
                 ch.socket().connect(proxy, 4000)
                 lines += "✓ прокси ${proxy.address.hostAddress}:${proxy.port} отвечает"
                 withDeadline(ch, 15_000) {
-                    val dst = InetSocketAddress(cloudflare, 80)
+                    val dst = InetSocketAddress(cloudflare, 443)
                     if (c.type == ProxyType.HTTP) HttpConnect.connect(ch, c.user, c.pass, dst)
                     else Socks5.connect(ch, c.user, c.pass, dst)
-                    val req = "GET /cdn-cgi/trace HTTP/1.1\r\nHost: 1.1.1.1\r\nUser-Agent: NetStrazh\r\nConnection: close\r\n\r\n"
-                    ch.write(ByteBuffer.wrap(req.toByteArray()))
-                    val sb = StringBuilder()
-                    val bb = ByteBuffer.allocate(4096)
-                    while (sb.length < 8192) {
-                        bb.clear()
-                        if (ch.read(bb) < 0) break
-                        sb.append(String(bb.array(), 0, bb.position(), Charsets.ISO_8859_1))
+                    // HTTPS to Cloudflare's resolver site through the tunnel; its trace page reports the exit IP and country.
+                    val tls = (javax.net.ssl.SSLSocketFactory.getDefault() as javax.net.ssl.SSLSocketFactory)
+                        .createSocket(ch.socket(), TRACE_HOST, 443, true) as javax.net.ssl.SSLSocket
+                    tls.use { t ->
+                        t.startHandshake()
+                        t.outputStream.write("GET /cdn-cgi/trace HTTP/1.1\r\nHost: $TRACE_HOST\r\nUser-Agent: NetStrazh\r\nConnection: close\r\n\r\n".toByteArray())
+                        t.outputStream.flush()
+                        val sb = StringBuilder()
+                        val b = ByteArray(4096)
+                        while (sb.length < 16384) {
+                            val n = t.inputStream.read(b)
+                            if (n < 0) break
+                            sb.append(String(b, 0, n, Charsets.ISO_8859_1))
+                        }
+                        sb.toString()
                     }
-                    sb.toString()
                 }
             } finally {
                 Engine.closeQuietly(ch)
@@ -143,6 +149,7 @@ class ProxyTester(
     }
 
     companion object {
+        private const val TRACE_HOST = "one.one.one.one"
         private val countries = mapOf(
             "RU" to "Россия", "NL" to "Нидерланды", "DE" to "Германия", "FI" to "Финляндия", "SE" to "Швеция",
             "US" to "США", "GB" to "Великобритания", "FR" to "Франция", "PL" to "Польша", "LV" to "Латвия",

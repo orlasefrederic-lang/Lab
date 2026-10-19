@@ -57,6 +57,24 @@ class SocksTest {
         assertArrayEquals(byteArrayOf(5, 1, 0, 5, 1, 0, 1, 93, 184.toByte(), 216.toByte(), 34, 1, 0xBB.toByte()), got.toByteArray())
     }
 
+    @Test fun connectByDomainName() {
+        val got = ByteArrayOutputStream()
+        withServer({ s ->
+            val i = DataInputStream(s.getInputStream())
+            val o = s.getOutputStream()
+            i.bytes(3); o.write(byteArrayOf(5, 0))
+            val head = i.bytes(5)
+            got.write(head)
+            got.write(i.bytes(head[4].toInt() + 2))
+            o.write(byteArrayOf(5, 0, 0, 1, 0, 0, 0, 0, 0, 0))
+        }) { ch, _ ->
+            Socks5.connect(ch, "", "", InetSocketAddress.createUnresolved("www.example.com", 443))
+        }
+        assertArrayEquals(byteArrayOf(5, 1, 0, 3, 15) + "www.example.com".toByteArray() + byteArrayOf(1, 0xBB.toByte()), got.toByteArray())
+        val http = String(HttpConnect.request(InetSocketAddress.createUnresolved("www.example.com", 443), "", ""))
+        assertTrue(http, http.startsWith("CONNECT www.example.com:443 HTTP/1.1\r\nHost: www.example.com:443\r\n"))
+    }
+
     @Test fun connectIpv6Request() {
         val a6 = InetAddress.getByName("2001:db8::1")
         val req = Socks5.request(Socks5.CMD_CONNECT, a6, 80)
