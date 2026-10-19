@@ -167,7 +167,7 @@ class UdpRelay(private val eng: Engine) {
             } else {
                 val path = up.openUdp(InetSocketAddress(dstInet, s.remotePort), uid)
                 if (path == null) {
-                    s.conn.note = if (up.udpUnsupported) "прокси не передаёт UDP" else "прокси недоступен"
+                    s.conn.note = up.udpDropReason()
                     synchronized(s) {
                         s.queue.clear()
                         s.state = DROP

@@ -243,6 +243,13 @@ class Upstream(private val host: EngineHost) {
         return UdpPath(dc, null, null)
     }
 
+    /** Why [openUdp] returned null, for the journal. */
+    fun udpDropReason(): String = when {
+        cfg.type == ProxyType.HTTP -> "HTTP-прокси не передаёт UDP"
+        udpUnsupported -> "прокси не передаёт UDP"
+        else -> "прокси недоступен"
+    }
+
     /** True when DNS queries of [uid] are resolved through the proxy. */
     fun dnsViaProxy(uid: Int): Boolean = cfg.enabled && cfg.dnsViaProxy && proxied(uid)
 

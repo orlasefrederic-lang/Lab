@@ -32,8 +32,6 @@ jobs:
           java-version: 17
 
       - uses: gradle/actions/setup-gradle@v4
-        with:
-          build-root-directory: NetStrazh
 
       - name: Unit tests
         run: ./gradlew --no-daemon testDebugUnitTest
@@ -69,6 +67,9 @@ jobs:
     # End-to-end tests on a real Android emulator: VPN, DNS, HTTPS, UDP, blocking, proxy chaining, screens.
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: NetStrazh
     strategy:
       fail-fast: false
       matrix:
@@ -82,8 +83,6 @@ jobs:
           java-version: 17
 
       - uses: gradle/actions/setup-gradle@v4
-        with:
-          build-root-directory: NetStrazh
 
       - name: Enable KVM
         run: |
