@@ -230,7 +230,7 @@ class E2eTest {
 
     @Test fun t07_proxyChaining() {
         val svc = FirewallService.instance!!
-        TestSocks({ svc.protect(it) }, { svc.protect(it) }).use { socks ->
+        TestSocks({ svc.protect(it) }, { svc.protect(it) }, { svc.resolve(it) }).use { socks ->
             fun diag(): String = "\nsocks connects=${socks.connects} udp=${socks.udp}" +
                 "\nupstream: proxyUid=${svc.upstream?.proxyUid} err=${svc.upstream?.lastError} udpUnsupported=${svc.upstream?.udpUnsupported}" +
                 "\nrecent: " + seen().take(12).joinToString("\n  ") +
@@ -243,6 +243,8 @@ class E2eTest {
                 val r = httpGet("example.net")
                 assertTrue(r.take(100), r.startsWith("HTTP/1."))
                 assertTrue("TCP went through the proxy: ${socks.connects}", socks.connects.any { it.endsWith(":80") })
+                // The proxy got the host name the app asked for (HTTP Host), not just an IP.
+                assertTrue("CONNECT by name: ${socks.connects}", socks.connects.contains("example.net:80"))
                 assertTrue("DNS went through the proxy: ${socks.connects}", socks.connects.contains("1.1.1.1:53"))
                 waitSeen("proxied TCP") { it.proto == "TCP" && it.port == 80 && it.via == VIA_PROXY && it.uid == myUid }
 

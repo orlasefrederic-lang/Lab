@@ -95,44 +95,52 @@ class Upstream(private val host: EngineHost) {
 
     private fun proxyEndpoint(): InetSocketAddress {
         proxyAddr?.let { return it }
-        val a = host.resolve(cfg.host)
-        return InetSocketAddress(a, cfg.port).also { proxyAddr = it }
+        val c = cfg
+        val e = InetSocketAddress(host.resolve(c.host), c.port)
+        if (cfg === c) proxyAddr = e
+        return e
     }
 
-    /** True when traffic of [uid] goes through the proxy. */
-    fun proxied(uid: Int): Boolean {
-        if (!cfg.enabled) return false
-        ensureProxyUid()
-        return uid != proxyUid
-    }
+    /**
+     * True when traffic of [uid] goes through the proxy. Never blocks: the proxy app's UID is learned on
+     * every proxy connection (see [proxyChannel]), so even before it is known no loop can form.
+     */
+    fun proxied(uid: Int): Boolean = cfg.enabled && uid != proxyUid
 
     /**
      * Finds the app that listens on the proxy port. If that app's traffic also enters our VPN, relaying it
      * back into its own proxy would loop forever, so its connections go directly instead.
      */
     fun ensureProxyUid() {
+        if (!cfg.enabled) return
         val now = System.currentTimeMillis()
         if (proxyUid != UID_UNKNOWN && now - proxyUidCheckedAt < PROXY_UID_TTL_MS) return
-        synchronized(lock) {
-            if (proxyUid != UID_UNKNOWN && now - proxyUidCheckedAt < PROXY_UID_TTL_MS) return
-            if (proxyUid == UID_UNKNOWN && now - proxyUidCheckedAt < PROXY_UID_RETRY_MS) return
-            proxyUidCheckedAt = now
-            var ch: SocketChannel? = null
-            try {
-                val p = proxyEndpoint()
-                ch = SocketChannel.open()
-                host.protect(ch.socket())
-                ch.socket().connect(p, 2000)
-                val local = ch.socket().localSocketAddress as InetSocketAddress
-                // The proxy's end of this connection: local = proxy endpoint, remote = our socket.
-                val uid = host.ownerUid(OsConstants.IPPROTO_TCP, p, local)
-                proxyUid = if (uid >= 0 && uid != host.selfUid) uid else UID_NONE
-            } catch (e: Exception) {
-                noteError("прокси недоступен: ${e.message ?: e.javaClass.simpleName}")
-            } finally {
-                Engine.closeQuietly(ch)
-            }
+        if (!probing.compareAndSet(false, true)) return
+        var ch: SocketChannel? = null
+        try {
+            ch = SocketChannel.open()
+            host.protect(ch.socket())
+            ch.socket().connect(proxyEndpoint(), 2000)
+            learnProxyUid(ch)
+        } catch (e: Exception) {
+            noteError("прокси недоступен: ${e.message ?: e.javaClass.simpleName}")
+        } finally {
+            Engine.closeQuietly(ch)
+            probing.set(false)
         }
+    }
+
+    private val probing = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    /** Finds which app owns the proxy's end of [ch] (local = proxy endpoint, remote = our socket). */
+    private fun learnProxyUid(ch: SocketChannel) {
+        val c = cfg
+        val local = ch.socket().localSocketAddress as? InetSocketAddress ?: return
+        val remote = ch.socket().remoteSocketAddress as? InetSocketAddress ?: return
+        val uid = host.ownerUid(OsConstants.IPPROTO_TCP, remote, local)
+        if (cfg !== c) return
+        proxyUid = if (uid >= 0 && uid != host.selfUid) uid else UID_NONE
+        proxyUidCheckedAt = System.currentTimeMillis()
     }
 
     private fun newChannel(track: (SocketChannel) -> Unit): SocketChannel {
@@ -145,14 +153,27 @@ class Upstream(private val host: EngineHost) {
         return ch
     }
 
-    /** Connects to the proxy and completes its greeting; the caller sends the command. */
-    private fun proxyChannel(track: (SocketChannel) -> Unit): SocketChannel {
+    /** The caller is the proxy app itself: its traffic must go directly. */
+    class IsProxyApp : IOException("proxy app")
+
+    /**
+     * Connects to the proxy for a flow of [uid]. The proxy app's UID is (re)learned from this very
+     * connection when unknown or stale, so the proxy app's own traffic is never sent into its proxy.
+     */
+    private fun proxyChannel(uid: Int, track: (SocketChannel) -> Unit): SocketChannel {
         val ch = newChannel(track)
         try {
             ch.socket().connect(proxyEndpoint(), PROXY_CONNECT_MS)
         } catch (e: IOException) {
             Engine.closeQuietly(ch)
             throw ProxyDown(e)
+        }
+        if (proxyUid == UID_UNKNOWN || System.currentTimeMillis() - proxyUidCheckedAt > PROXY_UID_TTL_MS) {
+            try { learnProxyUid(ch) } catch (_: Exception) {}
+        }
+        if (uid == proxyUid) {
+            Engine.closeQuietly(ch)
+            throw IsProxyApp()
         }
         return ch
     }
@@ -166,7 +187,7 @@ class Upstream(private val host: EngineHost) {
         if (proxied(uid) && !isProxyEndpoint(dst)) {
             val c = cfg
             try {
-                val ch = proxyChannel(track)
+                val ch = proxyChannel(uid, track)
                 try {
                     val target = if (name != null) InetSocketAddress.createUnresolved(name, dst.port) else dst
                     withDeadline(ch, HANDSHAKE_MS) {
@@ -181,6 +202,8 @@ class Upstream(private val host: EngineHost) {
                 }
                 lastOkAt = System.currentTimeMillis()
                 return Opened(ch, true)
+            } catch (e: IsProxyApp) {
+                // fall through to a direct connection
             } catch (e: ProxyDown) {
                 noteError("прокси недоступен: ${e.cause?.message ?: "нет соединения"}")
                 if (!c.directIfDown) throw e
@@ -205,36 +228,41 @@ class Upstream(private val host: EngineHost) {
         return ch
     }
 
-    /** Opens a UDP path to [dst]; null means the datagrams must be dropped (proxy without UDP). */
+    /** Opens a UDP path to [dst]; null means the datagrams must be dropped (proxy without UDP / down). */
     fun openUdp(dst: InetSocketAddress, uid: Int): UdpPath? {
         if (proxied(uid)) {
             val c = cfg
             if (c.type == ProxyType.SOCKS5 && !udpUnsupported) {
                 var ctl: SocketChannel? = null
+                var dc: DatagramChannel? = null
                 try {
-                    val ctlCh = proxyChannel {}
+                    val ctlCh = proxyChannel(uid) {}
                     ctl = ctlCh
                     val relay = try {
                         withDeadline(ctlCh, HANDSHAKE_MS) { Socks5.udpAssociate(ctlCh, c.user, c.pass, proxyEndpoint()) }
-                    } catch (e: IOException) {
-                        // Reachable proxy that cannot associate: it has no UDP support.
-                        udpUnsupportedAt = System.currentTimeMillis()
+                    } catch (e: ProxyException) {
+                        // Only an explicit refusal of the command means "no UDP"; a restart or timeout does not.
+                        if (e.code == 7 || e.code == 1 || e.code == 2) udpUnsupportedAt = System.currentTimeMillis()
                         throw e
                     }
-                    val dc = DatagramChannel.open()
-                    if (!host.protect(dc.socket())) {
-                        Engine.closeQuietly(dc)
-                        throw IOException("protect failed")
-                    }
-                    dc.connect(relay)
+                    val d = DatagramChannel.open()
+                    dc = d
+                    if (!host.protect(d.socket())) throw IOException("protect failed")
+                    d.connect(relay)
                     lastOkAt = System.currentTimeMillis()
-                    return UdpPath(dc, ctlCh, Socks5.udpHeader(dst.address, dst.port))
+                    return UdpPath(d, ctlCh, Socks5.udpHeader(dst.address, dst.port))
+                } catch (e: IsProxyApp) {
+                    // the proxy app's own UDP goes directly
+                    Engine.closeQuietly(ctl)
+                    return directUdp(dst)
                 } catch (e: ProxyDown) {
                     noteError("прокси недоступен: ${e.cause?.message ?: "нет соединения"}")
                     if (!c.directIfDown) return null
-                } catch (e: IOException) {
+                } catch (e: Exception) {
+                    Engine.closeQuietly(dc)
                     Engine.closeQuietly(ctl)
-                    if (!c.udpDirect) return null
+                    if (e !is ProxyException) noteError("UDP через прокси: ${e.message ?: e.javaClass.simpleName}")
+                    if (!(udpUnsupported && c.udpDirect)) return null
                 }
             } else if (!c.udpDirect) {
                 return null
@@ -271,9 +299,14 @@ class Upstream(private val host: EngineHost) {
         dnsPipe.query(q, off, len, DNS_TIMEOUT_MS)
     } catch (e: IOException) {
         // Resolvers that answer only one query per connection: fall back to a dedicated connection.
-        val o = openTcp(InetSocketAddress(host.resolve(cfg.dnsServer), 53), UID_DNS, PROXY_CONNECT_MS) {}
+        dnsQueryOnce(InetSocketAddress(host.resolve(cfg.dnsServer), 53), q, off, len)
+    }
+
+    /** One DNS-over-TCP query to [server] through the proxy, on its own connection. */
+    fun dnsQueryOnce(server: InetSocketAddress, q: ByteArray, off: Int, len: Int): ByteArray {
+        val o = openTcp(server, UID_DNS, PROXY_CONNECT_MS) {}
         try {
-            withDeadline(o.ch, DNS_TIMEOUT_MS) { DnsTcp.query(o.ch, q, off, len) }
+            return withDeadline(o.ch, DNS_TIMEOUT_MS) { DnsTcp.query(o.ch, q, off, len) }
         } finally {
             Engine.closeQuietly(o.ch)
         }
@@ -291,7 +324,8 @@ class Upstream(private val host: EngineHost) {
 
     companion object {
         const val UID_UNKNOWN = -2
-        const val UID_NONE = -1
+        /** No proxy app found. Distinct from -1 (Process.INVALID_UID: owner of a flow unknown). */
+        const val UID_NONE = -3
         /** Pseudo-UID for our own DNS lookups through the proxy. */
         const val UID_DNS = -100
         const val PROXY_CONNECT_MS = 5_000

@@ -42,6 +42,8 @@ class SettingsActivity : Activity() {
     private lateinit var status: TextView
     private lateinit var testOut: TextView
     private lateinit var otherVpn: TextView
+    private lateinit var testButton: TextView
+    private var testGen = 0
     private val handler = Handler(Looper.getMainLooper())
     private val ticker = object : Runnable {
         override fun run() {
@@ -116,7 +118,8 @@ class SettingsActivity : Activity() {
         form.addView(fields)
         val buttons = hbox().apply { setPadding(0, dp(12), 0, 0) }
         buttons.addView(pill("Сохранить", 0) { save() }, lp(WRAP, WRAP).apply { rightMargin = dp(8) })
-        buttons.addView(pill("Проверить", 1) { test() }, lp(WRAP, WRAP))
+        testButton = pill("Проверить", 1) { test() }
+        buttons.addView(testButton, lp(WRAP, WRAP))
         form.addView(buttons)
         testOut = text("", 13.5f, Pal.text)
         form.addView(testOut, lp().apply { topMargin = dp(10) })
@@ -222,6 +225,12 @@ class SettingsActivity : Activity() {
                 toast("DNS-сервер должен быть IP-адресом, например 1.1.1.1")
                 return null
             }
+            val u = user.text.toString().toByteArray(Charsets.UTF_8).size
+            val pw = pass.text.toString().toByteArray(Charsets.UTF_8).size
+            if (u > 255 || pw > 255 || (u == 0 && pw > 0)) {
+                toast("Логин и пароль: до 255 байт; без логина пароль не используется")
+                return null
+            }
         }
         return ProxyConfig(type, h, p, user.text.toString(), pass.text.toString(), dns.isChecked, d, udpDirect.isChecked, directIfDown.isChecked)
     }
@@ -242,6 +251,9 @@ class SettingsActivity : Activity() {
         }
         testOut.setTextColor(Pal.sub)
         testOut.text = "Проверяю…"
+        val gen = ++testGen
+        testButton.isEnabled = false
+        testButton.alpha = 0.5f
         val svc = FirewallService.instance
         Bg.run({
             val addr = Upstream.ipOrNull(c.host) ?: if (c.host.equals("localhost", true)) InetAddress.getByAddress(byteArrayOf(127, 0, 0, 1))
@@ -250,12 +262,21 @@ class SettingsActivity : Activity() {
             val t = ProxyTester({ s -> svc?.protect(s) ?: true }, { s -> svc?.protect(s) ?: true })
             t.run(c, InetSocketAddress(addr, c.port))
         }, { r ->
+            if (gen != testGen || isDestroyed) return@run
+            testDone()
             testOut.setTextColor(if (r.ok) Pal.ok else Pal.danger)
             testOut.text = r.lines.joinToString("\n")
         }, {
+            if (gen != testGen || isDestroyed) return@run
+            testDone()
             testOut.setTextColor(Pal.danger)
             testOut.text = "✗ не удалось проверить: адрес прокси не найден"
         })
+    }
+
+    private fun testDone() {
+        testButton.isEnabled = true
+        testButton.alpha = 1f
     }
 
     private fun renderStatus() {

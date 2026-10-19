@@ -68,7 +68,7 @@ object Socks5 {
     fun authRequest(user: String, pass: String): ByteArray {
         val u = user.toByteArray(Charsets.UTF_8)
         val p = pass.toByteArray(Charsets.UTF_8)
-        require(u.size in 1..255 && p.size <= 255) { "login/password too long" }
+        if (u.size !in 1..255 || p.size > 255) throw ProxyException("логин или пароль длиннее 255 байт")
         return byteArrayOf(1, u.size.toByte()) + u + byteArrayOf(p.size.toByte()) + p
     }
 
@@ -159,6 +159,16 @@ object Socks5 {
 
     /** Header prepended to every datagram sent to the UDP relay. */
     fun udpHeader(dst: InetAddress, port: Int): ByteArray = byteArrayOf(0, 0, 0) + address(dst, port)
+
+    /** Source address of a datagram from the relay (ATYP 1/4), or null for a domain/invalid header. */
+    fun udpSource(b: ByteArray, len: Int): InetSocketAddress? {
+        if (len < 4) return null
+        return when (b[3].toInt() and 0xFF) {
+            1 -> if (len >= 10) InetSocketAddress(InetAddress.getByAddress(b.copyOfRange(4, 8)), ((b[8].toInt() and 0xFF) shl 8) or (b[9].toInt() and 0xFF)) else null
+            4 -> if (len >= 22) InetSocketAddress(InetAddress.getByAddress(b.copyOfRange(4, 20)), ((b[20].toInt() and 0xFF) shl 8) or (b[21].toInt() and 0xFF)) else null
+            else -> null
+        }
+    }
 
     /** Offset of the payload in a datagram received from the relay, or -1 if invalid/fragmented. */
     fun udpPayloadOffset(b: ByteArray, len: Int): Int {

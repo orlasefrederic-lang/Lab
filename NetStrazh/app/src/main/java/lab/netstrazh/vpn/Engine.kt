@@ -442,10 +442,22 @@ class Engine(val host: EngineHost, private val pfd: ParcelFileDescriptor, val cf
 
     /** Switches the outbound route; live connections are dropped so apps reconnect via the new route. */
     fun setProxy(c: ProxyConfig) {
+        if (!running) return
         upstream.configure(c)
         for (conn in Live.active.values) if (!conn.blocked) conn.kill()
         udp.closeAll()
-        if (c.enabled) pool.execute { upstream.ensureProxyUid() }
+        upstream.ensureProxyUid()
+    }
+
+    /**
+     * Applies proxy settings off the main thread, one change at a time; [current] is read when the task
+     * runs, so the last saved settings always win.
+     */
+    fun applyProxyAsync(current: () -> ProxyConfig) {
+        try {
+            house.execute { if (running) setProxy(current()) }
+        } catch (_: RejectedExecutionException) {
+        }
     }
 
     /** Re-applies firewall rules to live connections (after a rule or network change). */

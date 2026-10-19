@@ -6,6 +6,9 @@ import android.net.LinkProperties
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
+import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import java.net.Inet4Address
 import java.net.Inet6Address
 import java.net.InetAddress
@@ -27,6 +30,24 @@ class NetMonitor(ctx: Context, private val onChange: () -> Unit) {
         private set
     @Volatile var hasIpv6 = false
         private set
+
+    /** The network the system itself uses as default for non-VPN traffic (Android 12+), if known. */
+    @Volatile private var systemBest: Network? = null
+
+    private val bestCallback = object : ConnectivityManager.NetworkCallback() {
+        override fun onAvailable(network: Network) {
+            systemBest = network
+            changed()
+        }
+        override fun onLost(network: Network) {
+            if (systemBest == network) systemBest = null
+            changed()
+        }
+        override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) {
+            systemBest = network
+            changed()
+        }
+    }
 
     private val callback = object : ConnectivityManager.NetworkCallback() {
         override fun onAvailable(network: Network) = changed()
@@ -52,9 +73,25 @@ class NetMonitor(ctx: Context, private val onChange: () -> Unit) {
             registered = true
         } catch (_: Exception) {
         }
+        // Our own default network is the VPN, so ask for the network the system would pick for
+        // non-VPN traffic: protected relay sockets leave through exactly that one.
+        if (Build.VERSION.SDK_INT >= 31) {
+            try {
+                cm.registerBestMatchingNetworkCallback(req, bestCallback, Handler(Looper.getMainLooper()))
+                bestRegistered = true
+            } catch (_: Exception) {
+            }
+        }
     }
 
+    private var bestRegistered = false
+
     fun stop() {
+        if (bestRegistered) {
+            try { cm.unregisterNetworkCallback(bestCallback) } catch (_: Exception) {}
+            bestRegistered = false
+            systemBest = null
+        }
         if (!registered) return
         try { cm.unregisterNetworkCallback(callback) } catch (_: Exception) {}
         registered = false
@@ -78,6 +115,16 @@ class NetMonitor(ctx: Context, private val onChange: () -> Unit) {
                 pick = n
                 pickCaps = caps
                 pickScore = score
+            }
+        }
+        // Prefer the system's own choice (e.g. HyperOS may move traffic to mobile data while Wi-Fi stays
+        // connected): the network we declare as underlying is what HyperOS uses for its per-app rules.
+        systemBest?.let { sb ->
+            val caps = cm.getNetworkCapabilities(sb)
+            if (caps != null && !caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN) &&
+                caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)) {
+                pick = sb
+                pickCaps = caps
             }
         }
         best = pick

@@ -39,6 +39,10 @@ class UdpRelay(private val eng: Engine) {
         /** DNS queries are resolved one by one over TCP through the proxy. */
         @Volatile var dnsOverProxy = false
         @Volatile var last = System.currentTimeMillis()
+        /** For flows dropped because of the proxy: when to set the path up again. */
+        @Volatile var retryAt = 0L
+        /** DNS datagrams to a third-party resolver when the proxy cannot carry UDP. */
+        @Volatile var dnsServer: InetSocketAddress? = null
         val closed = AtomicBoolean(false)
         /** Datagrams received while the path is being set up (guarded by the session). */
         val queue = ArrayDeque<ByteArray>()
@@ -140,7 +144,9 @@ class UdpRelay(private val eng: Engine) {
         }
         if (!eng.upstream.enabled) {
             // Direct: opening a datagram channel never blocks, so do it right here.
-            return if (openPath(s, uid, dstInet)) s else null
+            if (openPath(s, uid, dstInet, directOnly = true)) return s
+            close(s)
+            return null
         }
         // Proxy mode: talking to the proxy can block, so set the path up on another thread.
         try {
@@ -156,10 +162,12 @@ class UdpRelay(private val eng: Engine) {
     }
 
     /** Chooses and opens the path for a new session, then flushes datagrams queued meanwhile. */
-    private fun openPath(s: Session, uid: Int, dstInet: InetAddress): Boolean {
+    private fun openPath(s: Session, uid: Int, dstInet: InetAddress, directOnly: Boolean = false): Boolean {
         val up = eng.upstream
         try {
-            if (s.isDns) {
+            if (directOnly) {
+                s.path = up.directUdp(InetSocketAddress(if (s.isDns) eng.host.upstreamDns() else dstInet, s.remotePort))
+            } else if (s.isDns) {
                 if (up.dnsViaProxy(uid)) {
                     s.dnsOverProxy = true
                     s.conn.via = VIA_PROXY
@@ -169,15 +177,25 @@ class UdpRelay(private val eng: Engine) {
             } else {
                 val path = up.openUdp(InetSocketAddress(dstInet, s.remotePort), uid)
                 if (path == null) {
-                    s.conn.note = up.udpDropReason()
-                    synchronized(s) {
-                        s.queue.clear()
-                        s.state = DROP
+                    if (s.remotePort == 53 && up.proxied(uid)) {
+                        // An app asking a resolver directly (e.g. 8.8.8.8): resolve over TCP through the proxy.
+                        s.dnsServer = InetSocketAddress(dstInet, 53)
+                        s.dnsOverProxy = true
+                        s.conn.via = VIA_PROXY
+                    } else {
+                        s.conn.note = up.udpDropReason()
+                        // Re-evaluate later: the proxy may come back (soon) or gain UDP (after the recheck).
+                        s.retryAt = System.currentTimeMillis() + if (up.udpUnsupported) Upstream.UDP_RECHECK_MS else 5_000L
+                        synchronized(s) {
+                            s.queue.clear()
+                            s.state = DROP
+                        }
+                        return true
                     }
-                    return true
+                } else {
+                    s.path = path
+                    if (path.viaProxy) s.conn.via = VIA_PROXY
                 }
-                s.path = path
-                if (path.viaProxy) s.conn.via = VIA_PROXY
             }
         } catch (e: Exception) {
             Log.w(Engine.TAG, "udp open failed: ${s.conn.ip}:${s.remotePort}", e)
@@ -203,7 +221,9 @@ class UdpRelay(private val eng: Engine) {
         try {
             setup.execute {
                 try {
-                    val full = eng.upstream.dnsQuery(query, 0, query.size)
+                    val server = s.dnsServer
+                    val full = if (server != null) eng.upstream.dnsQueryOnce(server, query, 0, query.size)
+                    else eng.upstream.dnsQuery(query, 0, query.size)
                     s.last = System.currentTimeMillis()
                     s.conn.addTx(query.size.toLong())
                     s.conn.addRx(full.size.toLong())
@@ -273,6 +293,11 @@ class UdpRelay(private val eng: Engine) {
                         if (path.header != null) {
                             off = Socks5.udpPayloadOffset(bb.array(), n)
                             if (off < 0) continue
+                            // Full-cone proxies relay datagrams from any host; keep only this flow's peer,
+                            // as a connected socket would on the direct path.
+                            val src = Socks5.udpSource(bb.array(), n)
+                            // (InetAddress equality also matches an IPv4-mapped IPv6 header to an IPv4 peer.)
+                            if (src != null && (src.port != s.remotePort || src.address != InetAddress.getByAddress(s.remoteAddr))) continue
                         }
                         val len = n - off
                         s.last = System.currentTimeMillis()
@@ -317,6 +342,10 @@ class UdpRelay(private val eng: Engine) {
 
     fun sweep(now: Long) {
         for (s in sessions.values) {
+            if (s.state == DROP && !s.conn.blocked && s.retryAt != 0L && now >= s.retryAt) {
+                close(s)
+                continue
+            }
             val idle = now - s.last
             val limit = when {
                 s.isDns -> DNS_TIMEOUT_MS

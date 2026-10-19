@@ -39,6 +39,9 @@ class FirewallService : VpnService(), EngineHost {
         instance = this
         cm = getSystemService(ConnectivityManager::class.java)
         net = NetMonitor(this) {
+            // Tell the system the real underlying network right away (HyperOS applies its per-app
+            // Wi-Fi/mobile rules based on it); rules and restarts are debounced.
+            main.post { if (engine != null) net.best?.let { setUnderlyingNetworks(arrayOf(it)) } }
             main.removeCallbacks(netChanged)
             main.postDelayed(netChanged, 1000)
         }
@@ -285,7 +288,7 @@ class FirewallService : VpnService(), EngineHost {
         fun applyProxy() {
             val s = instance ?: return
             s.main.post {
-                s.engine?.let { e -> Thread { e.setProxy(Prefs.proxy) }.start() }
+                s.engine?.applyProxyAsync { Prefs.proxy }
                 s.updateNotification()
             }
         }

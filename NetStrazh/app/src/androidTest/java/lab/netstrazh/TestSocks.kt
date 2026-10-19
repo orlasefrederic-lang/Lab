@@ -20,6 +20,8 @@ import java.util.concurrent.atomic.AtomicReference
 class TestSocks(
     private val protectTcp: (Socket) -> Boolean,
     private val protectUdp: (DatagramSocket) -> Boolean,
+    /** Resolves names sent as ATYP 3 (outside our own VPN). */
+    private val resolve: (String) -> InetAddress,
 ) : Closeable {
     private val lo = InetAddress.getByAddress(byteArrayOf(127, 0, 0, 1))
     private val server = ServerSocket(0, 64, lo)
@@ -47,18 +49,24 @@ class TestSocks(
             i.readUnsignedByte()
             val cmd = i.readUnsignedByte()
             i.readUnsignedByte()
+            var name: String? = null
             val addr = when (i.readUnsignedByte()) {
                 1 -> InetAddress.getByAddress(ByteArray(4).also { i.readFully(it) })
                 4 -> InetAddress.getByAddress(ByteArray(16).also { i.readFully(it) })
+                3 -> {
+                    name = String(ByteArray(i.readUnsignedByte()).also { i.readFully(it) }, Charsets.US_ASCII)
+                    null
+                }
                 else -> throw IOException("unsupported atyp")
             }
             val port = i.readUnsignedShort()
             when (cmd) {
                 1 -> {
-                    connects += "${addr.hostAddress}:$port"
+                    connects += "${name ?: addr!!.hostAddress}:$port"
+                    val target = addr ?: resolve(name!!)
                     val out = java.nio.channels.SocketChannel.open()
                     protectTcp(out.socket())
-                    out.socket().connect(InetSocketAddress(addr, port), 10_000)
+                    out.socket().connect(InetSocketAddress(target, port), 10_000)
                     o.write(byteArrayOf(5, 0, 0, 1, 0, 0, 0, 0, 0, 0))
                     val s = out.socket()
                     pool.execute { copy(s, c) }
