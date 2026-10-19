@@ -58,6 +58,7 @@ class MainActivity : Activity() {
         val titles = vbox()
         titles.addView(text("Сетевой страж", 22f, bold = true))
         status = text("", 13f, Pal.sub)
+        status.setOnClickListener { headerAction?.invoke() }
         titles.addView(status)
         header.addView(titles, lp(0, WRAP, 1f))
         power = Switch(this).apply {
@@ -140,20 +141,49 @@ class MainActivity : Activity() {
         updatingSwitch = true
         power.isChecked = on || pendingStart
         updatingSwitch = false
-        status.text = if (on) {
-            "Защита включена · соединений: ${Live.active.size}"
-        } else if (pendingStart) {
-            "Включаю…"
-        } else {
-            "Защита выключена"
+        val up = FirewallService.instance?.upstream
+        val proxy = Prefs.proxy.enabled
+        val now = System.currentTimeMillis()
+        val proxyDown = on && proxy && up != null && up.lastErrorAt > up.lastOkAt && now - up.lastErrorAt < 30_000
+        headerAction = null
+        status.text = when {
+            on && proxyDown -> {
+                headerAction = { startActivity(Intent(this, SettingsActivity::class.java)) }
+                "⚠ Прокси недоступен — интернета нет. Нажмите, чтобы проверить"
+            }
+            on -> "Защита включена" + (if (proxy) " · через прокси" else "") + " · соединений: ${Live.active.size}"
+            pendingStart -> "Включаю…"
+            now - Prefs.revokedAt < 15 * 60_000L -> {
+                headerAction = { startActivity(Intent(this, SettingsActivity::class.java)) }
+                "Выключено: включился другой VPN. Как работать вместе ›"
+            }
+            otherVpnActive() -> {
+                headerAction = { startActivity(Intent(this, SettingsActivity::class.java)) }
+                "Сейчас работает другой VPN. Как работать вместе ›"
+            }
+            else -> "Защита выключена"
         }
-        status.setTextColor(if (on) Pal.ok else Pal.sub)
+        status.setTextColor(when {
+            proxyDown -> Pal.danger
+            on -> Pal.ok
+            headerAction != null -> Pal.warn
+            else -> Pal.sub
+        })
         if (on) pendingStart = false
     }
 
     // ------------------------------------------------------------ start / stop
 
     private var pendingStart = false
+    private var headerAction: (() -> Unit)? = null
+
+    private fun otherVpnActive(): Boolean = try {
+        val cm = getSystemService(android.net.ConnectivityManager::class.java)
+        @Suppress("DEPRECATION")
+        cm.allNetworks.any { cm.getNetworkCapabilities(it)?.hasTransport(android.net.NetworkCapabilities.TRANSPORT_VPN) == true }
+    } catch (_: Exception) {
+        false
+    }
     private var pendingSince = 0L
 
     private fun onPowerToggle(on: Boolean) {

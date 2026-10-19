@@ -23,6 +23,10 @@ class Conn(
         private set
     @Volatile var end = 0L
     @Volatile var blocked = false
+    /** [VIA_PROXY] when the traffic went through the upstream proxy. */
+    @Volatile var via = ""
+    /** Why the connection failed or was dropped, shown in the journal. */
+    @Volatile var note: String? = null
     /** Closes the underlying sockets; set by the relay. */
     @Volatile var killer: (() -> Unit)? = null
     internal val logged = AtomicBoolean(false)
@@ -46,6 +50,8 @@ class Conn(
         private val seq = AtomicLong()
     }
 }
+
+const val VIA_PROXY = "proxy"
 
 class UidStat {
     val tx = AtomicLong()

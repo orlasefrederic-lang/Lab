@@ -14,6 +14,7 @@ import lab.netstrazh.data.Db
 import lab.netstrazh.data.LogRow
 import lab.netstrazh.vpn.Conn
 import lab.netstrazh.vpn.Live
+import lab.netstrazh.vpn.VIA_PROXY
 
 /** "Журнал": every connection, DNS query and blocked attempt. */
 class JournalPage(act: MainActivity) : Page(act) {
@@ -117,7 +118,7 @@ class JournalPage(act: MainActivity) : Page(act) {
     }
 
     private fun toRow(c: Conn) = LogRow(c.start, System.currentTimeMillis(), c.uid, c.proto, c.ip, c.port, c.host,
-        c.tx, c.rx, c.blocked, c.net, active = true)
+        c.tx, c.rx, c.blocked, c.net, active = true, via = c.via, note = c.note)
 
     private fun confirmClear() {
         AlertDialog.Builder(act)
@@ -138,11 +139,13 @@ class JournalPage(act: MainActivity) : Page(act) {
         } else {
             v.line2.text = Fmt.dest(r.host, r.ip, r.port) + if (!r.host.isNullOrEmpty() && r.host != r.ip) " · " + r.ip else ""
         }
+        val via = if (r.via == VIA_PROXY) " · через прокси" else ""
         when {
             r.blocked -> v.setLine3("⛔ ЗАБЛОКИРОВАНО · " + Fmt.net(r.net), Pal.danger)
-            r.active -> v.setLine3("● активно · ↑ ${Fmt.bytes(r.tx)} ↓ ${Fmt.bytes(r.rx)} · ${Fmt.duration(r.te - r.ts)}", Pal.ok)
-            r.proto == "DNS" -> v.setLine3(Fmt.net(r.net))
-            else -> v.setLine3("↑ ${Fmt.bytes(r.tx)} ↓ ${Fmt.bytes(r.rx)} · ${Fmt.duration(r.te - r.ts)} · ${Fmt.net(r.net)}")
+            r.note != null && r.tx == 0L && r.rx == 0L -> v.setLine3("✗ ${r.note} · ${Fmt.net(r.net)}$via", Pal.warn)
+            r.active -> v.setLine3("● активно · ↑ ${Fmt.bytes(r.tx)} ↓ ${Fmt.bytes(r.rx)} · ${Fmt.duration(r.te - r.ts)}$via", Pal.ok)
+            r.proto == "DNS" -> v.setLine3(Fmt.net(r.net) + via)
+            else -> v.setLine3("↑ ${Fmt.bytes(r.tx)} ↓ ${Fmt.bytes(r.rx)} · ${Fmt.duration(r.te - r.ts)} · ${Fmt.net(r.net)}$via")
         }
     }
 }

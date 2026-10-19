@@ -242,7 +242,8 @@ class AppActivity : Activity() {
                 line(liveBox, Fmt.dest(c.host, c.ip, c.port) + " · " + c.proto, "⛔ заблокировано", subColor = Pal.danger)
             } else {
                 line(liveBox, Fmt.dest(c.host, c.ip, c.port) + " · " + c.proto,
-                    "↑ ${Fmt.bytes(c.tx)} ↓ ${Fmt.bytes(c.rx)} · ${Fmt.duration(System.currentTimeMillis() - c.start)}")
+                    "↑ ${Fmt.bytes(c.tx)} ↓ ${Fmt.bytes(c.rx)} · ${Fmt.duration(System.currentTimeMillis() - c.start)}" +
+                        if (c.via == lab.netstrazh.vpn.VIA_PROXY) " · через прокси" else "")
             }
         }
     }
@@ -287,6 +288,7 @@ class AppActivity : Activity() {
             val main = if (r.proto == "DNS") "DNS: ${r.host ?: "?"}" else Fmt.dest(r.host, r.ip, r.port) + " · " + r.proto
             val sub = Fmt.time(r.ts) + " · " + Fmt.net(r.net) + when {
                 r.blocked -> " · ⛔ заблокировано"
+                r.note != null && r.tx == 0L && r.rx == 0L -> " · ✗ ${r.note}"
                 r.proto == "DNS" -> if (r.ip.isNotEmpty()) " · → ${r.ip}" else ""
                 else -> " · ↑ ${Fmt.bytes(r.tx)} ↓ ${Fmt.bytes(r.rx)}"
             }

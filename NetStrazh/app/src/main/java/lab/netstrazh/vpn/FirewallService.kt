@@ -67,6 +67,7 @@ class FirewallService : VpnService(), EngineHost {
     override fun onRevoke() {
         // The user disconnected us in system settings or another VPN took over.
         Prefs.enabled = false
+        Prefs.revokedAt = System.currentTimeMillis()
         shutdown()
         stopSelf()
     }
@@ -95,6 +96,7 @@ class FirewallService : VpnService(), EngineHost {
         stopEngine()
         Live.reset()
         val e = Engine(this, pfd, cfg)
+        e.upstream.configure(Prefs.proxy)
         try {
             e.start()
         } catch (ex: Exception) {
@@ -196,6 +198,19 @@ class FirewallService : VpnService(), EngineHost {
 
     override fun upstreamDns(): InetAddress = net.upstreamDns()
 
+    override val selfUid: Int = android.os.Process.myUid()
+
+    override fun resolve(host: String): InetAddress {
+        Upstream.ipOrNull(host)?.let { return it }
+        if (host.equals("localhost", true)) return InetAddress.getByAddress(byteArrayOf(127, 0, 0, 1))
+        // Resolve on the real network so the lookup does not loop through our own VPN.
+        val n = net.best ?: throw java.net.UnknownHostException(host)
+        return n.getAllByName(host).first()
+    }
+
+    /** Current upstream (proxy) state, for the UI. */
+    val upstream: Upstream? get() = engine?.upstream
+
     override fun onEngineDied() {
         main.post {
             if (engine != null) restartEngine()
@@ -222,7 +237,10 @@ class FirewallService : VpnService(), EngineHost {
         return Notification.Builder(this, CHANNEL)
             .setSmallIcon(R.drawable.ic_stat_shield)
             .setContentTitle(getString(R.string.notif_on))
-            .setContentText(if (blocked == 0) getString(R.string.notif_no_rules) else getString(R.string.notif_blocked, blocked))
+            .setContentText(
+                (if (blocked == 0) getString(R.string.notif_no_rules) else getString(R.string.notif_blocked, blocked)) +
+                    if (Prefs.proxy.enabled) " · " + getString(R.string.notif_via_proxy) else ""
+            )
             .setContentIntent(mainIntent())
             .setOngoing(true)
             .setShowWhen(false)
@@ -261,6 +279,15 @@ class FirewallService : VpnService(), EngineHost {
         fun start(ctx: Context) {
             val i = Intent(ctx, FirewallService::class.java).setAction(ACTION_START)
             ctx.startForegroundService(i)
+        }
+
+        /** Applies changed proxy settings to the running engine. */
+        fun applyProxy() {
+            val s = instance ?: return
+            s.main.post {
+                s.engine?.let { e -> Thread { e.setProxy(Prefs.proxy) }.start() }
+                s.updateNotification()
+            }
         }
 
         /** Re-establishes the interface after a settings change (e.g. IPv6). */

@@ -25,6 +25,8 @@ class LogRow(
     val blocked: Boolean,
     val net: String,
     val active: Boolean = false,
+    val via: String = "",
+    val note: String? = null,
 )
 
 class DestRow(
@@ -40,17 +42,23 @@ class DestRow(
 )
 
 /** Connection journal stored in SQLite. Writes are batched on a background thread. */
-class Db private constructor(ctx: Context) : SQLiteOpenHelper(ctx, "netstrazh.db", null, 1) {
+class Db private constructor(ctx: Context) : SQLiteOpenHelper(ctx, "netstrazh.db", null, 2) {
     override fun onCreate(db: SQLiteDatabase) {
         db.execSQL(
             "CREATE TABLE conn(id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER, te INTEGER, uid INTEGER, " +
-                "proto TEXT, ip TEXT, port INTEGER, host TEXT, tx INTEGER, rx INTEGER, blocked INTEGER, net TEXT)"
+                "proto TEXT, ip TEXT, port INTEGER, host TEXT, tx INTEGER, rx INTEGER, blocked INTEGER, net TEXT, " +
+                "via TEXT, note TEXT)"
         )
         db.execSQL("CREATE INDEX conn_ts ON conn(ts)")
         db.execSQL("CREATE INDEX conn_uid ON conn(uid, ts)")
     }
 
-    override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {}
+    override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
+        if (oldVersion < 2) {
+            db.execSQL("ALTER TABLE conn ADD COLUMN via TEXT")
+            db.execSQL("ALTER TABLE conn ADD COLUMN note TEXT")
+        }
+    }
 
     companion object {
         private lateinit var helper: Db
@@ -74,7 +82,7 @@ class Db private constructor(ctx: Context) : SQLiteOpenHelper(ctx, "netstrazh.db
                 try {
                     while (true) {
                         val c = queue.poll() ?: break
-                        val v = ContentValues(11)
+                        val v = ContentValues(13)
                         v.put("ts", c.start)
                         v.put("te", if (c.end == 0L) System.currentTimeMillis() else c.end)
                         v.put("uid", c.uid)
@@ -86,6 +94,8 @@ class Db private constructor(ctx: Context) : SQLiteOpenHelper(ctx, "netstrazh.db
                         v.put("rx", c.rx)
                         v.put("blocked", if (c.blocked) 1 else 0)
                         v.put("net", c.net)
+                        v.put("via", c.via)
+                        v.put("note", c.note)
                         db.insert("conn", null, v)
                     }
                     db.setTransactionSuccessful()
@@ -144,24 +154,19 @@ class Db private constructor(ctx: Context) : SQLiteOpenHelper(ctx, "netstrazh.db
                 textCond != null -> where += textCond
                 uidCond != null -> where += uidCond
             }
-            val sql = "SELECT ts, te, uid, proto, ip, port, host, tx, rx, blocked, net FROM conn" +
+            val sql = "SELECT $ROW_COLS FROM conn" +
                 (if (where.isEmpty()) "" else " WHERE " + where.joinToString(" AND ")) +
                 " ORDER BY ts DESC LIMIT $limit"
-            return query(sql, args.toTypedArray()) { c ->
-                LogRow(c.getLong(0), c.getLong(1), c.getInt(2), c.getString(3), c.getString(4) ?: "",
-                    c.getInt(5), c.getString(6), c.getLong(7), c.getLong(8), c.getInt(9) != 0, c.getString(10) ?: "")
-            }
+            return query(sql, args.toTypedArray(), ::logRow)
         }
 
         fun recentForUid(uid: Int, limit: Int = 100): List<LogRow> {
             sync()
             return query(
-                "SELECT ts, te, uid, proto, ip, port, host, tx, rx, blocked, net FROM conn WHERE uid = ? ORDER BY ts DESC LIMIT $limit",
-                arrayOf(uid.toString())
-            ) { c ->
-                LogRow(c.getLong(0), c.getLong(1), c.getInt(2), c.getString(3), c.getString(4) ?: "",
-                    c.getInt(5), c.getString(6), c.getLong(7), c.getLong(8), c.getInt(9) != 0, c.getString(10) ?: "")
-            }
+                "SELECT $ROW_COLS FROM conn WHERE uid = ? ORDER BY ts DESC LIMIT $limit",
+                arrayOf(uid.toString()),
+                ::logRow
+            )
         }
 
         /** Where an app connected to, grouped by host (or IP when the host is unknown). */
@@ -187,6 +192,12 @@ class Db private constructor(ctx: Context) : SQLiteOpenHelper(ctx, "netstrazh.db
                     c.getLong(5), c.getLong(6), c.getLong(7), c.getInt(8))
             }
         }
+
+        private const val ROW_COLS = "ts, te, uid, proto, ip, port, host, tx, rx, blocked, net, via, note"
+
+        private fun logRow(c: Cursor) = LogRow(c.getLong(0), c.getLong(1), c.getInt(2), c.getString(3), c.getString(4) ?: "",
+            c.getInt(5), c.getString(6), c.getLong(7), c.getLong(8), c.getInt(9) != 0, c.getString(10) ?: "",
+            via = c.getString(11) ?: "", note = c.getString(12))
 
         private fun <T> query(sql: String, args: Array<String>, map: (Cursor) -> T): List<T> {
             val out = ArrayList<T>()

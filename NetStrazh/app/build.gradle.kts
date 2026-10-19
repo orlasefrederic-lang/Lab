@@ -15,7 +15,8 @@ android {
         minSdk = 29
         targetSdk = 34
         versionCode = 100 + buildNumber
-        versionName = "1.0.$buildNumber"
+        versionName = "1.1.$buildNumber"
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
     signingConfigs {
@@ -56,4 +57,9 @@ android {
 
 dependencies {
     testImplementation("junit:junit:4.13.2")
+    // Only for the end-to-end tests on an emulator; the app itself has no dependencies.
+    androidTestImplementation("androidx.test:runner:1.6.2")
+    androidTestImplementation("androidx.test:core:1.6.1")
+    androidTestImplementation("androidx.test.ext:junit:1.2.1")
+    androidTestImplementation("junit:junit:4.13.2")
 }

@@ -37,6 +37,9 @@ class FirewallPage(act: MainActivity) : Page(act) {
             lp(WRAP, WRAP).apply { rightMargin = act.dp(8) })
         buttons.addView(act.pill("Если отключается…", 3) { showBatteryHelp() }, lp(WRAP, WRAP))
         top.addView(buttons, lp().apply { topMargin = act.dp(10) })
+        top.addView(act.pill("Вместе с другим VPN (прокси) ›", 1) {
+            act.startActivity(Intent(act, SettingsActivity::class.java))
+        }, lp(WRAP, WRAP).apply { topMargin = act.dp(8) })
         addView(top)
         list.divider = null
         list.adapter = adapter

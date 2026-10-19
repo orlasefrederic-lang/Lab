@@ -6,4 +6,5 @@
     <string name="notif_no_rules">Наблюдаю за сетью · блок-лист пуст</string>
     <string name="notif_blocked">Наблюдаю за сетью · в блок-листе: %1$d</string>
     <string name="notif_stop">Выключить</string>
+    <string name="notif_via_proxy">через прокси</string>
 </resources>

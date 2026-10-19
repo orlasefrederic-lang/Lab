@@ -29,6 +29,7 @@ import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
 import kotlin.concurrent.thread
 
 /** Addresses of our VPN interface. */
@@ -59,6 +60,10 @@ interface EngineHost {
     fun ownerUid(proto: Int, local: InetSocketAddress, remote: InetSocketAddress): Int
     fun netType(): NetType
     fun upstreamDns(): InetAddress
+    /** Resolves an IP literal or host name without going through our own VPN. */
+    fun resolve(host: String): InetAddress
+    /** Our own UID (never treated as the proxy app). */
+    val selfUid: Int
     fun onEngineDied()
 }
 
@@ -75,6 +80,7 @@ class Engine(val host: EngineHost, private val pfd: ParcelFileDescriptor, val cf
     @Volatile var running = false
         private set
     val nat = NatTable()
+    val upstream = Upstream(host)
     private val wake: Array<FileDescriptor> = Os.pipe()
     private var tcp4: ServerSocketChannel? = null
     private var tcp6: ServerSocketChannel? = null
@@ -292,35 +298,54 @@ class Engine(val host: EngineHost, private val pfd: ParcelFileDescriptor, val cf
         val conn = Conn(uid, if (fakeDns) "DNS" else "TCP", if (fakeDns) "" else ip, e.dstPort,
             if (fakeDns) null else DnsCache.get(uid, ip), host.netType().label)
         Live.open(conn)
-        var out: SocketChannel? = null
+        val out = AtomicReference<SocketChannel?>()
+        conn.killer = {
+            reset(client)
+            closeQuietly(out.get())
+        }
         try {
             if (!fakeDns && isBlocked(uid)) {
                 conn.blocked = true
                 reset(client)
                 return
             }
-            val target = if (fakeDns) InetSocketAddress(host.upstreamDns(), 53) else InetSocketAddress(dst, e.dstPort)
-            val o = SocketChannel.open()
-            out = o
-            conn.killer = {
-                reset(client)
-                closeQuietly(o)
+            val o: SocketChannel
+            if (fakeDns) {
+                // DNS over TCP to our fake resolver (e.g. truncated answers): same route as UDP DNS.
+                if (upstream.dnsViaProxy(uid)) {
+                    o = upstream.openTcp(InetSocketAddress(host.resolve(upstream.cfg.dnsServer), 53), uid, CONNECT_TIMEOUT_MS) { out.set(it) }.ch
+                    conn.via = VIA_PROXY
+                } else {
+                    o = upstream.openTcpDirect(InetSocketAddress(host.upstreamDns(), 53), CONNECT_TIMEOUT_MS) { out.set(it) }
+                }
+            } else {
+                val opened = upstream.openTcp(InetSocketAddress(dst, e.dstPort), uid, CONNECT_TIMEOUT_MS) { out.set(it) }
+                o = opened.ch
+                if (opened.viaProxy) conn.via = VIA_PROXY
             }
-            if (!host.protect(o.socket())) throw IOException("protect failed")
-            o.socket().connect(target, CONNECT_TIMEOUT_MS)
             o.socket().tcpNoDelay = true
             client.socket().tcpNoDelay = true
             val down = pool.submit { pump(o, client, conn, false) }
             pump(client, o, conn, true)
             down.get()
         } catch (ex: Exception) {
+            if (conn.tx == 0L && conn.rx == 0L) conn.note = failureNote(ex)
             reset(client)
         } finally {
             closeQuietly(client)
-            closeQuietly(out)
+            closeQuietly(out.get())
             nat.close(e, System.currentTimeMillis())
             Live.close(conn)
         }
+    }
+
+    private fun failureNote(ex: Exception): String = when (ex) {
+        is Upstream.ProxyDown -> "прокси недоступен"
+        is lab.netstrazh.net.ProxyException -> ex.message ?: "ошибка прокси"
+        is java.net.SocketTimeoutException -> "нет ответа"
+        is java.net.ConnectException -> "соединение отклонено"
+        is java.nio.channels.ClosedChannelException -> "закрыто"
+        else -> ex.message?.take(80) ?: ex.javaClass.simpleName
     }
 
     private fun pump(src: SocketChannel, dst: SocketChannel, conn: Conn, up: Boolean) {
@@ -359,6 +384,14 @@ class Engine(val host: EngineHost, private val pfd: ParcelFileDescriptor, val cf
     fun isFakeDns(addr: ByteArray): Boolean = addr.contentEquals(cfg.dns4)
 
     fun isBlocked(uid: Int): Boolean = Rules.isBlocked(uid, host.netType())
+
+    /** Switches the outbound route; live connections are dropped so apps reconnect via the new route. */
+    fun setProxy(c: ProxyConfig) {
+        upstream.configure(c)
+        for (conn in Live.active.values) if (!conn.blocked) conn.kill()
+        udp.closeAll()
+        if (c.enabled) pool.execute { upstream.ensureProxyUid() }
+    }
 
     /** Re-applies firewall rules to live connections (after a rule or network change). */
     fun enforceRules() {
