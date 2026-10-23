@@ -16,6 +16,15 @@ if str(ROOT / "tests") not in sys.path:
 from mp4_factory import make_mp4  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def isolated_home(tmp_path_factory, monkeypatch):
+    """Keep every test away from a real ``mediameta exiftool install``."""
+    home = tmp_path_factory.mktemp("mediameta-home")
+    monkeypatch.setenv("MEDIAMETA_HOME", str(home))
+    monkeypatch.delenv("MEDIAMETA_EXIFTOOL", raising=False)
+    return home
+
+
 @pytest.fixture
 def jpeg(tmp_path) -> Path:
     from PIL import Image

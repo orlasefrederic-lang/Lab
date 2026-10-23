@@ -101,3 +101,57 @@ def test_native_backend_reads_xmp_written_by_exiftool(jpeg):
     record = read_metadata(jpeg, backend="native")
     assert record.common["title"] == "Из Lightroom"
     assert record.common["keywords"] == ["море", "лето"]
+
+
+# -- the stdin argument mode Windows uses ------------------------------------
+#
+# On Windows the command line reaches exiftool in the ANSI code page, so the
+# backend sends every argument through stdin as UTF-8 instead. The mode is
+# forced on here to prove it round-trips the awkward cases on this machine.
+
+
+@pytest.fixture
+def argfile_backend(monkeypatch):
+    from mediameta.backends import BACKENDS_BY_NAME
+
+    backend = BACKENDS_BY_NAME["exiftool"]
+    monkeypatch.setattr(backend, "use_argfile", True)
+    return backend
+
+
+def test_argfile_mode_keeps_cyrillic_and_odd_characters(tmp_path, argfile_backend):
+    from PIL import Image
+
+    folder = tmp_path / "папка с пробелом"
+    folder.mkdir()
+    photo = folder / "фото 1 #копия.jpg"
+    Image.new("RGB", (20, 20)).save(photo)
+
+    values = {
+        "title": "  Закат на заливе  ",
+        "description": "строка 1\nстрока 2\tс табом",
+        "comment": "#начинается с решётки",
+        "copyright": 'кавычки "внутри" и \\ слэш',
+        "artist": "Костя",
+    }
+    record = write_metadata(photo, values, backend="exiftool")
+    for name, expected in values.items():
+        assert record.common[name] == expected, name
+
+
+def test_argfile_mode_reads_and_strips(jpeg, argfile_backend):
+    from mediameta import remove_metadata
+
+    write_metadata(jpeg, {"title": "Закат"}, backend="exiftool")
+    assert read_metadata(jpeg, backend="exiftool").common["title"] == "Закат"
+    assert "title" not in remove_metadata(jpeg, backend="exiftool").common
+
+
+def test_argfile_line_encoding():
+    from mediameta.backends.exiftool import _argfile_line
+
+    assert _argfile_line("-Title=Закат") == "-Title=Закат"
+    assert _argfile_line(r"C:\Users\Костя\photo.jpg") == r"C:\Users\Костя\photo.jpg"
+    assert _argfile_line("#comment") == "#[CSTR]#comment"
+    assert _argfile_line("a\nb") == "#[CSTR]a\\nb"
+    assert _argfile_line(" x ") == "#[CSTR] x "

@@ -7,7 +7,7 @@ import json
 import sys
 from pathlib import Path
 
-from . import __version__
+from . import __version__, exiftool_setup
 from .api import copy_metadata, read_metadata, remove_metadata, write_metadata
 from .backends import backend_status
 from .errors import MediaMetaError
@@ -24,6 +24,7 @@ examples:
   mediameta remove photo.jpg -f gps_latitude -f gps_longitude
   mediameta remove photo.jpg --all --backup
   mediameta copy original.jpg edited.jpg
+  mediameta exiftool install      # adds HEIC, RAW, MKV, AVI support
 """
 
 
@@ -99,6 +100,21 @@ def build_parser() -> argparse.ArgumentParser:
 
     backends = subparsers.add_parser("backends", help="show which backends are usable")
     backends.set_defaults(handler=command_backends)
+
+    exiftool = subparsers.add_parser(
+        "exiftool", help="download or inspect the exiftool helper (HEIC, RAW, MKV, AVI)"
+    )
+    actions = exiftool.add_subparsers(dest="action", required=True)
+    install = actions.add_parser(
+        "install", help="download the latest exiftool from exiftool.org and verify it"
+    )
+    install.add_argument("--force", action="store_true",
+                         help="download again even if this version is installed")
+    install.set_defaults(handler=command_exiftool_install)
+    status = actions.add_parser("status", help="show which exiftool mediameta will use")
+    status.set_defaults(handler=command_exiftool_status)
+    remove = actions.add_parser("remove", help="delete mediameta's own copy of exiftool")
+    remove.set_defaults(handler=command_exiftool_remove)
 
     return parser
 
@@ -252,6 +268,50 @@ def command_backends(args) -> int:
         if not available:
             print(f"         {reason}")
     return 0
+
+
+def command_exiftool_install(args) -> int:
+    result = exiftool_setup.install(force=args.force, progress=print)
+    if result["changed"]:
+        print(f"installed exiftool {result['version']} into {result['path']}")
+    else:
+        print(f"exiftool {result['version']} is already installed in {result['path']}")
+    return 0
+
+
+def command_exiftool_status(args) -> int:
+    from .backends import BACKENDS_BY_NAME
+
+    backend = BACKENDS_BY_NAME["exiftool"]
+    command, source = backend.resolve()
+    if not command:
+        print(f"exiftool: not available ({backend.is_available()[1]})")
+        return 0
+
+    version = _exiftool_version(command)
+    print(f"exiftool: {version or 'unknown version'}, from {source}")
+    print(f"  command: {' '.join(command)}")
+    print(f"  mediameta's own folder: {exiftool_setup.install_dir()}")
+    return 0
+
+
+def command_exiftool_remove(args) -> int:
+    folder = exiftool_setup.install_dir()
+    if exiftool_setup.uninstall():
+        print(f"removed {folder}")
+    else:
+        print(f"nothing to remove: {folder} does not exist")
+    return 0
+
+
+def _exiftool_version(command):
+    import subprocess
+
+    try:
+        result = subprocess.run([*command, "-ver"], capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return result.stdout.strip() if result.returncode == 0 else None
 
 
 # -- helpers -----------------------------------------------------------

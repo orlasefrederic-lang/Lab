@@ -42,6 +42,16 @@ if errorlevel 1 (
 )
 
 echo.
+echo Скачиваю exiftool - он нужен для HEIC с айфона, RAW, MKV и AVI...
+echo.
+%PY% -m mediameta exiftool install
+if errorlevel 1 (
+    echo.
+    echo exiftool скачать не получилось. JPEG, PNG, MP4 и MOV работают и без него.
+    echo Повторить позже можно командой:  %PY% -m mediameta exiftool install
+)
+
+echo.
 echo ==========================================
 echo   Готово
 echo ==========================================

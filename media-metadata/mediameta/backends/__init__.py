@@ -88,7 +88,7 @@ def _explain_failure(path: Path, candidates) -> str:
         return f"no usable backend for {path.name} ({reasons})"
     return (
         f"{path.suffix or 'this file'} is not a format mediameta handles natively; "
-        "install exiftool to cover HEIC, RAW, MKV, AVI and friends"
+        "HEIC, RAW, MKV, AVI and friends need exiftool: run `mediameta exiftool install`"
     )
 
 

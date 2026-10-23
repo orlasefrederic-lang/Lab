@@ -1,18 +1,25 @@
 """Optional backend that shells out to Phil Harvey's ExifTool.
 
-It is not required for the common cases, but when the binary is installed
-it unlocks everything the pure-Python backends cannot do: HEIC, RAW, MKV,
-AVI, writing TIFF, and XMP sidecars.
+It is not required for the common cases, but when ExifTool is available it
+unlocks everything the pure-Python backends cannot do: HEIC, RAW, MKV, AVI,
+writing TIFF, and XMP sidecars.
+
+The program is looked up in this order: an explicit path given to the
+backend, the ``MEDIAMETA_EXIFTOOL`` environment variable, the private copy
+that ``mediameta exiftool install`` downloads, and finally ``PATH``.
 """
 
 from __future__ import annotations
 
 import datetime as _dt
 import json
+import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
+from .. import exiftool_setup
 from ..errors import FieldError, MediaMetaError
 from ..fields import normalize, resolve_field, split_list
 from ..record import MetadataRecord
@@ -92,13 +99,40 @@ class ExifToolBackend(Backend):
     read_suffixes = frozenset(MEDIA_SUFFIXES)
     write_suffixes = frozenset(MEDIA_SUFFIXES)
 
+    #: ``None`` means "only on Windows"; see :meth:`_run` for why.
+    use_argfile = None
+
     def __init__(self, executable: str | None = None):
-        self.executable = executable or shutil.which("exiftool") or "exiftool"
+        self.executable = executable
+
+    def resolve(self) -> tuple:
+        """Return ``(command, source)``; ``command`` is ``None`` if not found."""
+        if self.executable:
+            return _existing(self.executable), "explicit path"
+
+        configured = os.environ.get("MEDIAMETA_EXIFTOOL")
+        if configured:
+            return _existing(configured), "MEDIAMETA_EXIFTOOL"
+
+        managed = exiftool_setup.managed_command()
+        if managed:
+            return managed, "mediameta's own copy"
+
+        found = shutil.which("exiftool")
+        if found:
+            return [found], "PATH"
+        return None, ""
 
     def is_available(self) -> tuple:
-        if shutil.which(self.executable) is None:
-            return False, "exiftool is not installed (apt install libimage-exiftool-perl / brew install exiftool)"
-        return True, ""
+        command, source = self.resolve()
+        if command:
+            return True, ""
+        if source:
+            return False, f"exiftool from {source} was not found"
+        hint = "run `mediameta exiftool install`"
+        if sys.platform.startswith("linux"):
+            hint += " or `sudo apt install libimage-exiftool-perl`"
+        return False, f"exiftool is not installed: {hint}"
 
     def supports(self, path, suffix: str | None = None) -> bool:
         # ExifTool knows more formats than our suffix table, so accept anything
@@ -112,12 +146,30 @@ class ExifToolBackend(Backend):
     # -- process plumbing ---------------------------------------------
 
     def _run(self, arguments, check: bool = True) -> subprocess.CompletedProcess:
-        available, reason = self.is_available()
-        if not available:
-            raise MediaMetaError(reason)
+        command, _source = self.resolve()
+        if not command:
+            raise MediaMetaError(self.is_available()[1])
+
+        use_argfile = self.use_argfile
+        if use_argfile is None:
+            use_argfile = sys.platform == "win32"
+
+        stdin_text = None
+        if use_argfile:
+            # Windows hands command-line arguments to exiftool in the legacy
+            # ANSI code page, so a Cyrillic title would arrive as cp1251 bytes
+            # while we promise UTF-8. Arguments read from stdin (-@ -) are
+            # taken verbatim, and "filename=utf8" covers the file names too.
+            lines = ["-charset", "filename=utf8", *arguments]
+            stdin_text = "".join(_argfile_line(argument) + "\n" for argument in lines)
+            command = [*command, "-@", "-"]
+        else:
+            command = [*command, *arguments]
+
         try:
             result = subprocess.run(
-                [self.executable, *arguments],
+                command,
+                input=stdin_text,
                 capture_output=True,
                 text=True,
                 encoding="utf-8",
@@ -251,3 +303,37 @@ class ExifToolBackend(Backend):
         if isinstance(value, _dt.datetime):
             return [f"-{tag}={value.strftime('%Y:%m:%d %H:%M:%S')}"]
         return [f"-{tag}={value}"]
+
+
+def _existing(executable: str):
+    """A one-element command list if ``executable`` exists, else ``None``."""
+    found = shutil.which(executable)
+    if found:
+        return [found]
+    if Path(executable).is_file():
+        return [str(executable)]
+    return None
+
+
+def _argfile_line(argument: str) -> str:
+    """Encode one argument as a line of an exiftool argument file.
+
+    Plain lines lose surrounding white space and lines starting with ``#``
+    are comments, so anything unusual goes through the ``#[CSTR]`` form,
+    where C escapes keep newlines and spaces intact.
+    """
+    unusual = (
+        argument != argument.strip()
+        or argument.startswith("#")
+        or any(character in argument for character in "\r\n\t")
+    )
+    if not unusual:
+        return argument
+    escaped = (
+        argument.replace("\\", "\\\\")
+        .replace("\n", "\\n")
+        .replace("\r", "\\r")
+        .replace("\t", "\\t")
+        .replace('"', '\\"')
+    )
+    return "#[CSTR]" + escaped

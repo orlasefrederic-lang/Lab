@@ -33,14 +33,16 @@ git clone https://github.com/orlasefrederic-lang/Lab C:\Users\%USERNAME%\Lab
 ## 3. Установить
 
 Зайти в папку `media-metadata` и **дважды кликнуть `install-windows.bat`**.
-Он сам найдёт Python, поставит библиотеку и её зависимости и в конце покажет
-версию. Окно закроется по нажатию клавиши.
+Он сам найдёт Python, поставит библиотеку и её зависимости, скачает exiftool
+(для HEIC с айфона, RAW, MKV и AVI) и в конце покажет версию. Окно закроется
+по нажатию клавиши.
 
 Если предпочитаешь руками:
 
 ```cmd
 cd C:\Users\%USERNAME%\Lab\media-metadata
 py -m pip install -e .
+py -m mediameta exiftool install
 ```
 
 ## 4. Пользоваться
@@ -118,21 +120,34 @@ mediameta set *.jpg -s rating=5 --dry-run
 | Вместо русских букв кракозябры | Выполнить в том же окне `chcp 65001` и повторить команду |
 | `is locked by another program` | Файл открыт в просмотрщике или редакторе — закрыть его и повторить |
 | `no files matched` | Проверить путь; если в нём пробелы или кириллица — взять в двойные кавычки |
-| `not a format mediameta handles natively` | Формат (HEIC, RAW, MKV, AVI) требует exiftool — см. ниже |
+| `not a format mediameta handles natively` или `exiftool is not installed` | Формат (HEIC, RAW, MKV, AVI) требует exiftool: выполнить `mediameta exiftool install` |
+| `could not download https://exiftool.org/...` | Нет доступа к exiftool.org (интернет, VPN, антивирус) — повторить позже или поставить вручную, см. ниже |
 | `Отказано в доступе` при установке | Запустить `install-windows.bat` правой кнопкой → «Запуск от имени администратора» |
 
-## Необязательно: exiftool для остальных форматов
+## exiftool: HEIC, RAW, MKV, AVI
 
 Родные бэкенды покрывают JPEG, PNG, WebP, MP4, MOV, M4A. Для HEIC с айфона,
-RAW с зеркалки, MKV и AVI нужен exiftool:
+RAW с зеркалки, MKV и AVI нужен exiftool. `install-windows.bat` скачивает его
+сам; если установка шла руками или exiftool тогда не скачался:
 
-1. Скачать «Windows Executable» с [exiftool.org](https://exiftool.org/).
-2. Распаковать, переименовать `exiftool(-k).exe` в `exiftool.exe`.
-3. Положить в папку, которая есть в `PATH` — проще всего в
-   `C:\Windows\System32`, либо в папку `media-metadata` рядом со скриптами.
+```cmd
+mediameta exiftool install
+```
 
-Проверить: `mediameta backends` — напротив `exiftool` должно стоять `yes`.
-Дальше он подключается сам, отдельных команд не нужно.
+Команда берёт свежую официальную сборку с [exiftool.org](https://exiftool.org/),
+сверяет её SHA-256 с контрольной суммой, опубликованной там же, и кладёт в
+`%LOCALAPPDATA%\mediameta\exiftool`. Ни `PATH`, ни права администратора не
+нужны, а дальше mediameta подхватывает её сама.
+
+```cmd
+mediameta exiftool status    :: какой exiftool используется и откуда
+mediameta exiftool install   :: обновить до последней версии
+mediameta exiftool remove    :: удалить свою копию
+```
+
+Если exiftool у тебя уже стоит отдельно, mediameta найдёт и его — через
+`PATH` или переменную окружения `MEDIAMETA_EXIFTOOL` с полным путём к
+`exiftool.exe`. Своя скачанная копия при этом в приоритете.
 
 ## Обновить до свежей версии
 
