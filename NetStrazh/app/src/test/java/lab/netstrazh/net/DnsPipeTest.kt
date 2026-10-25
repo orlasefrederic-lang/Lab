@@ -4,6 +4,7 @@ import lab.netstrazh.vpn.DnsPipe
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
+import org.junit.Assert.fail
 import org.junit.Test
 import java.io.DataInputStream
 import java.io.DataOutputStream
@@ -90,6 +91,102 @@ class DnsPipeTest {
         }
         assertTrue(conns.get() >= 3)
         pipe.close(); ss.close()
+    }
+
+    @Test fun stalledConnectionIsReplaced() {
+        val conns = AtomicInteger()
+        val ss = ServerSocket(0, 10, lo)
+        thread(isDaemon = true) {
+            while (!ss.isClosed) {
+                val s = try { ss.accept() } catch (e: Exception) { break }
+                val n = conns.incrementAndGet()
+                thread(isDaemon = true) {
+                    try {
+                        val i = DataInputStream(s.getInputStream())
+                        val o = DataOutputStream(s.getOutputStream())
+                        while (true) {
+                            val q = ByteArray(i.readUnsignedShort()).also { i.readFully(it) }
+                            if (n == 1) continue // the first path swallows everything, like a dead tunnel
+                            q[2] = (q[2].toInt() or 0x80).toByte()
+                            o.writeShort(q.size); o.write(q); o.flush()
+                        }
+                    } catch (_: Exception) {
+                    }
+                }
+            }
+        }
+        val pipe = DnsPipe { SocketChannel.open(InetSocketAddress(lo, ss.localPort)) }
+        val q1 = query(1, "a.example")
+        val t0 = System.currentTimeMillis()
+        try { pipe.query(q1, 0, q1.size, 300); fail("answered by a dead path") } catch (e: java.io.IOException) {}
+        assertTrue("bounded by the timeout", System.currentTimeMillis() - t0 < 1500)
+        val q2 = query(2, "b.example")
+        val r = pipe.query(q2, 0, q2.size, 2000)
+        assertEquals("b.example", Dns.parse(r, 0, r.size)!!.qname)
+        assertEquals("stalled connection replaced", 2, conns.get())
+        pipe.close(); ss.close()
+    }
+
+    @Test fun slowOpenAndBlockedWritesAreBounded() {
+        // Opening through the proxy can hang: queries still give up after their timeout.
+        val slow = DnsPipe { Thread.sleep(3000); throw java.io.IOException("too late") }
+        val q = query(3, "c.example")
+        var t0 = System.currentTimeMillis()
+        try { slow.query(q, 0, q.size, 300); fail() } catch (e: java.io.IOException) {}
+        assertTrue(System.currentTimeMillis() - t0 < 1500)
+        t0 = System.currentTimeMillis()
+        slow.close()
+        assertTrue("close does not wait for the opener", System.currentTimeMillis() - t0 < 300)
+
+        // A resolver path that never reads: writes fill the buffers and block; each query is still bounded.
+        val ss = ServerSocket()
+        ss.receiveBufferSize = 4096
+        ss.bind(InetSocketAddress(lo, 0), 10)
+        val held = java.util.concurrent.CopyOnWriteArrayList<java.net.Socket>()
+        thread(isDaemon = true) { while (!ss.isClosed) held += try { ss.accept() } catch (e: Exception) { break } }
+        val pipe = DnsPipe {
+            SocketChannel.open().apply { socket().sendBufferSize = 4096; connect(InetSocketAddress(lo, ss.localPort)) }
+        }
+        val big = query(4, "d.example").copyOf(60_000)
+        for (k in 0 until 8) {
+            t0 = System.currentTimeMillis()
+            try { pipe.query(big, 0, big.size, 300) } catch (e: java.io.IOException) {}
+            assertTrue("query $k bounded", System.currentTimeMillis() - t0 < 1500)
+        }
+        t0 = System.currentTimeMillis()
+        pipe.close()
+        assertTrue(System.currentTimeMillis() - t0 < 300)
+        for (s in held) s.close()
+        ss.close()
+    }
+
+    @Test fun refusedAnswerHasHeaderAndQuestionOnly() {
+        val plain = query(0x4242, "ads.example")
+        val withOpt = plain.copyOf().also { it[11] = 1 } + byteArrayOf(0, 0, 41, 0x10, 0, 0, 0, 0, 0, 0, 0)
+        val r = Dns.refused(withOpt, 0, withOpt.size)!!
+        assertEquals(plain.size, r.size)
+        assertEquals(0x42, r[0].toInt()); assertEquals(0x42, r[1].toInt())
+        assertEquals("QR + RD", 0x81, r[2].toInt() and 0xFF)
+        assertEquals("RA + REFUSED", 0x85, r[3].toInt() and 0xFF)
+        assertEquals(0, r[11].toInt())
+        val m = Dns.parse(r, 0, r.size)!!
+        assertTrue(m.isResponse)
+        assertEquals("ads.example", m.qname)
+        // Not for responses or garbage.
+        assertEquals(null, Dns.refused(r, 0, r.size))
+        assertEquals(null, Dns.refused(plain, 0, 8))
+    }
+
+    @Test fun hostRulesCoverSubdomains() {
+        val all = setOf("miui.com")
+        val own = setOf("tracker.example")
+        assertTrue(Hosts.blocked("api.sec.intl.MIUI.com.", null, all))
+        assertTrue(Hosts.blocked("miui.com", null, all))
+        assertTrue(!Hosts.blocked("notmiui.com", null, all))
+        assertTrue(Hosts.blocked("x.tracker.example", own, all))
+        assertTrue(!Hosts.blocked("tracker.example.org", own, all))
+        assertTrue(!Hosts.blocked(null, own, all))
+        assertTrue(!Hosts.blocked("a.example", null, emptySet()))
     }
 
     @Test fun ednsLimitAndTruncation() {

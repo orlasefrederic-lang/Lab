@@ -14,7 +14,6 @@ import java.nio.channels.Selector
 import java.util.ArrayDeque
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ConcurrentLinkedQueue
-import java.util.concurrent.Executors
 import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.concurrent.thread
@@ -53,7 +52,11 @@ class UdpRelay(private val eng: Engine) {
     private val selector: Selector = Selector.open()
     private val sessions = ConcurrentHashMap<FlowKey, Session>()
     private val pending = ConcurrentLinkedQueue<Session>()
-    private val setup = Executors.newCachedThreadPool { r -> Thread(null, r, "ns-udp-setup", 256L * 1024).apply { isDaemon = true } }
+    // Bounded: a stuck proxy must not pile up a thread per DNS query. Over the limit a session is
+    // dropped and the app (or the system resolver) simply retries.
+    private val setup = java.util.concurrent.ThreadPoolExecutor(SETUP_THREADS, SETUP_THREADS, 30, java.util.concurrent.TimeUnit.SECONDS,
+        java.util.concurrent.LinkedBlockingQueue(SETUP_QUEUE)) { r -> Thread(null, r, "ns-udp-setup", 256L * 1024).apply { isDaemon = true } }
+        .apply { allowCoreThreadTimeOut(true) }
     @Volatile private var running = false
     private var thread: Thread? = null
 
@@ -82,11 +85,22 @@ class UdpRelay(private val eng: Engine) {
         var s = sessions[key]
         if (s == null || s.closed.get()) s = create(p, key) ?: return
         s.last = System.currentTimeMillis()
-        if (s.conn.blocked) return
         val off = p.udpPayloadOff
-        if (s.isDns && s.conn.host == null) {
-            Dns.parse(p.buf, off, n)?.qname?.let { s.conn.host = it }
+        if (s.isDns) {
+            val name = Dns.parse(p.buf, off, n)?.qname
+            if (s.conn.host == null && name != null) s.conn.host = name
+            val why = if (s.conn.blocked) s.conn.note else eng.dnsRefusal(s.conn.uid, name)
+            if (why != null) {
+                // Answer at once: silence would make the system resolver retry and wait.
+                if (s.conn.tx == 0L) {
+                    s.conn.blocked = true
+                    s.conn.note = why
+                }
+                refuse(s, p.buf, off, n)
+                return
+            }
         }
+        if (s.conn.blocked) return
         when (s.state) {
             READY -> send(s, p.buf, off, n)
             PENDING -> {
@@ -101,6 +115,12 @@ class UdpRelay(private val eng: Engine) {
             }
             else -> {}
         }
+    }
+
+    private fun refuse(s: Session, b: ByteArray, off: Int, n: Int) {
+        val r = Dns.refused(b, off, n) ?: return
+        val pk = PacketBuilder.udp(s.v6, s.remoteAddr, s.remotePort, s.appAddr, s.appPort, r, 0, r.size)
+        eng.write(pk, pk.size)
     }
 
     private fun send(s: Session, b: ByteArray, off: Int, n: Int) {
@@ -135,10 +155,28 @@ class UdpRelay(private val eng: Engine) {
         Live.open(conn)
         sessions[key] = s
         conn.killer = { close(s) }
-        // DNS is never blocked: the system resolver cache is shared between apps, so failing a
-        // lookup for a blocked app could break other apps. Its connections are blocked instead.
+        // DNS of a blocked app is resolved unless the user asked to block it too (or the name is
+        // blocked): then fromApp answers REFUSED, which the shared system resolver does not cache.
+        if (isDns) {
+            val why = eng.dnsRefusal(uid, Dns.parse(p.buf, p.udpPayloadOff, p.udpPayloadLen)?.qname)
+            if (why != null) {
+                conn.blocked = true
+                conn.note = why
+                s.state = DROP
+                return s
+            }
+        }
         if (!isDns && eng.isBlocked(uid)) {
             conn.blocked = true
+            s.state = DROP
+            return s
+        }
+        // QUIC to a host blocked for this app (by the name this app resolved for the IP): dropping it
+        // is harmless even if the IP serves other sites too, browsers then retry over TCP, where
+        // the name in TLS decides exactly.
+        if (!isDns && (dport == 443 || dport == 80) && DnsCache.ownNames(uid, ip).any { lab.netstrazh.data.Rules.hostBlocked(uid, it) }) {
+            conn.blocked = true
+            conn.note = Engine.NOTE_HOST_BLOCKED
             s.state = DROP
             return s
         }
@@ -179,7 +217,7 @@ class UdpRelay(private val eng: Engine) {
             } else {
                 val path = up.openUdp(InetSocketAddress(dstInet, s.remotePort), uid)
                 if (path == null) {
-                    if (s.remotePort == 53 && up.proxied(uid)) {
+                    if (s.remotePort == 53 && up.proxiedTo(uid, dstInet)) {
                         // An app asking a resolver directly (e.g. 8.8.8.8): resolve over TCP through the proxy.
                         s.dnsServer = InetSocketAddress(dstInet, 53)
                         s.dnsOverProxy = true
@@ -242,6 +280,7 @@ class UdpRelay(private val eng: Engine) {
                     eng.write(pk, pk.size)
                 } catch (e: Exception) {
                     s.conn.note = "DNS через прокси: ${e.message ?: "ошибка"}"
+                    eng.upstream.noteEvent(s.conn.note!!)
                 }
                 close(s)
             }
@@ -302,10 +341,11 @@ class UdpRelay(private val eng: Engine) {
                             off = Socks5.udpPayloadOffset(bb.array(), n)
                             if (off < 0) continue
                             // Full-cone proxies relay datagrams from any host; keep only this flow's peer,
-                            // as a connected socket would on the direct path.
+                            // as a connected socket would on the direct path. By port only: a proxy that
+                            // sniffed a domain (Xray) dials it itself and reports the address it resolved,
+                            // which may differ from the one the app chose.
                             val src = Socks5.udpSource(bb.array(), n)
-                            // (InetAddress equality also matches an IPv4-mapped IPv6 header to an IPv4 peer.)
-                            if (src != null && (src.port != s.remotePort || src.address != InetAddress.getByAddress(s.remoteAddr))) continue
+                            if (src != null && src.port != s.remotePort) continue
                         }
                         val len = n - off
                         s.last = System.currentTimeMillis()
@@ -385,6 +425,8 @@ class UdpRelay(private val eng: Engine) {
         const val DNS_TIMEOUT_MS = 20_000L
         const val BLOCKED_TIMEOUT_MS = 30_000L
         const val MAX_QUEUED = 32
+        const val SETUP_THREADS = 64
+        const val SETUP_QUEUE = 1024
         private const val PENDING = 0
         private const val READY = 1
         private const val DROP = 2

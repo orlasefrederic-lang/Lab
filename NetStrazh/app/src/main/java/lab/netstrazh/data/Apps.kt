@@ -91,6 +91,10 @@ object Apps {
         return d
     }
 
+    /** Every package sharing [uid] (system UIDs such as 1000 have many). */
+    fun packagesForUid(uid: Int): List<String> =
+        (try { pm.getPackagesForUid(uid % 100000) } catch (_: Exception) { null })?.toList() ?: emptyList()
+
     fun forPackage(pkg: String): Info? = try {
         forUid(pm.getApplicationInfo(pkg, 0).uid)
     } catch (_: Exception) {

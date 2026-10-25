@@ -179,20 +179,10 @@ class MainActivity : Activity() {
     private var pendingStart = false
     private var headerAction: (() -> Unit)? = null
 
-    private fun otherVpnActive(): Boolean = try {
-        val cm = getSystemService(android.net.ConnectivityManager::class.java)
-        @Suppress("DEPRECATION")
-        cm.allNetworks.any {
-            val caps = cm.getNetworkCapabilities(it)
-            // Our own VPN network (still registered for a moment after stopping) is not "another VPN".
-            caps != null && caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_VPN) && caps.ownerUid != android.os.Process.myUid()
-        }
-    } catch (_: Exception) {
-        false
-    }
+    private fun otherVpnActive(): Boolean = FirewallService.otherVpnActive(this)
     private var pendingSince = 0L
 
-    private fun onPowerToggle(on: Boolean) {
+    fun onPowerToggle(on: Boolean) {
         if (on) requestStart() else {
             pendingStart = false
             FirewallService.stop(this)

@@ -81,6 +81,8 @@ object Prefs {
             dnsServer = sp.getString("px_dns_server", null) ?: "1.1.1.1",
             udpDirect = sp.getBoolean("px_udp_direct", false),
             directIfDown = sp.getBoolean("px_direct_if_down", false),
+            bypassApp = sp.getBoolean("px_bypass_app", true),
+            appPkg = sp.getString("px_app_pkg", null) ?: "",
         )
         set(v) = sp.edit()
             .putString("px_type", v.type.name)
@@ -92,6 +94,8 @@ object Prefs {
             .putString("px_dns_server", v.dnsServer)
             .putBoolean("px_udp_direct", v.udpDirect)
             .putBoolean("px_direct_if_down", v.directIfDown)
+            .putBoolean("px_bypass_app", v.bypassApp)
+            .putString("px_app_pkg", v.appPkg)
             .apply()
 
     /** When another VPN (or the user in system settings) last switched us off. */

@@ -1,8 +1,6 @@
 package lab.netstrazh.ui
 
 import android.app.Activity
-import android.net.ConnectivityManager
-import android.net.NetworkCapabilities
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -38,6 +36,8 @@ class SettingsActivity : Activity() {
     private lateinit var dnsServer: EditText
     private lateinit var udpDirect: CheckBox
     private lateinit var directIfDown: CheckBox
+    private lateinit var bypassApp: CheckBox
+    private var appPkg = ""
     private lateinit var fields: LinearLayout
     private lateinit var status: TextView
     private lateinit var testOut: TextView
@@ -115,6 +115,8 @@ class SettingsActivity : Activity() {
         dnsServer = field(fields, "DNS-сервер для запросов через прокси", "1.1.1.1", InputType.TYPE_CLASS_TEXT)
         udpDirect = check(fields, "Если прокси не передаёт UDP — пускать UDP напрямую, мимо прокси (иначе UDP блокируется)")
         directIfDown = check(fields, "Если прокси недоступен — пускать трафик напрямую (небезопасно: VPN тогда не защищает)")
+        bypassApp = check(fields, "Само VPN-приложение — мимо Стража (рекомендуется): его связь с сервером идёт напрямую, " +
+            "как в его собственном режиме VPN. Страж находит его сам.")
         form.addView(fields)
         val buttons = hbox().apply { setPadding(0, dp(12), 0, 0) }
         buttons.addView(pill("Сохранить", 0) { save() }, lp(WRAP, WRAP).apply { rightMargin = dp(8) })
@@ -182,9 +184,7 @@ class SettingsActivity : Activity() {
         names.addView(text("${a.app.type.name} · порт ${a.app.port}" + if (a.app.udp) " · есть UDP" else " · без UDP", 12.5f, Pal.sub))
         top.addView(names, lp(0, WRAP, 1f).apply { leftMargin = dp(10) })
         top.addView(pill("Подставить", 1) {
-            load(Prefs.proxy.let {
-                ProxyConfig(a.app.type, "127.0.0.1", a.app.port, "", "", it.dnsViaProxy, it.dnsServer, it.udpDirect, it.directIfDown)
-            })
+            load(Prefs.proxy.copy(type = a.app.type, host = "127.0.0.1", port = a.app.port, user = "", pass = "", appPkg = a.pkg))
             testOut.text = "Подставлено. Включите в ${a.label} режим прокси и нажмите «Сохранить»."
         }, lp(WRAP, WRAP))
         row.addView(top)
@@ -209,6 +209,8 @@ class SettingsActivity : Activity() {
         dnsServer.setText(c.dnsServer)
         udpDirect.isChecked = c.udpDirect
         directIfDown.isChecked = c.directIfDown
+        bypassApp.isChecked = c.bypassApp
+        appPkg = c.appPkg
     }
 
     /** Reads the form; returns null (and explains) when it is invalid. */
@@ -232,7 +234,8 @@ class SettingsActivity : Activity() {
                 return null
             }
         }
-        return ProxyConfig(type, h, p, user.text.toString(), pass.text.toString(), dns.isChecked, d, udpDirect.isChecked, directIfDown.isChecked)
+        return ProxyConfig(type, h, p, user.text.toString(), pass.text.toString(), dns.isChecked, d, udpDirect.isChecked,
+            directIfDown.isChecked, bypassApp.isChecked, appPkg)
     }
 
     private fun save() {
@@ -297,8 +300,18 @@ class SettingsActivity : Activity() {
                     }
                     if (up.proxyUid >= 0) {
                         sb.append("\nПрокси обслуживает «${Apps.forUid(up.proxyUid).label}»: его собственный трафик идёт напрямую, без петли.")
+                    } else if (cfg.bypassApp && cfg.appPkg.isNotEmpty()) {
+                        sb.append("\n«${Apps.labelForPackage(cfg.appPkg)}» работает мимо Стража: его связь с сервером идёт по обычной сети.")
                     }
                     if (up.udpUnsupported) sb.append("\nПрокси не передаёт UDP" + if (cfg.udpDirect) " — UDP идёт напрямую." else " — UDP блокируется.")
+                    val ev = up.recentEvents().filter { now - it.lastAt < 24 * 3_600_000L }
+                    if (ev.isNotEmpty()) {
+                        sb.append("\n\nНедавние сбои (новые сверху):")
+                        for (e in ev.take(8)) {
+                            sb.append("\n• ").append(Fmt.time(e.lastAt)).append(" ").append(e.msg)
+                            if (e.count > 1) sb.append(" (×").append(e.count).append(" с ").append(Fmt.time(e.at)).append(")")
+                        }
+                    }
                 }
             }
         }
@@ -307,14 +320,7 @@ class SettingsActivity : Activity() {
             "заполните настройки ниже и включите Стража." else ""
     }
 
-    private fun otherVpnActive(): Boolean {
-        val cm = getSystemService(ConnectivityManager::class.java)
-        @Suppress("DEPRECATION")
-        return cm.allNetworks.any {
-            val caps = cm.getNetworkCapabilities(it)
-            caps != null && caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN) && caps.ownerUid != android.os.Process.myUid()
-        }
-    }
+    private fun otherVpnActive(): Boolean = FirewallService.otherVpnActive(this)
 
     private fun toast(s: String) = Toast.makeText(this, s, Toast.LENGTH_LONG).show()
 }

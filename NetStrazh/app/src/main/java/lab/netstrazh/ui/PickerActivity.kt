@@ -96,14 +96,24 @@ class PickerActivity : Activity() {
     private fun toggle(a: Apps.Info) {
         val pkg = a.pkg ?: return
         val f = Rules.flags(pkg)
-        Rules.set(pkg, if (f and Rules.BLOCK_ALL != 0) f and Rules.BLOCK_ALL.inv() else (f and Rules.EXCLUDE.inv()) or Rules.BLOCK_ALL)
-        adapter.notifyDataSetChanged()
+        val apply = {
+            Rules.set(pkg, if (f and Rules.BLOCK_ALL != 0) f and Rules.BLOCK_ALL.inv() else (f and Rules.EXCLUDE.inv()) or Rules.BLOCK_ALL)
+            adapter.notifyDataSetChanged()
+        }
+        // A package on a shared system UID (e.g. 1000) blocks every service on that UID.
+        if (f and Rules.BLOCK_ALL == 0 && a.uid % 100000 < 10000) {
+            AppActivity.confirmSystemBlock(this, a.label, a.uid, Apps.packagesForUid(a.uid), apply)
+        } else apply()
     }
 
     private fun bind(v: RowView, a: Apps.Info) {
         v.title.text = a.label
         v.icon.setImageDrawable(Apps.icon(a.pkg) ?: getDrawable(android.R.drawable.sym_def_app_icon))
-        v.line2.text = a.pkg + if (a.system) " · системное" else ""
+        v.line2.text = a.pkg + when {
+            a.uid % 100000 < 10000 -> " · системный UID ${a.uid % 100000}"
+            a.system -> " · системное"
+            else -> ""
+        }
         val f = Rules.flags(a.pkg!!)
         when {
             f and Rules.BLOCK_ALL != 0 -> {

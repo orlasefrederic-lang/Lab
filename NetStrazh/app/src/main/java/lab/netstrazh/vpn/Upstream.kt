@@ -5,6 +5,7 @@ import lab.netstrazh.net.DnsTcp
 import lab.netstrazh.net.HttpConnect
 import lab.netstrazh.net.ProxyException
 import lab.netstrazh.net.Socks5
+import lab.netstrazh.net.isLoopback
 import lab.netstrazh.net.withDeadline
 import java.io.Closeable
 import java.io.IOException
@@ -16,7 +17,7 @@ import java.nio.channels.SocketChannel
 enum class ProxyType { NONE, SOCKS5, HTTP }
 
 /** Where relayed traffic leaves the device: directly, or through another app's local proxy. */
-class ProxyConfig(
+data class ProxyConfig(
     val type: ProxyType = ProxyType.NONE,
     val host: String = "127.0.0.1",
     val port: Int = 0,
@@ -29,6 +30,13 @@ class ProxyConfig(
     val udpDirect: Boolean = false,
     /** Go directly when the proxy is unreachable (otherwise connections fail). */
     val directIfDown: Boolean = false,
+    /**
+     * Keep the proxy app itself out of our VPN, as it keeps itself out of its own VPN: its server
+     * connections and DNS then use the real network directly, whatever happens inside our tunnel.
+     */
+    val bypassApp: Boolean = true,
+    /** Package of the app serving the proxy, when known (picked in the settings or detected). */
+    val appPkg: String = "",
 ) {
     val enabled: Boolean get() = type != ProxyType.NONE && port in 1..65535 && host.isNotBlank()
 
@@ -114,6 +122,12 @@ class Upstream(private val host: EngineHost) {
     fun proxied(uid: Int): Boolean = cfg.enabled && uid != proxyUid
 
     /**
+     * Like [proxied], for a destination: the local network (router, printers, phones next to you)
+     * is reached directly, as the proxy app's own VPN mode leaves it outside the tunnel.
+     */
+    fun proxiedTo(uid: Int, dst: InetAddress?): Boolean = proxied(uid) && (dst == null || !Engine.isLocal(dst))
+
+    /**
      * Finds the app that listens on the proxy port. If that app's traffic also enters our VPN, relaying it
      * back into its own proxy would loop forever, so its connections go directly instead.
      */
@@ -173,7 +187,9 @@ class Upstream(private val host: EngineHost) {
         }
         if (cfg !== c) return null
         val learned = if (uid >= 0 && uid != host.selfUid) uid else UID_NONE
+        val before = proxyUid
         proxyUid = learned
+        if (learned >= 0 && learned != before) host.onProxyApp(learned)
         proxyUidCheckedAt = System.currentTimeMillis()
         return learned
     }
@@ -197,12 +213,27 @@ class Upstream(private val host: EngineHost) {
      * traffic is never sent into its proxy.
      */
     private fun proxyChannel(uid: Int, track: (SocketChannel) -> Unit): SocketChannel {
-        val ch = newChannel(track)
-        try {
-            ch.socket().connect(proxyEndpoint(), PROXY_CONNECT_MS)
-        } catch (e: IOException) {
-            Engine.closeQuietly(ch)
-            throw ProxyDown(e)
+        val ep = proxyEndpoint()
+        // A local proxy app restarts its core on every network change (v2rayNG: about a second with
+        // the port closed): keep trying a refused connection for a moment instead of failing the app.
+        // Not when the proxy has just been found down, so a stopped proxy app fails quickly.
+        val now = System.currentTimeMillis()
+        val justDown = downAt > lastOkAt && now - downAt < 10_000
+        val end = if (isLoopback(ep.address) && !justDown) now + RELOAD_GRACE_MS else now
+        var ch: SocketChannel
+        while (true) {
+            ch = newChannel(track)
+            try {
+                ch.socket().connect(ep, PROXY_CONNECT_MS)
+                break
+            } catch (e: IOException) {
+                Engine.closeQuietly(ch)
+                if (e is java.net.ConnectException && System.currentTimeMillis() + RELOAD_RETRY_MS < end) {
+                    Thread.sleep(RELOAD_RETRY_MS)
+                    continue
+                }
+                throw ProxyDown(e)
+            }
         }
         // Compare with what this very connection found, not the shared field another thread may be writing.
         val owner = try { learnProxyUid(ch) } catch (_: Exception) { null } ?: proxyUid
@@ -219,7 +250,7 @@ class Upstream(private val host: EngineHost) {
      * early so a kill can close it.
      */
     fun openTcp(dst: InetSocketAddress, uid: Int, timeoutMs: Int, name: String? = null, track: (SocketChannel) -> Unit): Opened {
-        if (proxied(uid) && !isProxyEndpoint(dst)) {
+        if (proxiedTo(uid, dst.address) && !isProxyEndpoint(dst)) {
             val c = cfg
             try {
                 val ch = proxyChannel(uid, track)
@@ -266,7 +297,7 @@ class Upstream(private val host: EngineHost) {
 
     /** Opens a UDP path to [dst]; null means the datagrams must be dropped (proxy without UDP / down). */
     fun openUdp(dst: InetSocketAddress, uid: Int): UdpPath? {
-        if (proxied(uid)) {
+        if (proxiedTo(uid, dst.address)) {
             val c = cfg
             if (c.type == ProxyType.SOCKS5 && !udpUnsupported) {
                 var ctl: SocketChannel? = null
@@ -332,7 +363,8 @@ class Upstream(private val host: EngineHost) {
 
     /** Resolves one DNS query (wire format) over a pipelined TCP connection through the proxy. */
     fun dnsQuery(q: ByteArray, off: Int, len: Int): ByteArray = try {
-        dnsPipe.query(q, off, len, DNS_TIMEOUT_MS)
+        // Short enough to leave time for the fallback before the system resolver gives up (~5 s).
+        dnsPipe.query(q, off, len, DNS_PIPE_TIMEOUT_MS)
     } catch (e: IOException) {
         // Resolvers that answer only one query per connection: fall back to a dedicated connection.
         dnsQueryOnce(InetSocketAddress(host.resolve(cfg.dnsServer), 53), q, off, len)
@@ -354,7 +386,34 @@ class Upstream(private val host: EngineHost) {
         lastError = msg
         lastErrorAt = System.currentTimeMillis()
         if (down) downAt = lastErrorAt
+        noteEvent(msg)
     }
+
+    /** A proxy problem worth showing later; repeats within a minute are counted, not listed. */
+    class Event(val at: Long, val msg: String) {
+        @Volatile var count = 1
+        @Volatile var lastAt = at
+    }
+
+    private val events = ArrayDeque<Event>()
+
+    fun noteEvent(msg: String) {
+        val now = System.currentTimeMillis()
+        synchronized(events) {
+            val last = events.lastOrNull()
+            if (last != null && last.msg == msg && now - last.lastAt < 60_000) {
+                last.count++
+                last.lastAt = now
+            } else {
+                events.addLast(Event(now, msg))
+                if (events.size > MAX_EVENTS) events.removeFirst()
+            }
+        }
+    }
+
+    /** Recent proxy problems, newest first. */
+    // Not reversed(): with compileSdk 35 that can bind to java.util.List.reversed(), absent before Android 15.
+    fun recentEvents(): List<Event> = synchronized(events) { ArrayList(events).apply { reverse() } }
 
     /** The proxy itself could not be reached. */
     class ProxyDown(cause: IOException) : IOException(cause)
@@ -368,6 +427,10 @@ class Upstream(private val host: EngineHost) {
         const val PROXY_CONNECT_MS = 5_000
         const val HANDSHAKE_MS = 20_000L
         const val DNS_TIMEOUT_MS = 8_000L
+        const val DNS_PIPE_TIMEOUT_MS = 3_000L
+        const val MAX_EVENTS = 20
+        const val RELOAD_GRACE_MS = 3_000L
+        const val RELOAD_RETRY_MS = 300L
         const val PROXY_UID_TTL_MS = 60_000L
         const val PROXY_UID_RETRY_MS = 3_000L
         const val UDP_RECHECK_MS = 300_000L

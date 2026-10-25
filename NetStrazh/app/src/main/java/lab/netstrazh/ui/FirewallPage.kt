@@ -40,6 +40,8 @@ class FirewallPage(act: MainActivity) : Page(act) {
         top.addView(act.pill("Вместе с другим VPN (прокси) ›", 1) {
             act.startActivity(Intent(act, SettingsActivity::class.java))
         }, lp(WRAP, WRAP).apply { topMargin = act.dp(8) })
+        top.addView(act.pill("Адреса, заблокированные для всех ›", 3) { showGlobalHosts() },
+            lp(WRAP, WRAP).apply { topMargin = act.dp(8) })
         addView(top)
         list.divider = null
         list.adapter = adapter
@@ -59,6 +61,30 @@ class FirewallPage(act: MainActivity) : Page(act) {
                 FirewallService.reconfigure()
             }
         }, lp().apply { setMargins(act.dp(12), act.dp(4), act.dp(16), act.dp(8)) })
+        addView(android.widget.CheckBox(act).apply {
+            text = "Блокировать и DNS-запросы приложений из списка: они не смогут даже узнать адрес сайта." +
+                if (android.os.Build.VERSION.SDK_INT < 30) " На Android 10 не действует: система не сообщает, чей это запрос." else ""
+            textSize = 12.5f
+            setTextColor(Pal.sub)
+            isChecked = Rules.blockDns
+            setOnCheckedChangeListener { _, on -> Rules.setBlockDns(on) }
+        }, lp().apply { setMargins(act.dp(12), 0, act.dp(16), act.dp(8)) })
+    }
+
+    private fun showGlobalHosts() {
+        val hosts = Rules.blockedHosts(Rules.ALL).sorted()
+        if (hosts.isEmpty()) {
+            Toast.makeText(act, "Пока нет. Откройте приложение и нажмите на адрес в списке «Куда подключалось».", Toast.LENGTH_LONG).show()
+            return
+        }
+        android.app.AlertDialog.Builder(act)
+            .setTitle("Заблокировано для всех · нажмите, чтобы разблокировать")
+            .setItems(hosts.map { "⛔ $it" }.toTypedArray()) { _, i ->
+                Rules.setHostBlocked(Rules.ALL, hosts[i], false)
+                Toast.makeText(act, "${hosts[i]} разблокирован", Toast.LENGTH_SHORT).show()
+            }
+            .setNegativeButton("Закрыть", null)
+            .show()
     }
 
     override fun onShow() = load()
@@ -84,7 +110,9 @@ class FirewallPage(act: MainActivity) : Page(act) {
                     "2. «Контроль активности» (батарея) → «Нет ограничений».\n" +
                     "3. В меню недавних приложений потяните карточку «Сетевого стража» вниз, чтобы закрепить.\n\n" +
                     "Дополнительно: Настройки → Подключения → VPN → «Сетевой страж» → «Постоянная VPN».\n\n" +
-                    "И не запрещайте сеть самому Стражу (и прокси-приложению, если работаете вместе с другим VPN) " +
+                    "Если работаете вместе с другим VPN (v2rayNG и т. п. в режиме прокси), сделайте то же для него: " +
+                    "в режиме прокси система не бережёт его, как VPN, и может усыпить — тогда приложения «не соединяются».\n\n" +
+                    "И не запрещайте сеть самому Стражу (и прокси-приложению) " +
                     "в «Безопасность → Сетевой доступ» — иначе пропадёт весь интернет."
             )
             .setPositiveButton("Настройки приложения") { _, _ ->

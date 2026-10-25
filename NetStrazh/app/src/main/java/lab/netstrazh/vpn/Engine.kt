@@ -65,6 +65,8 @@ interface EngineHost {
     /** Our own UID (never treated as the proxy app). */
     val selfUid: Int
     fun onEngineDied()
+    /** The app with this UID serves the proxy and its traffic still enters our VPN. */
+    fun onProxyApp(uid: Int) {}
 }
 
 /**
@@ -311,7 +313,7 @@ class Engine(val host: EngineHost, private val pfd: ParcelFileDescriptor, val cf
             closeQuietly(out.get())
         }
         try {
-            if (!fakeDns && isBlocked(uid)) {
+            if (isBlocked(uid) && (!fakeDns || Rules.blockDns)) {
                 conn.blocked = true
                 reset(client)
                 return
@@ -330,18 +332,25 @@ class Engine(val host: EngineHost, private val pfd: ParcelFileDescriptor, val cf
                 // Through a proxy, first read what the app sends (TLS ClientHello / HTTP request) to learn
                 // the host name: the proxy then connects by name and its routing rules by domain work.
                 var name: String? = null
-                if (upstream.proxied(uid)) {
+                if (upstream.proxiedTo(uid, dst)) {
                     val (bytes, sniffer) = preread(client)
                     first = bytes
                     val sniffed = sniffer.host
                     if (sniffed != null) {
                         if (!isIpLiteral(sniffed) || conn.host == null) conn.host = sniffed
-                        // Only a name the app itself sent is exact enough to connect by. SNI is bound to
-                        // the server by its certificate; a plain HTTP Host only when the app got this IP
-                        // for that name from our resolver. Local addresses always go by IP, so the proxy
-                        // app's "bypass LAN" rules see them.
-                        if (isHostName(sniffed) && !isLocal(dst) &&
-                            (sniffer.tls || sniffed.equals(DnsCache.get(uid, ip), ignoreCase = true))) name = sniffed
+                        conn.hostSniffed = true
+                        // Host rules go by the name the app itself sent: an IP is often shared by
+                        // many sites, so the name our DNS cache has for it may be another one.
+                        if (Rules.hostBlocked(uid, sniffed)) {
+                            blockHost(conn)
+                            reset(client)
+                            return
+                        }
+                        // Connect by the name only when the app got this IP for it from our resolver:
+                        // then the proxy reaching that name reaches the same service. Otherwise keep the
+                        // IP the app chose: fronted or decoy names (MTProto fake-TLS, domain fronting)
+                        // would lead the proxy elsewhere. Local addresses never get here (direct).
+                        if (isHostName(sniffed) && !isLocal(dst) && DnsCache.has(uid, ip, sniffed)) name = sniffed
                     }
                 }
                 val opened = upstream.openTcp(InetSocketAddress(dst, e.dstPort), uid, CONNECT_TIMEOUT_MS, name) { out.set(it) }
@@ -428,7 +437,18 @@ class Engine(val host: EngineHost, private val pfd: ParcelFileDescriptor, val cf
                 if (n == 0) continue
                 if (sniffer != null && !sniffer.done && sniffer.feed(bb.array(), 0, n)) {
                     // A literal IP in SNI/Host says nothing new; keep the name learned from DNS then.
-                    sniffer.host?.let { if (!isIpLiteral(it) || conn.host == null) conn.host = it }
+                    sniffer.host?.let {
+                        if (!isIpLiteral(it) || conn.host == null) conn.host = it
+                        conn.hostSniffed = true
+                    }
+                    // An app that skipped our DNS (cached or hard-coded IP) still names the host here,
+                    // before anything is forwarded.
+                    if (Rules.hostBlocked(conn.uid, sniffer.host)) {
+                        blockHost(conn)
+                        reset(src)
+                        closeQuietly(dst)
+                        return
+                    }
                 }
                 bb.flip()
                 while (bb.hasRemaining()) dst.write(bb)
@@ -450,6 +470,18 @@ class Engine(val host: EngineHost, private val pfd: ParcelFileDescriptor, val cf
     fun isFakeDns(addr: ByteArray): Boolean = addr.contentEquals(cfg.dns4)
 
     fun isBlocked(uid: Int): Boolean = Rules.isBlocked(uid, host.netType())
+
+    /** Why a DNS query of [uid] for [name] is answered "refused", or null to resolve it. */
+    fun dnsRefusal(uid: Int, name: String?): String? = when {
+        Rules.blockDns && isBlocked(uid) -> "DNS запрещён вместе с приложением"
+        Rules.hostBlocked(uid, name) -> NOTE_HOST_BLOCKED
+        else -> null
+    }
+
+    private fun blockHost(conn: Conn) {
+        conn.blocked = true
+        conn.note = NOTE_HOST_BLOCKED
+    }
 
     /** Switches the outbound route; live connections are dropped so apps reconnect via the new route. */
     fun setProxy(c: ProxyConfig) {
@@ -474,7 +506,7 @@ class Engine(val host: EngineHost, private val pfd: ParcelFileDescriptor, val cf
     /** Re-applies firewall rules to live connections (after a rule or network change). */
     fun enforceRules() {
         for (c in Live.active.values) {
-            if (!c.blocked && c.proto != "DNS" && isBlocked(c.uid)) c.kill()
+            if (!c.blocked && c.proto != "DNS" && (isBlocked(c.uid) || c.hostSniffed && Rules.hostBlocked(c.uid, c.host))) c.kill()
         }
         udp.reevaluateBlocked()
     }
@@ -489,6 +521,7 @@ class Engine(val host: EngineHost, private val pfd: ParcelFileDescriptor, val cf
         const val TAG = "NetStrazh"
         const val CONNECT_TIMEOUT_MS = 15_000
         const val PREREAD_MS = 400L
+        const val NOTE_HOST_BLOCKED = "адрес заблокирован"
         const val BUF_SIZE = 32 * 1024
 
         fun closeQuietly(c: Closeable?) {

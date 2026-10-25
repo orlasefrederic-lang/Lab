@@ -40,6 +40,9 @@ class ProxyTester(
                     // HTTPS to Cloudflare's resolver site through the tunnel; its trace page reports the exit IP and country.
                     val tls = (javax.net.ssl.SSLSocketFactory.getDefault() as javax.net.ssl.SSLSocketFactory)
                         .createSocket(ch.socket(), TRACE_HOST, 443, true) as javax.net.ssl.SSLSocket
+                    // A plain SSLSocket checks the chain but not the name: without this, any site with
+                    // a valid certificate could pose as the trace page and fake the exit IP and country.
+                    tls.sslParameters = tls.sslParameters.apply { endpointIdentificationAlgorithm = "HTTPS" }
                     tls.use { t ->
                         t.startHandshake()
                         t.outputStream.write("GET /cdn-cgi/trace HTTP/1.1\r\nHost: $TRACE_HOST\r\nUser-Agent: NetStrazh\r\nConnection: close\r\n\r\n".toByteArray())

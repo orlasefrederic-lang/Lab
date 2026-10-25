@@ -130,6 +130,29 @@ object Dns {
         return 512
     }
 
+    /**
+     * A REFUSED answer to the query at [off]: its header and question only (an EDNS record is dropped).
+     * Resolvers do not cache REFUSED, so other apps asking the same name are not affected.
+     * Null if [q] is not a well-formed query.
+     */
+    fun refused(q: ByteArray, off: Int, len: Int): ByteArray? {
+        if (len < 12 || B.u8(q, off + 2) and 0x80 != 0) return null
+        val end = off + len
+        var p = off + 12
+        for (i in 0 until B.u16(q, off + 4)) {
+            p = skipName(q, p, end)
+            if (p < 0 || p + 4 > end) return null
+            p += 4
+        }
+        val r = q.copyOfRange(off, p)
+        r[2] = (0x80 or (B.u8(q, off + 2) and 0x79)).toByte() // QR; keep opcode and RD
+        r[3] = (0x80 or RCODE_REFUSED).toByte()                // RA
+        for (i in 6..11) r[i] = 0
+        return r
+    }
+
+    const val RCODE_REFUSED = 5
+
     /** Header + question of [r] with the TC bit set and no records: tells the stub to retry over TCP. */
     fun truncated(r: ByteArray, len: Int): ByteArray {
         if (len < 12) return r.copyOf(len)

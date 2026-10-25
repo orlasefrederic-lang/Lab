@@ -23,10 +23,12 @@ import lab.netstrazh.vpn.Live
 import lab.netstrazh.vpn.ProxyConfig
 import lab.netstrazh.vpn.ProxyTester
 import lab.netstrazh.vpn.ProxyType
+import lab.netstrazh.vpn.TunConfig
 import lab.netstrazh.vpn.Upstream
 import lab.netstrazh.vpn.VIA_PROXY
 import org.junit.AfterClass
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
 import org.junit.BeforeClass
@@ -295,5 +297,80 @@ class E2eTest {
         ActivityScenario.launch<AppActivity>(Intent(ctx, AppActivity::class.java).putExtra("uid", myUid)).use { Thread.sleep(1500) }
         ActivityScenario.launch(PickerActivity::class.java).use { Thread.sleep(2500) }
         ActivityScenario.launch(SettingsActivity::class.java).use { Thread.sleep(1500) }
+    }
+
+    private fun rcode(r: ByteArray?): Int = if (r == null || r.size < 12) -1 else r[3].toInt() and 0x0F
+
+    /** "Block DNS too": lookups of a blocked app are refused at once, and resolve again after. */
+    @Test fun t10_dnsBlockedWithTheApp() {
+        Rules.set(ctx.packageName, Rules.BLOCK_ALL)
+        Rules.setBlockDns(true)
+        try {
+            Thread.sleep(300)
+            val r = dnsQueryUdp(TunConfig.DNS4, "dns-block-${SystemClock.uptimeMillis()}.example.com")
+            assertEquals("REFUSED for the blocked app", 5, rcode(r))
+            assertEquals("same query id", 0x51.toByte(), r!![0])
+            waitSeen("blocked DNS") { it.proto == "DNS" && it.blocked && it.uid == myUid }
+        } finally {
+            Rules.setBlockDns(false)
+            Rules.set(ctx.packageName, 0)
+        }
+        Thread.sleep(300)
+        assertEquals("resolves again", 0, rcode(dnsQueryUdp(TunConfig.DNS4, "example.org")))
+    }
+
+    /** Host rules: DNS for the name is refused, TLS naming it is cut, other sites keep working. */
+    @Test fun t11_hostRules() {
+        Rules.setHostBlocked(Rules.ALL, "example.org", true)
+        try {
+            Thread.sleep(300)
+            assertEquals("subdomain refused", 5, rcode(dnsQueryUdp(TunConfig.DNS4, "www.example.org")))
+            // An app that skips our DNS still names the host in TLS: connect to some IP with that name.
+            val ip = InetAddress.getByName("www.google.com")
+            val f = javax.net.ssl.SSLSocketFactory.getDefault() as javax.net.ssl.SSLSocketFactory
+            try {
+                (f.createSocket() as javax.net.ssl.SSLSocket).use { t ->
+                    t.sslParameters = t.sslParameters.apply { serverNames = listOf(javax.net.ssl.SNIHostName("www.example.org")) }
+                    t.connect(InetSocketAddress(ip, 443), 10_000)
+                    t.soTimeout = 10_000
+                    t.startHandshake()
+                }
+                fail("handshake with a blocked name went through")
+            } catch (_: IOException) {
+            }
+            waitSeen("TLS to a blocked name cut") { it.proto == "TCP" && it.port == 443 && it.host == "www.example.org" && it.blocked && it.uid == myUid }
+            val c = URL("https://www.google.com/generate_204").openConnection() as HttpsURLConnection
+            c.connectTimeout = 15_000
+            c.readTimeout = 15_000
+            assertEquals("other sites work", 204, c.responseCode)
+            c.disconnect()
+        } finally {
+            Rules.setHostBlocked(Rules.ALL, "example.org", false)
+        }
+        Thread.sleep(300)
+        assertEquals("resolves after unblocking", 0, rcode(dnsQueryUdp(TunConfig.DNS4, "www.example.org")))
+    }
+
+    /** Runs last: the user's switch off and on again, with the screens refreshing meanwhile. */
+    @Test fun t20_powerSwitchOffAndOn() {
+        ActivityScenario.launch(MainActivity::class.java).use { sc ->
+            sc.onActivity { it.onPowerToggle(false) }
+            waitFor(10_000, "VPN stopped") { !FirewallService.running }
+            // Our own VPN network lingers for a moment after stopping: it is not "another VPN",
+            // and checking that must work on every API level (the header asks it right away).
+            val end = SystemClock.uptimeMillis() + 2_000
+            while (SystemClock.uptimeMillis() < end) {
+                assertFalse("own VPN network taken for another VPN", FirewallService.otherVpnActive(ctx))
+                Thread.sleep(100)
+            }
+            Thread.sleep(1_000) // header refresh while off
+        }
+        ActivityScenario.launch(SettingsActivity::class.java).use { Thread.sleep(1500) }
+        ActivityScenario.launch(MainActivity::class.java).use { sc ->
+            sc.onActivity { it.onPowerToggle(true) }
+            waitFor(25_000, "VPN running again") { FirewallService.running }
+            Thread.sleep(1_000)
+        }
+        assertTrue(httpGet("example.com").startsWith("HTTP/1."))
     }
 }

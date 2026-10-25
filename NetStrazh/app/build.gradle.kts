@@ -50,8 +50,11 @@ android {
     }
 
     lint {
-        abortOnError = false
+        // CI runs lintDebug: errors such as NewApi (a call above minSdk) fail the build.
+        abortOnError = true
         checkReleaseBuilds = false
+        // Deliberate: usage stats and the full app list are what the app is for.
+        disable += setOf("ProtectedPermissions", "QueryAllPackagesPermission")
     }
 }
 

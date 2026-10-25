@@ -16,7 +16,9 @@ import android.os.ParcelFileDescriptor
 import android.util.Log
 import lab.netstrazh.Prefs
 import lab.netstrazh.R
+import lab.netstrazh.data.Apps
 import lab.netstrazh.data.Db
+import lab.netstrazh.data.ProxyApps
 import lab.netstrazh.data.Rules
 import lab.netstrazh.ui.MainActivity
 import java.net.DatagramSocket
@@ -33,6 +35,13 @@ class FirewallService : VpnService(), EngineHost {
     private val rulesListener: () -> Unit = { main.post { onRulesChanged() } }
 
     private val netChanged = Runnable { onNetworkChanged() }
+    /** The journal keeps only the configured number of days, also while the VPN runs for weeks. */
+    private val prune = object : Runnable {
+        override fun run() {
+            Db.pruneAsync()
+            main.postDelayed(this, PRUNE_EVERY_MS)
+        }
+    }
 
     override fun onCreate() {
         super.onCreate()
@@ -112,7 +121,8 @@ class FirewallService : VpnService(), EngineHost {
         engine = e
         running = true
         Prefs.revokedAt = 0L
-        Db.pruneAsync()
+        main.removeCallbacks(prune)
+        main.post(prune)
         updateNotification()
     }
 
@@ -136,7 +146,7 @@ class FirewallService : VpnService(), EngineHost {
         }
         b.setMetered(false)
         net.best?.let { b.setUnderlyingNetworks(arrayOf(it)) }
-        appliedExcluded = Rules.excludedPackages()
+        appliedExcluded = excludedNow()
         for (pkg in appliedExcluded) {
             try { b.addDisallowedApplication(pkg) } catch (_: Exception) {}
         }
@@ -156,6 +166,7 @@ class FirewallService : VpnService(), EngineHost {
 
     private fun shutdown() {
         main.removeCallbacks(netChanged)
+        main.removeCallbacks(prune)
         stopEngine()
         net.stop()
         running = false
@@ -182,7 +193,7 @@ class FirewallService : VpnService(), EngineHost {
 
     private fun onRulesChanged() {
         val e = engine ?: return
-        if (Rules.excludedPackages() != appliedExcluded) {
+        if (excludedNow() != appliedExcluded) {
             restartEngine()
         } else {
             e.enforceRules()
@@ -194,6 +205,28 @@ class FirewallService : VpnService(), EngineHost {
 
     /** Apps excluded from the VPN when the interface was established. */
     private var appliedExcluded: Set<String> = emptySet()
+
+    /** Apps kept out of the VPN: the user's exclusions, plus the proxy app when it should bypass us. */
+    private fun excludedNow(): Set<String> {
+        val p = Prefs.proxy
+        val proxyApp = if (p.enabled && p.bypassApp && p.appPkg.isNotEmpty() && p.appPkg != packageName) setOf(p.appPkg) else emptySet()
+        return Rules.excludedPackages() + proxyApp
+    }
+
+    /** The proxy app's traffic still comes through us: remember it and rebuild the VPN without it. */
+    override fun onProxyApp(uid: Int) {
+        main.post {
+            val p = Prefs.proxy
+            if (engine == null || !p.enabled || !p.bypassApp || uid == selfUid) return@post
+            val pkgs = Apps.packagesForUid(uid)
+            if (pkgs.isEmpty() || p.appPkg in pkgs) return@post
+            val known = ProxyApps.known.flatMap { it.packages }
+            val pkg = pkgs.firstOrNull { it in known } ?: pkgs[0]
+            Log.i(Engine.TAG, "proxy served by $pkg: keeping it out of the VPN")
+            Prefs.proxy = p.copy(appPkg = pkg)
+            restartEngine()
+        }
+    }
 
     // ------------------------------------------------------------ EngineHost
 
@@ -274,6 +307,7 @@ class FirewallService : VpnService(), EngineHost {
     companion object {
         const val ACTION_START = "lab.netstrazh.START"
         const val ACTION_STOP = "lab.netstrazh.STOP"
+        private const val PRUNE_EVERY_MS = 6 * 3_600_000L
         private val V6_ROUTES = listOf(
             "::" to 1, "8000::" to 2, "c000::" to 3, "e000::" to 4, "f000::" to 5,
             "f800::" to 6, "fc00::" to 7, "fe00::" to 9, "fec0::" to 10,
@@ -295,6 +329,12 @@ class FirewallService : VpnService(), EngineHost {
         fun applyProxy() {
             val s = instance ?: return
             s.main.post {
+                // Whether the proxy app bypasses the VPN is part of the interface: rebuild it then.
+                if (s.engine != null && s.excludedNow() != s.appliedExcluded) {
+                    s.restartEngine()
+                    s.updateNotification()
+                    return@post
+                }
                 s.engine?.applyProxyAsync { Prefs.proxy }
                 s.updateNotification()
             }
@@ -304,6 +344,23 @@ class FirewallService : VpnService(), EngineHost {
         fun reconfigure() {
             val s = instance ?: return
             s.main.post { s.restartEngine() }
+        }
+
+        /**
+         * True when a VPN other than ours is up. Our own network (still registered for a moment after
+         * stopping) is recognised by its interface address: NetworkCapabilities.getOwnerUid() would
+         * need API 30.
+         */
+        fun otherVpnActive(ctx: Context): Boolean = try {
+            val cm = ctx.getSystemService(ConnectivityManager::class.java)
+            @Suppress("DEPRECATION")
+            cm.allNetworks.any { n ->
+                val caps = cm.getNetworkCapabilities(n)
+                caps != null && caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_VPN) &&
+                    cm.getLinkProperties(n)?.linkAddresses?.none { it.address.hostAddress == TunConfig.T4 } != false
+            }
+        } catch (_: Exception) {
+            false
         }
 
         fun stop(ctx: Context) {
