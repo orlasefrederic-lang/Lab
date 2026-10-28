@@ -473,12 +473,12 @@ class E2eTest {
             throw AssertionError("own traffic bypasses the VPN after switching on" + diag(), e)
         }
         val nc = shell("toybox nc -w 3 1.1.1.1 80")
-        if (nc.contains("not found") || nc.contains("inaccessible")) {
-            Log.w(TAG, "no toybox nc on this image: $nc")
-        } else try {
+        assertFalse("toybox nc is missing on this image: $nc", nc.contains("not found") || nc.contains("inaccessible"))
+        try {
             waitSeen("shell TCP captured after switching on") { it.proto == "TCP" && it.port == 80 && it.uid == 2000 && it.ts >= t0 }
         } catch (e: AssertionError) {
             throw AssertionError("another app's traffic bypasses the VPN after switching on; nc: $nc" + diag(), e)
         }
+        Log.i(TAG, "capture after switching on verified for uid $myUid and the shell")
     }
 }
