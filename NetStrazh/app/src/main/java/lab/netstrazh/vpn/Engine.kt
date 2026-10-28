@@ -7,6 +7,8 @@ import android.system.OsConstants
 import android.system.StructPollfd
 import android.util.Log
 import lab.netstrazh.data.Rules
+import lab.netstrazh.net.Dns
+import lab.netstrazh.net.DnsTcp
 import lab.netstrazh.net.HostSniffer
 import lab.netstrazh.net.Ip
 import lab.netstrazh.net.PROTO_TCP
@@ -29,6 +31,7 @@ import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.concurrent.thread
 
@@ -67,6 +70,8 @@ interface EngineHost {
     fun onEngineDied()
     /** The app with this UID serves the proxy and its traffic still enters our VPN. */
     fun onProxyApp(uid: Int) {}
+    /** Name of the proxy app for messages, when known. */
+    fun proxyAppLabel(): String? = null
 }
 
 /**
@@ -97,6 +102,8 @@ class Engine(val host: EngineHost, private val pfd: ParcelFileDescriptor, val cf
     }
     private val threads = ArrayList<Thread>()
     private val writeLock = Any()
+    /** TCP connections being relayed right now. */
+    private val relays = AtomicInteger()
 
     fun start() {
         running = true
@@ -283,9 +290,19 @@ class Engine(val host: EngineHost, private val pfd: ParcelFileDescriptor, val cf
                 closeQuietly(ch)
                 continue
             }
+            if (relays.get() >= MAX_TCP_RELAYS) {
+                // Thousands of open connections already: refuse, the app retries later.
+                reset(ch)
+                nat.close(e, System.currentTimeMillis())
+                continue
+            }
+            relays.incrementAndGet()
             try {
-                pool.execute { relayTcp(e, ch) }
+                pool.execute {
+                    try { relayTcp(e, ch) } finally { relays.decrementAndGet() }
+                }
             } catch (ex: RejectedExecutionException) {
+                relays.decrementAndGet()
                 closeQuietly(ch)
             }
         }
@@ -302,7 +319,18 @@ class Engine(val host: EngineHost, private val pfd: ParcelFileDescriptor, val cf
         }
         val ip = dst.hostAddress ?: "?"
         val local = InetAddress.getByAddress(if (e.v6) cfg.t6 else cfg.t4)
-        val uid = host.ownerUid(OsConstants.IPPROTO_TCP, InetSocketAddress(local, e.srcPort), InetSocketAddress(dst, e.dstPort))
+        val uid = run {
+            // An owner Android cannot name yet (e.g. a lookup racing with the socket's setup) is asked
+            // again a few times before the connection counts as nobody's.
+            fun lookup() = host.ownerUid(OsConstants.IPPROTO_TCP, InetSocketAddress(local, e.srcPort), InetSocketAddress(dst, e.dstPort))
+            var u = lookup()
+            var tries = 0
+            while (u < 0 && tries++ < 3) {
+                Thread.sleep(20)
+                u = lookup()
+            }
+            u
+        }
         val conn = Conn(uid, if (fakeDns) "DNS" else "TCP", if (fakeDns) "" else ip, e.dstPort,
             if (fakeDns) null else DnsCache.get(uid, ip), host.netType().label)
         Live.open(conn)
@@ -318,17 +346,12 @@ class Engine(val host: EngineHost, private val pfd: ParcelFileDescriptor, val cf
                 reset(client)
                 return
             }
-            val o: SocketChannel
             if (fakeDns) {
-                // DNS over TCP to our fake resolver (e.g. truncated answers): same route as UDP DNS.
-                upstream.awaitProxyUid()
-                if (upstream.dnsViaProxy(uid)) {
-                    o = upstream.openTcp(InetSocketAddress(host.resolve(upstream.cfg.dnsServer), 53), uid, CONNECT_TIMEOUT_MS) { out.set(it) }.ch
-                    conn.via = VIA_PROXY
-                } else {
-                    o = upstream.openTcpDirect(InetSocketAddress(host.upstreamDns(), 53), CONNECT_TIMEOUT_MS) { out.set(it) }
-                }
-            } else {
+                serveDnsTcp(client, conn, uid, out)
+                return
+            }
+            val o: SocketChannel
+            run {
                 // Through a proxy, first read what the app sends (TLS ClientHello / HTTP request) to learn
                 // the host name: the proxy then connects by name and its routing rules by domain work.
                 var name: String? = null
@@ -378,6 +401,92 @@ class Engine(val host: EngineHost, private val pfd: ParcelFileDescriptor, val cf
             nat.close(e, System.currentTimeMillis())
             Live.close(conn)
         }
+    }
+
+    /**
+     * DNS over TCP to our resolver address (e.g. after a truncated UDP answer). Every framed query gets
+     * the decision a UDP one gets (refused, or resolved through the proxy or by the network's
+     * resolver) and its answer, in order, on this connection.
+     */
+    private fun serveDnsTcp(client: SocketChannel, conn: Conn, uid: Int, out: AtomicReference<SocketChannel?>) {
+        upstream.awaitProxyUid()
+        val head = ByteBuffer.allocate(2)
+        var answered = false
+        var tcpRefused = false
+        while (true) {
+            head.clear()
+            if (!readExactly(client, head)) return
+            val n = ((head.get(0).toInt() and 0xFF) shl 8) or (head.get(1).toInt() and 0xFF)
+            if (n < 12) return
+            val q = ByteArray(n)
+            if (!readExactly(client, ByteBuffer.wrap(q))) return
+            conn.addTx(n + 2L)
+            val name = Dns.parse(q, 0, n)?.qname
+            if (conn.host == null && name != null) conn.host = name
+            val why = dnsRefusal(uid, name)
+            val r: ByteArray = if (why != null) {
+                if (!answered) {
+                    conn.blocked = true
+                    conn.note = why
+                }
+                Dns.refused(q, 0, n) ?: return
+            } else {
+                val a = if (upstream.dnsViaProxy(uid)) {
+                    conn.via = VIA_PROXY
+                    upstream.dnsQuery(q, 0, n)
+                } else {
+                    val server = host.upstreamDns()
+                    var a: ByteArray? = null
+                    if (!tcpRefused) try {
+                        val ch = out.get() ?: upstream.openTcpDirect(InetSocketAddress(server, 53), DNS_TCP_CONNECT_MS) { out.set(it) }
+                        a = lab.netstrazh.net.withDeadline(ch, Upstream.DNS_TIMEOUT_MS) { DnsTcp.query(ch, q, 0, n) }
+                    } catch (e: IOException) {
+                        // A resolver without DNS over TCP (many home routers, the emulator): ask over UDP.
+                        tcpRefused = true
+                        closeQuietly(out.getAndSet(null))
+                    }
+                    a ?: udpDnsQuery(server, q, n)
+                }
+                if (conn.blocked) {
+                    conn.blocked = false
+                    conn.note = UdpRelay.NOTE_SOME_REFUSED
+                }
+                answered = true
+                noteDnsAnswer(uid, a)
+                a
+            }
+            val frame = ByteBuffer.allocate(2 + r.size)
+            frame.put((r.size ushr 8).toByte()).put(r.size.toByte()).put(r).flip()
+            while (frame.hasRemaining()) client.write(frame)
+            conn.addRx(r.size + 2L)
+        }
+    }
+
+    /** One plain DNS query over UDP to [server], outside the VPN. */
+    private fun udpDnsQuery(server: InetAddress, q: ByteArray, n: Int): ByteArray {
+        DatagramSocket().use { s ->
+            if (!host.protect(s)) throw IOException("protect failed")
+            s.soTimeout = DNS_TCP_CONNECT_MS
+            s.connect(InetSocketAddress(server, 53))
+            s.send(java.net.DatagramPacket(q, n))
+            val buf = ByteArray(65535)
+            val p = java.net.DatagramPacket(buf, buf.size)
+            s.receive(p)
+            return buf.copyOf(p.length)
+        }
+    }
+
+    /** Remembers the names behind the addresses of a DNS answer, as the UDP path does. */
+    private fun noteDnsAnswer(uid: Int, r: ByteArray) {
+        val m = Dns.parse(r, 0, r.size) ?: return
+        val name = m.qname ?: return
+        for (a in m.addresses) DnsCache.put(uid, a, name)
+    }
+
+    /** Fills [bb] completely; false when the peer closed first. */
+    private fun readExactly(ch: SocketChannel, bb: ByteBuffer): Boolean {
+        while (bb.hasRemaining()) if (ch.read(bb) < 0) return false
+        return true
     }
 
     private fun failureNote(ex: Exception): String = when (ex) {
@@ -473,7 +582,7 @@ class Engine(val host: EngineHost, private val pfd: ParcelFileDescriptor, val cf
 
     /** Why a DNS query of [uid] for [name] is answered "refused", or null to resolve it. */
     fun dnsRefusal(uid: Int, name: String?): String? = when {
-        Rules.blockDns && isBlocked(uid) -> "DNS запрещён вместе с приложением"
+        Rules.blockDns && isBlocked(uid) -> NOTE_DNS_WITH_APP
         Rules.hostBlocked(uid, name) -> NOTE_HOST_BLOCKED
         else -> null
     }
@@ -513,6 +622,14 @@ class Engine(val host: EngineHost, private val pfd: ParcelFileDescriptor, val cf
 
     private fun housekeeping() {
         val now = System.currentTimeMillis()
+        // Connections silent for hours are almost always dead on the far side (carrier NATs drop idle
+        // ones much sooner); apps that keep a connection open send keep-alives well within this.
+        for (c in Live.active.values) {
+            if (c.proto == "TCP" && now - c.lastAt > TCP_IDLE_MS) {
+                c.note = "закрыто: нет активности ${TCP_IDLE_MS / 3_600_000} ч"
+                c.kill()
+            }
+        }
         try { nat.sweep(now) } catch (e: Exception) { Log.w(TAG, "nat sweep", e) }
         try { udp.sweep(now) } catch (e: Exception) { Log.w(TAG, "udp sweep", e) }
     }
@@ -521,7 +638,11 @@ class Engine(val host: EngineHost, private val pfd: ParcelFileDescriptor, val cf
         const val TAG = "NetStrazh"
         const val CONNECT_TIMEOUT_MS = 15_000
         const val PREREAD_MS = 400L
+        const val MAX_TCP_RELAYS = 2000
+        const val DNS_TCP_CONNECT_MS = 3_000
+        const val TCP_IDLE_MS = 2 * 3_600_000L
         const val NOTE_HOST_BLOCKED = "адрес заблокирован"
+        const val NOTE_DNS_WITH_APP = "DNS запрещён вместе с приложением"
         const val BUF_SIZE = 32 * 1024
 
         fun closeQuietly(c: Closeable?) {

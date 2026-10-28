@@ -8,6 +8,7 @@ import java.util.concurrent.CompletableFuture
 import java.util.concurrent.ExecutionException
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.TimeoutException
+import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.thread
 
 /**
@@ -16,14 +17,15 @@ import kotlin.concurrent.thread
  * responses back by ID and restores the app's original ID. A new proxied connection per lookup would
  * cost a full handshake to the VPN server every time; this keeps lookups at about one round trip.
  *
- * Every wait is bounded by the caller's timeout: the connection is opened on its own thread, and a
- * write that blocks closes the connection. A connection that answers nothing at all while a query
- * times out is considered stalled (e.g. its path through the VPN died silently) and replaced.
+ * Every wait of a query shares one deadline (monotonic clock): opening the connection (on its own
+ * thread), waiting for another query's write, writing (a write that blocks closes the connection)
+ * and the answer. A connection that answers nothing at all while a query times out is considered
+ * stalled (e.g. its path through the VPN died silently) and replaced.
  */
 class DnsPipe(private val open: () -> SocketChannel) {
     private class Conn(val ch: SocketChannel) {
         val pending = HashMap<Int, CompletableFuture<ByteArray>>()
-        val writeLock = Any()
+        val writeLock = ReentrantLock()
         @Volatile var dead = false
         /** When the last response arrived. */
         @Volatile var lastRx = 0L
@@ -36,23 +38,23 @@ class DnsPipe(private val open: () -> SocketChannel) {
     private var generation = 0
     private var nextId = (System.nanoTime() and 0xFFFF).toInt()
 
-    /** Resolves one query (wire format); throws IOException on failure. Blocks up to about [timeoutMs]. */
+    /** Resolves one query (wire format); throws IOException on failure. Blocks at most [timeoutMs]. */
     fun query(q: ByteArray, off: Int, len: Int, timeoutMs: Long): ByteArray {
         require(len >= 12)
         val origId = ((q[off].toInt() and 0xFF) shl 8) or (q[off + 1].toInt() and 0xFF)
-        val deadline = System.currentTimeMillis() + timeoutMs
+        val deadline = System.nanoTime() + timeoutMs * 1_000_000
+        fun left(): Long = (deadline - System.nanoTime()) / 1_000_000
         var lastError: Exception? = null
         // One retry on a fresh connection: the resolver may have closed an idle pipe.
         repeat(2) {
-            val left = deadline - System.currentTimeMillis()
-            if (left <= 0) throw IOException("DNS timeout")
+            if (left() <= 0) throw IOException(TIMEOUT)
             val f = CompletableFuture<ByteArray>()
             var c: Conn? = null
             val sentAt = System.currentTimeMillis()
             try {
-                c = connection(left)
-                send(c, q, off, len, f, left)
-                val r = f.get(maxOf(1L, deadline - System.currentTimeMillis()), TimeUnit.MILLISECONDS)
+                c = connection(left())
+                send(c, q, off, len, f) { left() }
+                val r = f.get(maxOf(1L, left()), TimeUnit.MILLISECONDS)
                 r[0] = (origId ushr 8).toByte()
                 r[1] = origId.toByte()
                 return r
@@ -62,7 +64,7 @@ class DnsPipe(private val open: () -> SocketChannel) {
                     c.lastRx < sentAt
                 }
                 if (stalled) fail(c!!, IOException("DNS pipe stalled"))
-                throw IOException("DNS timeout")
+                throw IOException(TIMEOUT)
             } catch (e: ExecutionException) {
                 lastError = e.cause as? Exception ?: e
             } catch (e: IOException) {
@@ -102,15 +104,15 @@ class DnsPipe(private val open: () -> SocketChannel) {
             }
         }
         return try {
-            f.get(timeoutMs, TimeUnit.MILLISECONDS)
+            f.get(maxOf(1L, timeoutMs), TimeUnit.MILLISECONDS)
         } catch (e: TimeoutException) {
-            throw IOException("no DNS connection through the proxy")
+            throw IOException("нет соединения с DNS через прокси")
         } catch (e: ExecutionException) {
             throw e.cause as? IOException ?: IOException(e.cause)
         }
     }
 
-    private fun send(c: Conn, q: ByteArray, off: Int, len: Int, f: CompletableFuture<ByteArray>, timeoutMs: Long) {
+    private fun send(c: Conn, q: ByteArray, off: Int, len: Int, f: CompletableFuture<ByteArray>, left: () -> Long) {
         val frame = ByteArray(2 + len)
         frame[0] = (len ushr 8).toByte()
         frame[1] = len.toByte()
@@ -128,19 +130,24 @@ class DnsPipe(private val open: () -> SocketChannel) {
         }
         frame[2] = (id ushr 8).toByte()
         frame[3] = id.toByte()
+        // Waiting for another query's write counts against this query's own deadline.
+        if (!c.writeLock.tryLock(maxOf(0L, left()), TimeUnit.MILLISECONDS)) {
+            synchronized(lock) { c.pending.remove(id) }
+            throw IOException(TIMEOUT)
+        }
         try {
             // Length and message in one write (RFC 7766 section 8); a write that cannot finish in
             // time means the path is stuck, and closing the channel ends it.
-            synchronized(c.writeLock) {
-                withDeadline(c.ch, timeoutMs) {
-                    val bb = ByteBuffer.wrap(frame)
-                    while (bb.hasRemaining()) c.ch.write(bb)
-                }
+            withDeadline(c.ch, maxOf(1L, left())) {
+                val bb = ByteBuffer.wrap(frame)
+                while (bb.hasRemaining()) c.ch.write(bb)
             }
         } catch (e: IOException) {
             synchronized(lock) { c.pending.remove(id) }
             fail(c, e)
             throw e
+        } finally {
+            c.writeLock.unlock()
         }
     }
 
@@ -182,6 +189,10 @@ class DnsPipe(private val open: () -> SocketChannel) {
         // Closing does not need the write lock: it also unblocks a write stuck in progress.
         try { c.ch.close() } catch (_: Exception) {}
         for (f in waiting) f.completeExceptionally(e)
+    }
+
+    companion object {
+        const val TIMEOUT = "нет ответа DNS через туннель"
     }
 
     fun close() {

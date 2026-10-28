@@ -217,7 +217,7 @@ class SocksTest {
                 withDeadline(ch, 300) { Socks5.handshake(ch, "", "") }
                 fail("expected timeout")
             } catch (e: java.io.IOException) {
-                assertTrue(e.message, e.message!!.contains("timeout"))
+                assertTrue("typed deadline: $e", e is DeadlineException && e.ms == 300L)
             }
         }
         assertTrue((System.nanoTime() - start) / 1_000_000 < 3000)

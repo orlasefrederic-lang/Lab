@@ -1,6 +1,7 @@
 package lab.netstrazh.ui
 
 import android.app.Activity
+import android.content.Intent
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -40,6 +41,8 @@ class SettingsActivity : Activity() {
     private var appPkg = ""
     private lateinit var fields: LinearLayout
     private lateinit var status: TextView
+    private lateinit var statusActions: LinearLayout
+    private var actionsKey = ""
     private lateinit var testOut: TextView
     private lateinit var otherVpn: TextView
     private lateinit var testButton: TextView
@@ -113,8 +116,8 @@ class SettingsActivity : Activity() {
         pass = field(fields, "Пароль (если нужен)", "", InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD)
         dns = check(fields, "DNS-запросы — тоже через прокси (рекомендуется: провайдер не увидит, какие сайты вы открываете)")
         dnsServer = field(fields, "DNS-сервер для запросов через прокси", "1.1.1.1", InputType.TYPE_CLASS_TEXT)
-        udpDirect = check(fields, "Если прокси не передаёт UDP — пускать UDP напрямую, мимо прокси (иначе UDP блокируется)")
-        directIfDown = check(fields, "Если прокси недоступен — пускать трафик напрямую (небезопасно: VPN тогда не защищает)")
+        udpDirect = check(fields, "Если прокси не передаёт UDP — пускать UDP напрямую, мимо VPN-сервера (иначе UDP блокируется)")
+        directIfDown = check(fields, "Если прокси недоступен — пускать трафик напрямую, мимо VPN-сервера (небезопасно)")
         bypassApp = check(fields, "Само VPN-приложение — мимо Стража (рекомендуется): его связь с сервером идёт напрямую, " +
             "как в его собственном режиме VPN. Страж находит его сам.")
         form.addView(fields)
@@ -132,6 +135,8 @@ class SettingsActivity : Activity() {
         st.addView(text("Состояние", 16f, bold = true))
         status = text("", 13.5f, Pal.sub)
         st.addView(status, lp().apply { topMargin = dp(4) })
+        statusActions = vbox()
+        st.addView(statusActions, lp().apply { topMargin = dp(6) })
         col.addView(st, lp().apply { topMargin = dp(12) })
 
         setContentView(scroll)
@@ -300,8 +305,12 @@ class SettingsActivity : Activity() {
                     }
                     if (up.proxyUid >= 0) {
                         sb.append("\nПрокси обслуживает «${Apps.forUid(up.proxyUid).label}»: его собственный трафик идёт напрямую, без петли.")
-                    } else if (cfg.bypassApp && cfg.appPkg.isNotEmpty()) {
+                    } else if (cfg.bypassApp && cfg.appPkg.isNotEmpty() && !FirewallService.lockdown) {
                         sb.append("\n«${Apps.labelForPackage(cfg.appPkg)}» работает мимо Стража: его связь с сервером идёт по обычной сети.")
+                    }
+                    if (cfg.bypassApp && FirewallService.lockdown) {
+                        sb.append("\nВключено «Блокировать соединения без VPN»: прокси-приложение остаётся в Страже " +
+                            "(вне VPN Android отрезал бы его от сервера), его трафик идёт напрямую.")
                     }
                     if (up.udpUnsupported) sb.append("\nПрокси не передаёт UDP" + if (cfg.udpDirect) " — UDP идёт напрямую." else " — UDP блокируется.")
                     val ev = up.recentEvents().filter { now - it.lastAt < 24 * 3_600_000L }
@@ -312,12 +321,53 @@ class SettingsActivity : Activity() {
                             if (e.count > 1) sb.append(" (×").append(e.count).append(" с ").append(Fmt.time(e.at)).append(")")
                         }
                     }
+                    if (ev.any { now - it.lastAt < 30 * 60_000L && it.msg.contains("не отвечает") }) {
+                        sb.append("\n\n💡 Похоже, система усыпляет ${proxyLabel(cfg)}: в режиме прокси Android не бережёт его, " +
+                            "как VPN. Откройте его настройки (кнопка ниже): «Контроль активности» → «Нет ограничений», " +
+                            "включите «Автозапуск», и закрепите его в недавних приложениях.")
+                    }
                 }
             }
         }
         status.text = sb.toString()
+        renderStatusActions(cfg)
         otherVpn.text = if (!FirewallService.running && otherVpnActive()) "Сейчас включён другой VPN. Переведите его в режим прокси, " +
             "заполните настройки ниже и включите Стража." else ""
+    }
+
+    private fun proxyLabel(cfg: ProxyConfig): String =
+        if (cfg.appPkg.isNotEmpty()) "«${Apps.labelForPackage(cfg.appPkg)}»" else "приложение прокси"
+
+    /** Buttons under the status: the proxy app's system settings, and a detected proxy app to confirm. */
+    private fun renderStatusActions(cfg: ProxyConfig) {
+        val pkg = if (!cfg.enabled) "" else
+            cfg.appPkg.ifEmpty { FirewallService.instance?.upstream?.proxyUid?.takeIf { it >= 0 }?.let { Apps.forUid(it).pkg } ?: "" }
+        val suggested = FirewallService.suggestedProxyPkg
+        // The status refreshes every few seconds: rebuild the buttons only when they change, so a tap
+        // in progress is not lost.
+        val key = "${cfg.enabled}|$pkg|$suggested|${cfg.appPkg}|${cfg.bypassApp}"
+        if (key == actionsKey) return
+        actionsKey = key
+        statusActions.removeAllViews()
+        if (!cfg.enabled) return
+        if (pkg.isNotEmpty()) {
+            statusActions.addView(pill("Настройки «${Apps.labelForPackage(pkg)}» (батарея, автозапуск) ›", 1) {
+                try {
+                    startActivity(Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS, android.net.Uri.parse("package:$pkg")))
+                } catch (_: Exception) {}
+            }, lp(WRAP, WRAP).apply { topMargin = dp(6) })
+        }
+        if (suggested != null && suggested != cfg.appPkg && cfg.bypassApp) {
+            statusActions.addView(text("Порт прокси обслуживает «${Apps.labelForPackage(suggested)}» — его нет в списке известных " +
+                "VPN-приложений, поэтому Страж не пустил его мимо себя сам.", 12.5f, Pal.sub), lp().apply { topMargin = dp(8) })
+            statusActions.addView(pill("Пускать «${Apps.labelForPackage(suggested)}» мимо Стража", 3) {
+                Prefs.proxy = Prefs.proxy.copy(appPkg = suggested)
+                appPkg = suggested
+                FirewallService.suggestedProxyPkg = null
+                FirewallService.applyProxy()
+                renderStatus()
+            }, lp(WRAP, WRAP).apply { topMargin = dp(4) })
+        }
     }
 
     private fun otherVpnActive(): Boolean = FirewallService.otherVpnActive(this)

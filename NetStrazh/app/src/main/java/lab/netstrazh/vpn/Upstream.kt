@@ -1,6 +1,7 @@
 package lab.netstrazh.vpn
 
 import android.system.OsConstants
+import lab.netstrazh.net.DeadlineException
 import lab.netstrazh.net.DnsTcp
 import lab.netstrazh.net.HttpConnect
 import lab.netstrazh.net.ProxyException
@@ -169,21 +170,25 @@ class Upstream(private val host: EngineHost) {
     }
 
     /**
-     * Finds which app owns the proxy's end of [ch] (local = proxy endpoint, remote = our socket).
-     * Returns the value stored in [proxyUid], or null if the lookup was not possible.
+     * Finds which app serves the proxy reached by [ch]. Returns the value stored in [proxyUid], or
+     * null when it cannot be told right now (the previous value is kept then).
+     *
+     * The owner of the proxy's *listening* socket is asked for: the proxy's end of our connection
+     * waits in the accept queue until the proxy app accepts it (late when the app is busy or frozen),
+     * and the kernel reports such a socket as owned by root (uid 0). A lookup for a peer that never
+     * connected (port 1) finds the listener, which always carries its app's UID.
      */
     private fun learnProxyUid(ch: SocketChannel): Int? {
         val c = cfg
         val local = ch.socket().localSocketAddress as? InetSocketAddress ?: return null
         val remote = ch.socket().remoteSocketAddress as? InetSocketAddress ?: return null
-        var uid = host.ownerUid(OsConstants.IPPROTO_TCP, remote, local)
-        // Right after connect() the proxy's end can still be a half-open request socket, which the
-        // kernel reports as owned by uid 0. Ask again until its handshake is done; a proxy that really
-        // runs as root (rooted phones) keeps answering 0 and is accepted after that, once.
-        var tries = 0
-        while (uid == 0 && proxyUid != 0 && tries++ < 5) {
-            Thread.sleep(10)
-            uid = host.ownerUid(OsConstants.IPPROTO_TCP, remote, local)
+        var uid = host.ownerUid(OsConstants.IPPROTO_TCP, remote, InetSocketAddress(remote.address, 1))
+        if (uid < 0) {
+            // Not found that way (or the app is outside our VPN): our connection's other end tells,
+            // unless it has not been accepted yet.
+            val u = host.ownerUid(OsConstants.IPPROTO_TCP, remote, local)
+            if (u == 0) return null
+            uid = u
         }
         if (cfg !== c) return null
         val learned = if (uid >= 0 && uid != host.selfUid) uid else UID_NONE
@@ -249,14 +254,15 @@ class Upstream(private val host: EngineHost) {
      * when known (so the proxy app can route by domain), otherwise as the IP. [track] gets the channel
      * early so a kill can close it.
      */
-    fun openTcp(dst: InetSocketAddress, uid: Int, timeoutMs: Int, name: String? = null, track: (SocketChannel) -> Unit): Opened {
+    fun openTcp(dst: InetSocketAddress, uid: Int, timeoutMs: Int, name: String? = null, handshakeMs: Long = 0,
+                track: (SocketChannel) -> Unit): Opened {
         if (proxiedTo(uid, dst.address) && !isProxyEndpoint(dst)) {
             val c = cfg
             try {
                 val ch = proxyChannel(uid, track)
                 try {
                     val target = if (name != null) InetSocketAddress.createUnresolved(name, dst.port) else dst
-                    withDeadline(ch, HANDSHAKE_MS) {
+                    withDeadline(ch, if (handshakeMs > 0) handshakeMs else handshakeTimeout()) {
                         when (c.type) {
                             ProxyType.HTTP -> HttpConnect.connect(ch, c.user, c.pass, target)
                             else -> Socks5.connect(ch, c.user, c.pass, target)
@@ -264,6 +270,7 @@ class Upstream(private val host: EngineHost) {
                     }
                 } catch (e: Exception) {
                     Engine.closeQuietly(ch)
+                    if (e is DeadlineException) noteSilentProxy()
                     throw e
                 }
                 lastOkAt = System.currentTimeMillis()
@@ -306,10 +313,13 @@ class Upstream(private val host: EngineHost) {
                     val ctlCh = proxyChannel(uid) {}
                     ctl = ctlCh
                     val relay = try {
-                        withDeadline(ctlCh, HANDSHAKE_MS) { Socks5.udpAssociate(ctlCh, c.user, c.pass, proxyEndpoint()) }
+                        withDeadline(ctlCh, handshakeTimeout()) { Socks5.udpAssociate(ctlCh, c.user, c.pass, proxyEndpoint()) }
                     } catch (e: ProxyException) {
                         // Only an explicit refusal of the command means "no UDP"; a restart or timeout does not.
                         if (e.code == 7 || e.code == 1 || e.code == 2) udpUnsupportedAt = System.currentTimeMillis()
+                        throw e
+                    } catch (e: DeadlineException) {
+                        noteSilentProxy()
                         throw e
                     }
                     val d = DatagramChannel.open()
@@ -328,7 +338,7 @@ class Upstream(private val host: EngineHost) {
                 } catch (e: Exception) {
                     Engine.closeQuietly(dc)
                     Engine.closeQuietly(ctl)
-                    if (e !is ProxyException) noteError("UDP через прокси: ${e.message ?: e.javaClass.simpleName}")
+                    if (e !is ProxyException && e !is DeadlineException) noteError("UDP через прокси: ${e.message ?: e.javaClass.simpleName}")
                     if (!(udpUnsupported && c.udpDirect)) return null
                 }
             } else if (!c.udpDirect) {
@@ -370,14 +380,33 @@ class Upstream(private val host: EngineHost) {
         dnsQueryOnce(InetSocketAddress(host.resolve(cfg.dnsServer), 53), q, off, len)
     }
 
-    /** One DNS-over-TCP query to [server] through the proxy, on its own connection. */
+    /** One DNS-over-TCP query to [server] through the proxy, on its own connection, within a few seconds. */
     fun dnsQueryOnce(server: InetSocketAddress, q: ByteArray, off: Int, len: Int): ByteArray {
-        val o = openTcp(server, UID_DNS, PROXY_CONNECT_MS) {}
+        val o = openTcp(server, UID_DNS, PROXY_CONNECT_MS, handshakeMs = minOf(handshakeTimeout(), DNS_ONCE_MS)) {}
         try {
-            return withDeadline(o.ch, DNS_TIMEOUT_MS) { DnsTcp.query(o.ch, q, off, len) }
+            return withDeadline(o.ch, DNS_ONCE_MS) { DnsTcp.query(o.ch, q, off, len) }
+        } catch (e: DeadlineException) {
+            // The proxy took the request, but no answer came back through the tunnel.
+            throw IOException("DNS-сервер ${server.address.hostAddress} не ответил через туннель за ${DNS_ONCE_MS / 1000} с", e)
         } finally {
             Engine.closeQuietly(o.ch)
         }
+    }
+
+    /**
+     * SOCKS/HTTP handshake limit. A proxy app on this phone answers at once (it replies before even
+     * dialing the server): if it stays silent, it is frozen or stuck, so give up sooner than for a
+     * proxy across the network.
+     */
+    private fun handshakeTimeout(): Long =
+        if (try { isLoopback(proxyEndpoint().address) } catch (_: Exception) { false }) LOCAL_HANDSHAKE_MS else HANDSHAKE_MS
+
+    /** The proxy accepted the connection but did not answer the handshake. */
+    private fun noteSilentProxy() {
+        val local = try { isLoopback(proxyEndpoint().address) } catch (_: Exception) { false }
+        noteError(if (local) "${host.proxyAppLabel() ?: "приложение прокси"} принимает соединения, но не отвечает: " +
+            "похоже, система его усыпила или оно зависло"
+        else "прокси не ответил за ${HANDSHAKE_MS / 1000} с", down = true)
     }
 
     fun close() = dnsPipe.close()
@@ -426,6 +455,8 @@ class Upstream(private val host: EngineHost) {
         const val UID_DNS = -100
         const val PROXY_CONNECT_MS = 5_000
         const val HANDSHAKE_MS = 20_000L
+        const val LOCAL_HANDSHAKE_MS = 6_000L
+        const val DNS_ONCE_MS = 4_000L
         const val DNS_TIMEOUT_MS = 8_000L
         const val DNS_PIPE_TIMEOUT_MS = 3_000L
         const val MAX_EVENTS = 20

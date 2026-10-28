@@ -2,6 +2,7 @@ package lab.netstrazh.vpn
 
 import android.system.OsConstants
 import android.util.Log
+import lab.netstrazh.data.Rules
 import lab.netstrazh.net.Dns
 import lab.netstrazh.net.Ip
 import lab.netstrazh.net.PacketBuilder
@@ -42,6 +43,10 @@ class UdpRelay(private val eng: Engine) {
         @Volatile var retryAt = 0L
         /** DNS datagrams to a third-party resolver when the proxy cannot carry UDP. */
         @Volatile var dnsServer: InetSocketAddress? = null
+        /** DNS of a blocked app while "block DNS too" is on: every query of this flow is refused. */
+        @Volatile var refuseAll = false
+        /** Owner lookups made so far while the owner is unknown (0: it is known). */
+        @Volatile var uidLookups = 0
         val closed = AtomicBoolean(false)
         /** Datagrams received while the path is being set up (guarded by the session). */
         val queue = ArrayDeque<ByteArray>()
@@ -84,23 +89,44 @@ class UdpRelay(private val eng: Engine) {
         val key = FlowKey.of(p)
         var s = sessions[key]
         if (s == null || s.closed.get()) s = create(p, key) ?: return
-        s.last = System.currentTimeMillis()
+        val now = System.currentTimeMillis()
+        if (s.uidLookups in 1 until MAX_UID_LOOKUPS && now - s.conn.start > 100) {
+            // The owner was not known when the flow started (e.g. a socket that had just been created):
+            // ask again a few times rather than treating its traffic as nobody's for the whole flow.
+            s.uidLookups++
+            val u = eng.host.ownerUid(OsConstants.IPPROTO_UDP, InetSocketAddress(InetAddress.getByAddress(p.srcAddr()), p.srcPort),
+                InetSocketAddress(InetAddress.getByAddress(p.dstAddr()), p.dstPort))
+            if (u >= 0) {
+                close(s)
+                s = create(p, key) ?: return
+            }
+        }
+        s.last = now
         val off = p.udpPayloadOff
         if (s.isDns) {
             val name = Dns.parse(p.buf, off, n)?.qname
             if (s.conn.host == null && name != null) s.conn.host = name
-            val why = if (s.conn.blocked) s.conn.note else eng.dnsRefusal(s.conn.uid, name)
+            // Decided per query: one socket may ask for several names, and only blocked ones are refused.
+            val why = if (s.refuseAll) s.conn.note else if (Rules.hostBlocked(s.conn.uid, name)) Engine.NOTE_HOST_BLOCKED else null
             if (why != null) {
                 // Answer at once: silence would make the system resolver retry and wait.
-                if (s.conn.tx == 0L) {
+                refuse(s, p.buf, off, n)
+                if (s.state == NOPATH) {
                     s.conn.blocked = true
                     s.conn.note = why
                 }
-                refuse(s, p.buf, off, n)
                 return
             }
+            if (s.state == NOPATH) {
+                // An allowed name on a socket whose first queries were refused: set the path up now.
+                s.conn.blocked = false
+                s.conn.note = NOTE_SOME_REFUSED
+                synchronized(s) { s.state = PENDING }
+                if (!startPath(s, s.conn.uid, InetAddress.getByAddress(s.remoteAddr))) return
+            }
+        } else if (s.conn.blocked) {
+            return
         }
-        if (s.conn.blocked) return
         when (s.state) {
             READY -> send(s, p.buf, off, n)
             PENDING -> {
@@ -145,6 +171,8 @@ class UdpRelay(private val eng: Engine) {
         val isDns = eng.isFakeDns(dst)
         if (isDns && dport != 53) return null
         if (isMulticastOrBroadcast(dst)) return null
+        // Bounded, so a flood of flows cannot exhaust memory and descriptors; the app just retries.
+        if (sessions.size >= MAX_SESSIONS) return null
         val dstInet = InetAddress.getByAddress(dst)
         val srcInet = InetAddress.getByAddress(p.srcAddr())
         val uid = eng.host.ownerUid(OsConstants.IPPROTO_UDP, InetSocketAddress(srcInet, p.srcPort), InetSocketAddress(dstInet, dport))
@@ -152,17 +180,23 @@ class UdpRelay(private val eng: Engine) {
         val conn = Conn(uid, if (isDns) "DNS" else "UDP", if (isDns) "" else ip, dport,
             if (isDns) null else DnsCache.get(uid, ip), eng.host.netType().label)
         val s = Session(key, p.v6, p.srcAddr(), p.srcPort, dst, dport, conn, isDns)
+        if (uid < 0 && !isDns) s.uidLookups = 1
         Live.open(conn)
         sessions[key] = s
         conn.killer = { close(s) }
-        // DNS of a blocked app is resolved unless the user asked to block it too (or the name is
-        // blocked): then fromApp answers REFUSED, which the shared system resolver does not cache.
+        // DNS of a blocked app is resolved unless the user asked to block it too; blocked names are
+        // refused query by query in fromApp. REFUSED is not cached by the shared system resolver.
         if (isDns) {
-            val why = eng.dnsRefusal(uid, Dns.parse(p.buf, p.udpPayloadOff, p.udpPayloadLen)?.qname)
-            if (why != null) {
+            if (Rules.blockDns && eng.isBlocked(uid)) {
                 conn.blocked = true
-                conn.note = why
+                conn.note = Engine.NOTE_DNS_WITH_APP
+                s.refuseAll = true
                 s.state = DROP
+                return s
+            }
+            if (Rules.hostBlocked(uid, Dns.parse(p.buf, p.udpPayloadOff, p.udpPayloadLen)?.qname)) {
+                // No path until a query for an allowed name comes.
+                s.state = NOPATH
                 return s
             }
         }
@@ -174,17 +208,22 @@ class UdpRelay(private val eng: Engine) {
         // QUIC to a host blocked for this app (by the name this app resolved for the IP): dropping it
         // is harmless even if the IP serves other sites too, browsers then retry over TCP, where
         // the name in TLS decides exactly.
-        if (!isDns && (dport == 443 || dport == 80) && DnsCache.ownNames(uid, ip).any { lab.netstrazh.data.Rules.hostBlocked(uid, it) }) {
+        if (!isDns && (dport == 443 || dport == 80) && DnsCache.ownNames(uid, ip).any { Rules.hostBlocked(uid, it) }) {
             conn.blocked = true
             conn.note = Engine.NOTE_HOST_BLOCKED
             s.state = DROP
             return s
         }
+        return if (startPath(s, uid, dstInet)) s else null
+    }
+
+    /** Sets the session's path up; false (session closed) when that is not possible. */
+    private fun startPath(s: Session, uid: Int, dstInet: InetAddress): Boolean {
         if (!eng.upstream.enabled) {
             // Direct: opening a datagram channel never blocks, so do it right here.
-            if (openPath(s, uid, dstInet, directOnly = true)) return s
+            if (openPath(s, uid, dstInet, directOnly = true)) return true
             close(s)
-            return null
+            return false
         }
         // Proxy mode: talking to the proxy can block, so set the path up on another thread.
         try {
@@ -194,9 +233,9 @@ class UdpRelay(private val eng: Engine) {
             }
         } catch (e: RejectedExecutionException) {
             close(s)
-            return null
+            return false
         }
-        return s
+        return true
     }
 
     /** Chooses and opens the path for a new session, then flushes datagrams queued meanwhile. */
@@ -427,8 +466,13 @@ class UdpRelay(private val eng: Engine) {
         const val MAX_QUEUED = 32
         const val SETUP_THREADS = 64
         const val SETUP_QUEUE = 1024
+        const val MAX_SESSIONS = 4096
+        const val MAX_UID_LOOKUPS = 4
+        const val NOTE_SOME_REFUSED = "часть запросов отклонена: адрес заблокирован"
         private const val PENDING = 0
         private const val READY = 1
         private const val DROP = 2
+        /** DNS flow whose queries so far were all refused: no path opened yet. */
+        private const val NOPATH = 3
     }
 }

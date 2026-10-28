@@ -15,13 +15,16 @@ import java.util.concurrent.TimeUnit
 /** A proxy refused or failed a request. [code] is the SOCKS5 reply code (or HTTP status), -1 if none. */
 class ProxyException(message: String, val code: Int = -1) : IOException(message)
 
+/** [withDeadline] ran out of time (the channel was closed to stop the blocked call). */
+class DeadlineException(val ms: Long, cause: Throwable?) : IOException("нет ответа за ${(ms + 999) / 1000} с", cause)
+
 /** Closes [ch] if [block] does not finish within [ms]; a blocked read then fails with an exception. */
 fun <T> withDeadline(ch: SocketChannel, ms: Long, block: () -> T): T {
-    val f: ScheduledFuture<*> = Deadline.timer.schedule({ try { ch.close() } catch (_: Exception) {} }, ms, TimeUnit.MILLISECONDS)
+    val f: ScheduledFuture<*> = Deadline.timer.schedule({ try { ch.close() } catch (_: Exception) {} }, maxOf(1L, ms), TimeUnit.MILLISECONDS)
     try {
         return block()
     } catch (e: IOException) {
-        if (!ch.isOpen && f.isDone) throw IOException("proxy timeout", e)
+        if (!ch.isOpen && f.isDone) throw DeadlineException(ms, e)
         throw e
     } finally {
         f.cancel(false)

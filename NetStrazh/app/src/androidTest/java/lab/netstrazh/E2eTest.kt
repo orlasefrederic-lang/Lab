@@ -54,7 +54,7 @@ import javax.net.ssl.HttpsURLConnection
 class E2eTest {
     /** What the engine recorded about one connection (live or from the journal). */
     data class Seen(val uid: Int, val proto: String, val host: String?, val ip: String, val port: Int,
-                    val tx: Long, val rx: Long, val blocked: Boolean, val via: String)
+                    val tx: Long, val rx: Long, val blocked: Boolean, val via: String, val ts: Long)
 
     companion object {
         private const val TAG = "NetStrazhE2E"
@@ -112,8 +112,8 @@ class E2eTest {
     }
 
     private fun seen(): List<Seen> {
-        val live = Live.active.values.map { Seen(it.uid, it.proto, it.host, it.ip, it.port, it.tx, it.rx, it.blocked, it.via) }
-        val db = Db.recent(Db.F_ALL, null, null, 1000).map { Seen(it.uid, it.proto, it.host, it.ip, it.port, it.tx, it.rx, it.blocked, it.via) }
+        val live = Live.active.values.map { Seen(it.uid, it.proto, it.host, it.ip, it.port, it.tx, it.rx, it.blocked, it.via, it.start) }
+        val db = Db.recent(Db.F_ALL, null, null, 1000).map { Seen(it.uid, it.proto, it.host, it.ip, it.port, it.tx, it.rx, it.blocked, it.via, it.ts) }
         return live + db
     }
 
@@ -351,6 +351,97 @@ class E2eTest {
         assertEquals("resolves after unblocking", 0, rcode(dnsQueryUdp(TunConfig.DNS4, "www.example.org")))
     }
 
+    private fun dnsQuery(id: Int, name: String): ByteArray {
+        val q = java.io.ByteArrayOutputStream()
+        q.write(byteArrayOf((id ushr 8).toByte(), id.toByte(), 1, 0, 0, 1, 0, 0, 0, 0, 0, 0))
+        for (l in name.split('.')) { q.write(l.length); q.write(l.toByteArray()) }
+        q.write(byteArrayOf(0, 0, 1, 0, 1))
+        return q.toByteArray()
+    }
+
+    /** One query on an already open UDP socket; the answer or null. */
+    private fun dnsOn(s: DatagramSocket, id: Int, name: String): ByteArray? {
+        val b = dnsQuery(id, name)
+        repeat(3) {
+            s.send(DatagramPacket(b, b.size))
+            val buf = ByteArray(1500)
+            val p = DatagramPacket(buf, buf.size)
+            try {
+                s.receive(p)
+                if (p.length >= 12 && buf[0] == b[0] && buf[1] == b[1]) return buf.copyOf(p.length)
+            } catch (_: java.net.SocketTimeoutException) {
+            }
+        }
+        return null
+    }
+
+    /** Host rules decide per query: a blocked name must not spoil the next query on the same socket. */
+    @Test fun t12_hostRuleIsPerQueryOnOneDnsSocket() {
+        Rules.setHostBlocked(Rules.ALL, "blocked.example.org", true)
+        try {
+            Thread.sleep(300)
+            DatagramSocket().use { s ->
+                s.soTimeout = 4000
+                s.connect(InetSocketAddress(InetAddress.getByName(TunConfig.DNS4), 53))
+                assertEquals("blocked name refused", 5, rcode(dnsOn(s, 0x6101, "www.blocked.example.org")))
+                assertEquals("allowed name on the same socket resolves", 0, rcode(dnsOn(s, 0x6102, "example.org")))
+                assertEquals("blocked again", 5, rcode(dnsOn(s, 0x6103, "blocked.example.org")))
+            }
+        } finally {
+            Rules.setHostBlocked(Rules.ALL, "blocked.example.org", false)
+        }
+    }
+
+    /** DNS over TCP to our resolver address gets the same per-query decisions as UDP. */
+    @Test fun t13_dnsOverTcpHonorsHostRules() {
+        Rules.setHostBlocked(Rules.ALL, "blocked.example.org", true)
+        try {
+            Thread.sleep(300)
+            Socket().use { s ->
+                s.connect(InetSocketAddress(InetAddress.getByName(TunConfig.DNS4), 53), 10_000)
+                s.soTimeout = 10_000
+                val o = java.io.DataOutputStream(s.getOutputStream())
+                val i = java.io.DataInputStream(s.getInputStream())
+                fun ask(id: Int, name: String): Int {
+                    val q = dnsQuery(id, name)
+                    o.writeShort(q.size); o.write(q); o.flush()
+                    val r = ByteArray(i.readUnsignedShort()).also { i.readFully(it) }
+                    assertEquals("same id", q[1], r[1])
+                    return rcode(r)
+                }
+                assertEquals("blocked name refused over TCP", 5, ask(0x6201, "tcp.blocked.example.org"))
+                assertEquals("allowed name on the same connection resolves", 0, ask(0x6202, "example.org"))
+            }
+            waitSeen("TCP DNS refusal logged") { it.proto == "DNS" && it.uid == myUid && it.host == "tcp.blocked.example.org" }
+        } finally {
+            Rules.setHostBlocked(Rules.ALL, "blocked.example.org", false)
+        }
+    }
+
+    /**
+     * A proxy app that is slow to accept (busy, or briefly frozen by the system) must still be told
+     * apart: the proxy's end of a connection waiting in the accept queue is reported as owned by
+     * root, the proxy's listening socket is not.
+     */
+    @Test fun t14_slowAcceptingProxyIsNotMistakenForRoot() {
+        val svc = FirewallService.instance!!
+        TestSocks({ svc.protect(it) }, { svc.protect(it) }, { svc.resolve(it) }, acceptDelayMs = 400).use { socks ->
+            try {
+                Prefs.proxy = ProxyConfig(ProxyType.SOCKS5, "127.0.0.1", socks.port, dnsServer = "1.1.1.1")
+                FirewallService.applyProxy()
+                waitFor(5_000, "proxy applied") { svc.upstream?.cfg?.port == socks.port }
+                assertTrue(httpGet("example.com").startsWith("HTTP/1."))
+                assertTrue("went through the slow proxy: ${socks.connects}", socks.connects.any { it.endsWith(":80") })
+                // Our own process serves this proxy, so the right answer is "not another app" (never root).
+                assertEquals("proxy owner", Upstream.UID_NONE, svc.upstream?.proxyUid)
+            } finally {
+                Prefs.proxy = ProxyConfig.OFF
+                FirewallService.applyProxy()
+                waitFor(5_000, "proxy off") { svc.upstream?.cfg?.enabled == false }
+            }
+        }
+    }
+
     /** Runs last: the user's switch off and on again, with the screens refreshing meanwhile. */
     @Test fun t20_powerSwitchOffAndOn() {
         ActivityScenario.launch(MainActivity::class.java).use { sc ->
@@ -371,6 +462,23 @@ class E2eTest {
             waitFor(25_000, "VPN running again") { FirewallService.running }
             Thread.sleep(1_000)
         }
+        // After switching back on, traffic must really go through the VPN again (an answer alone
+        // does not show that): for this app and for another one (the shell, uid 2000).
+        val t0 = System.currentTimeMillis()
+        fun diag() = "\nip rule:\n" + shell("ip rule") + "\nrecent: " + seen().take(10).joinToString("\n  ")
         assertTrue(httpGet("example.com").startsWith("HTTP/1."))
+        try {
+            waitSeen("own TCP captured after switching on") { it.proto == "TCP" && it.port == 80 && it.uid == myUid && it.ts >= t0 }
+        } catch (e: AssertionError) {
+            throw AssertionError("own traffic bypasses the VPN after switching on" + diag(), e)
+        }
+        val nc = shell("toybox nc -w 3 1.1.1.1 80")
+        if (nc.contains("not found") || nc.contains("inaccessible")) {
+            Log.w(TAG, "no toybox nc on this image: $nc")
+        } else try {
+            waitSeen("shell TCP captured after switching on") { it.proto == "TCP" && it.port == 80 && it.uid == 2000 && it.ts >= t0 }
+        } catch (e: AssertionError) {
+            throw AssertionError("another app's traffic bypasses the VPN after switching on; nc: $nc" + diag(), e)
+        }
     }
 }

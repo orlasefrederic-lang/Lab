@@ -24,6 +24,8 @@ class TestSocks(
     private val protectUdp: (DatagramSocket) -> Boolean,
     /** Resolves names sent as ATYP 3 (outside our own VPN). */
     private val resolve: (String) -> InetAddress,
+    /** Waits this long before accepting each connection, like a busy or briefly frozen proxy app. */
+    private val acceptDelayMs: Long = 0,
 ) : Closeable {
     private val lo = InetAddress.getByAddress(byteArrayOf(127, 0, 0, 1))
     private val server = ServerSocket(0, 64, lo)
@@ -35,6 +37,7 @@ class TestSocks(
     init {
         pool.execute {
             while (!server.isClosed) {
+                if (acceptDelayMs > 0) try { Thread.sleep(acceptDelayMs) } catch (_: InterruptedException) { break }
                 val c = try { server.accept() } catch (e: IOException) { break }
                 pool.execute { handle(c) }
             }

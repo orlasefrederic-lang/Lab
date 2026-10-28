@@ -160,6 +160,41 @@ class DnsPipeTest {
         ss.close()
     }
 
+    @Test fun oneDeadlineCoversOpenWriteWaitAndAnswer() {
+        // Opening takes most of the budget: the query must still end within the budget, not reuse it.
+        val ss = ServerSocket(0, 10, lo)
+        thread(isDaemon = true) { while (!ss.isClosed) try { ss.accept() } catch (e: Exception) { break } } // never answers
+        val pipe = DnsPipe { Thread.sleep(250); SocketChannel.open(InetSocketAddress(lo, ss.localPort)) }
+        val q = query(7, "slow.example")
+        var t0 = System.nanoTime()
+        try { pipe.query(q, 0, q.size, 300); fail() } catch (e: java.io.IOException) {}
+        val took = (System.nanoTime() - t0) / 1_000_000
+        assertTrue("open + answer within the budget, took $took ms", took < 450)
+        pipe.close(); ss.close()
+
+        // Another query's write holds the lock (its path does not read): a short query still ends in time.
+        val ss2 = ServerSocket()
+        ss2.receiveBufferSize = 4096
+        ss2.bind(InetSocketAddress(lo, 0), 10)
+        val held = java.util.concurrent.CopyOnWriteArrayList<java.net.Socket>()
+        thread(isDaemon = true) { while (!ss2.isClosed) held += try { ss2.accept() } catch (e: Exception) { break } }
+        val pipe2 = DnsPipe { SocketChannel.open().apply { socket().sendBufferSize = 4096; connect(InetSocketAddress(lo, ss2.localPort)) } }
+        val big = query(8, "big.example").copyOf(60_000)
+        val small = query(9, "small.example")
+        // Warm up: open the connection with a tiny query first.
+        try { pipe2.query(small, 0, small.size, 100) } catch (e: java.io.IOException) {}
+        val writer = thread { try { pipe2.query(big, 0, big.size, 1200) } catch (e: java.io.IOException) {} }
+        Thread.sleep(100) // let the big write take the lock and block
+        t0 = System.nanoTime()
+        try { pipe2.query(small, 0, small.size, 100); } catch (e: java.io.IOException) {}
+        val waited = (System.nanoTime() - t0) / 1_000_000
+        assertTrue("write wait bounded by its own deadline, took $waited ms", waited < 400)
+        writer.join(3000)
+        pipe2.close()
+        for (s in held) s.close()
+        ss2.close()
+    }
+
     @Test fun refusedAnswerHasHeaderAndQuestionOnly() {
         val plain = query(0x4242, "ads.example")
         val withOpt = plain.copyOf().also { it[11] = 1 } + byteArrayOf(0, 0, 41, 0x10, 0, 0, 0, 0, 0, 0, 0)

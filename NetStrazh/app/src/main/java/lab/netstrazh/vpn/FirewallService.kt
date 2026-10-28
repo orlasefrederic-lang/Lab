@@ -206,14 +206,23 @@ class FirewallService : VpnService(), EngineHost {
     /** Apps excluded from the VPN when the interface was established. */
     private var appliedExcluded: Set<String> = emptySet()
 
-    /** Apps kept out of the VPN: the user's exclusions, plus the proxy app when it should bypass us. */
+    /**
+     * Apps kept out of the VPN: the user's exclusions, plus the proxy app when it should bypass us.
+     * Not under "Block connections without VPN": Android then cuts every app outside the VPN, and the
+     * proxy app would lose its server; inside, its traffic still goes directly (it is recognised).
+     */
     private fun excludedNow(): Set<String> {
         val p = Prefs.proxy
-        val proxyApp = if (p.enabled && p.bypassApp && p.appPkg.isNotEmpty() && p.appPkg != packageName) setOf(p.appPkg) else emptySet()
+        lockdown = try { isLockdownEnabled } catch (_: Exception) { false }
+        val proxyApp = if (p.enabled && p.bypassApp && !lockdown && p.appPkg.isNotEmpty() && p.appPkg != packageName) setOf(p.appPkg) else emptySet()
         return Rules.excludedPackages() + proxyApp
     }
 
-    /** The proxy app's traffic still comes through us: remember it and rebuild the VPN without it. */
+    /**
+     * The proxy app's traffic still comes through us: remember it and rebuild the VPN without it.
+     * Automatically only for a known proxy client; another app that took the port is suggested in the
+     * proxy settings instead, so nothing escapes the firewall without the user saying so.
+     */
     override fun onProxyApp(uid: Int) {
         main.post {
             val p = Prefs.proxy
@@ -221,12 +230,19 @@ class FirewallService : VpnService(), EngineHost {
             val pkgs = Apps.packagesForUid(uid)
             if (pkgs.isEmpty() || p.appPkg in pkgs) return@post
             val known = ProxyApps.known.flatMap { it.packages }
-            val pkg = pkgs.firstOrNull { it in known } ?: pkgs[0]
+            val pkg = pkgs.firstOrNull { it in known }
+            if (pkg == null) {
+                suggestedProxyPkg = pkgs[0]
+                return@post
+            }
+            if (lockdown) return@post
             Log.i(Engine.TAG, "proxy served by $pkg: keeping it out of the VPN")
             Prefs.proxy = p.copy(appPkg = pkg)
             restartEngine()
         }
     }
+
+    override fun proxyAppLabel(): String? = Prefs.proxy.appPkg.takeIf { it.isNotEmpty() }?.let { Apps.labelForPackage(it) }
 
     // ------------------------------------------------------------ EngineHost
 
@@ -319,6 +335,11 @@ class FirewallService : VpnService(), EngineHost {
             private set
         @Volatile var running = false
             private set
+        /** Android's "Block connections without VPN" is on for us. */
+        @Volatile var lockdown = false
+            private set
+        /** An app (not a known proxy client) that serves the proxy port, for the user to confirm. */
+        @Volatile var suggestedProxyPkg: String? = null
 
         fun start(ctx: Context) {
             val i = Intent(ctx, FirewallService::class.java).setAction(ACTION_START)

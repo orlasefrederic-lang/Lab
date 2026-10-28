@@ -22,6 +22,8 @@ class Conn(
     @Volatile var rx = 0L
         private set
     @Volatile var end = 0L
+    /** Last time data moved either way. */
+    @Volatile var lastAt = start
     @Volatile var blocked = false
     /** [VIA_PROXY] when the traffic went through the upstream proxy. */
     @Volatile var via = ""
@@ -36,11 +38,13 @@ class Conn(
     // Each direction is written by a single thread, so plain volatile increments are safe.
     fun addTx(n: Long) {
         tx += n
+        lastAt = System.currentTimeMillis()
         Live.stat(uid).tx.addAndGet(n)
     }
 
     fun addRx(n: Long) {
         rx += n
+        lastAt = System.currentTimeMillis()
         Live.stat(uid).rx.addAndGet(n)
     }
 

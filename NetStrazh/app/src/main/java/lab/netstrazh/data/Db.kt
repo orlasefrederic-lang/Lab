@@ -111,7 +111,10 @@ class Db private constructor(ctx: Context) : SQLiteOpenHelper(ctx, "netstrazh.db
             exec.execute {
                 try {
                     val cutoff = System.currentTimeMillis() - Prefs.logDays * 86_400_000L
-                    helper.writableDatabase.delete("conn", "ts < ?", arrayOf(cutoff.toString()))
+                    val db = helper.writableDatabase
+                    db.delete("conn", "ts < ?", arrayOf(cutoff.toString()))
+                    // Also a size limit: a very chatty phone keeps only the newest rows.
+                    db.execSQL("DELETE FROM conn WHERE id <= (SELECT id FROM conn ORDER BY id DESC LIMIT 1 OFFSET $MAX_ROWS)")
                 } catch (_: Exception) {
                 }
             }
@@ -130,6 +133,8 @@ class Db private constructor(ctx: Context) : SQLiteOpenHelper(ctx, "netstrazh.db
         }
 
         const val F_ALL = 0
+        /** Journal rows kept at most (about 50 MB). */
+        const val MAX_ROWS = 300_000
         const val F_BLOCKED = 1
         const val F_DNS = 2
         const val F_CONN = 3
