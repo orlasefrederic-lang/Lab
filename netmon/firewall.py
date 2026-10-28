@@ -575,10 +575,13 @@ class FirewallManager:
                     self._uncertain.update(keys)
                     self.error = 'не удалось прочитать правила: %s' % exc
                     if action is not None:
-                        first = str(action_error) if action_error else 'Команда выполнена'
-                        self._messages.append(('error', '%s\n\nПроверить результат не удалось (%s), '
-                                                        'поэтому состояние запрета неизвестно.'
-                                                        % (first, exc)))
+                        if action_error is not None and str(action_error) == str(exc):
+                            text = 'Команда не выполнена: %s.' % exc
+                        elif action_error is not None:
+                            text = '%s\n\nПроверить результат не удалось: %s.' % (action_error, exc)
+                        else:
+                            text = 'Команда выполнена, но проверить результат не удалось: %s.' % exc
+                        self._messages.append(('error', text + '\n\nСостояние запрета неизвестно.'))
                 return
             entries = group_rules(rules)
             problem = verify(rules) if verify is not None else None

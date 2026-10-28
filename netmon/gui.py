@@ -688,6 +688,8 @@ class App:
             self.fw_tab.update()
         for kind, text in self.firewall.take_messages():
             if kind == 'error':
+                self._flash = None   # прежнее «Запрещено: …» уже не про текущее состояние
+                self._refresh_status()
                 messagebox.showerror('Брандмауэр', 'Не получилось:\n\n%s' % text, parent=self.root)
             else:
                 self._flash = (text, time.time() + 8)

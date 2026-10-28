@@ -91,7 +91,7 @@ class FirewallTab:
             iid = 'f' + '|'.join(e.key)
             self._entries[iid] = e
             if not known:
-                state, tags = 'неизвестно (не удалось прочитать правила)', ('paused',)
+                state, tags = 'неизвестно', ('paused',)   # причина — в строке над таблицей
             elif e.enabled is True:
                 state, tags = 'запрещено', ()
             elif e.enabled is False:
