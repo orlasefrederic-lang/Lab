@@ -4,8 +4,9 @@ import os
 import sys
 import time
 
-from firewall import (FirewallError, block_plan, check_blockable, directions_label, group_rules,
-                      normalize_path, stale_rule_ids, warnings_for)
+from firewall import (FirewallError, apply_block, block_plan, check_blockable, describe_state,
+                      directions_label, entry_key, group_rules, normalize_path, verify_block,
+                      verify_removed, warnings_for)
 from model import Model, display_name, group_views
 from util import RateTracker, fmt_bytes, fmt_datetime, fmt_rate, fmt_time, ip_category
 
@@ -88,8 +89,11 @@ def run_report(storage, days=None, top=30, include_lo=False, destinations=5):
             views.append(v)
     groups = sorted(group_views(views), key=lambda g: g.sent + g.recv, reverse=True)
     print('История: %s' % storage.path)
-    print('Период: %s' % ('последние %g дн. (с %s)' % (days, fmt_datetime(since)) if days
-                         else 'вся история'))
+    if days:
+        print('Программы, активные за последние %g дн. (с %s). Объёмы — за всё время '
+              'наблюдения, а не только за этот период.' % (days, fmt_datetime(since)))
+    else:
+        print('Период: вся история')
     if not groups:
         print('\nДанных нет.')
         return 0
@@ -112,41 +116,77 @@ def run_report(storage, days=None, top=30, include_lo=False, destinations=5):
     return 0
 
 
-def run_firewall_cli(backend, args):
-    """--blocked / --block / --unblock: управление запретами из консоли."""
-    services = [s for item in args.service for s in item.replace(';', ',').split(',') if s.strip()]
-    services = [s.strip() for s in services]
+def _confirm(backend, failure, verify, success_text, keys):
+    """Перечитывает правила и сообщает фактический итог команды. Возвращает код выхода."""
     try:
-        if args.block:
-            path = os.path.abspath(args.block) if os.name == 'nt' else args.block
-            error = check_blockable(path, services)
-            if error:
-                print(error)
-                return 1
-            for note in warnings_for(path, services):
-                print('Внимание:', note)
-            directions = ('out',) if args.outbound_only else ('out', 'in')
-            plan = block_plan(path, services, directions)
-            stale = stale_rule_ids(group_rules(backend.state()[0]), plan)
-            if stale:
-                backend.remove(stale)
-            backend.add(plan)
-            print('Запрещено: %s%s — %s' % (path, ' (службы: %s)' % ', '.join(services)
-                                             if services else '', directions_label(directions)))
-        if args.unblock:
-            target = normalize_path(os.path.abspath(args.unblock) if os.name == 'nt' else args.unblock)
-            wanted = {s.lower() for s in services}
+        rules, _profiles = backend.state()
+    except FirewallError as exc:
+        if failure:
+            print('Ошибка брандмауэра: %s' % failure)
+        print('Проверить результат не удалось (%s): состояние запрета неизвестно.' % exc)
+        return 1
+    problem = verify(rules)
+    if problem is None:
+        print(success_text)
+        return 0
+    print('Ошибка брандмауэра: %s' % (failure or problem))
+    print(describe_state(group_rules(rules), keys))
+    return 1
+
+
+def run_firewall_cli(backend, args):
+    """--blocked / --block / --unblock: управление запретами из консоли.
+
+    Логика та же, что в окне: новые правила создаются раньше, чем убираются старые,
+    а итог проверяется повторным чтением правил.
+    """
+    services = [s.strip() for item in args.service for s in item.replace(';', ',').split(',')
+                if s.strip()]
+    code = 0
+    if args.block:
+        path = os.path.abspath(args.block) if os.name == 'nt' else args.block
+        error = check_blockable(path, services)
+        if error:
+            print(error)
+            return 1
+        for note in warnings_for(path, services):
+            print('Внимание:', note)
+        directions = ('out',) if args.outbound_only else ('out', 'in')
+        plan, failure = block_plan(path, services, directions), None
+        try:
+            plan, _stale = apply_block(backend, path, services, directions)
+        except FirewallError as exc:
+            failure = str(exc)
+        code |= _confirm(backend, failure, lambda rules: verify_block(rules, plan),
+                         'Запрещено: %s%s — %s' % (path, ' (службы: %s)' % ', '.join(services)
+                                                   if services else '', directions_label(directions)),
+                         {entry_key(path, s) for s in services or ['']})
+    if args.unblock:
+        target = normalize_path(os.path.abspath(args.unblock) if os.name == 'nt' else args.unblock)
+        wanted = {s.lower() for s in services}
+        try:
             rules, _profiles = backend.state()
-            ids = [r.id for r in rules if normalize_path(r.program) == target
-                   and (not wanted or r.service.lower() in wanted)]
-            if not ids:
-                print('Для %s запретов в списке нет.' % args.unblock)
-                return 1
+        except FirewallError as exc:
+            print('Ошибка брандмауэра: %s' % exc)
+            return 1
+        found = [r for r in rules if normalize_path(r.program) == target
+                 and (not wanted or r.service.lower() in wanted)]
+        if not found:
+            print('Для %s запретов в списке нет.' % args.unblock)
+            return 1
+        ids = [r.id for r in found]
+        failure = None
+        try:
             backend.remove(ids)
-            print('Запрет снят: %s (правил удалено: %d)' % (args.unblock, len(ids)))
+        except FirewallError as exc:
+            failure = str(exc)
+        code |= _confirm(backend, failure, lambda rules: verify_removed(rules, ids),
+                         'Запрет снят: %s (правил удалено: %d)' % (args.unblock, len(ids)),
+                         {entry_key(r.program, r.service) for r in found})
+    try:
         rules, profiles = backend.state()
     except FirewallError as exc:
-        print('Ошибка брандмауэра: %s' % exc)
+        print('Не удалось прочитать список запретов: %s' % exc)
         return 1
     entries = group_rules(rules)
     print()
@@ -159,4 +199,4 @@ def run_firewall_cli(backend, args):
     if off:
         print('\nВнимание: брандмауэр Windows выключен для профилей: %s — запреты не действуют.'
               % ', '.join(off))
-    return 0
+    return code

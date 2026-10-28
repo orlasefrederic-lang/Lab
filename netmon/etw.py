@@ -470,7 +470,8 @@ if IS_WINDOWS:
 _ERROR_TEXT = {
     ERROR_ACCESS_DENIED: 'отказано в доступе — запустите программу от имени администратора',
     ERROR_NO_SYSTEM_RESOURCES: 'не хватает ресурсов: запущено слишком много сеансов трассировки',
-    ERROR_ALREADY_EXISTS: 'сеанс трассировки с таким именем уже существует',
+    ERROR_ALREADY_EXISTS: ('сеанс трассировки с таким именем уже существует — похоже, монитор '
+                           'запущен в другом сеансе Windows'),
     ERROR_WMI_INSTANCE_NOT_FOUND: 'сеанс трассировки не найден',
 }
 
@@ -507,9 +508,14 @@ def _make_properties(for_start):
 class EtwSession:
     """Сеанс ETW реального времени. События передаются в sink (model.Model)."""
 
-    def __init__(self, sink, name='NetActivityMonitor', dns=True, processes=True, use_filter=True):
+    def __init__(self, sink, name='NetActivityMonitor', dns=True, processes=True, use_filter=True,
+                 takeover_stale=False):
         self.sink = sink
         self.use_filter = use_filter
+        # Останавливать ли сеанс с нашим именем, если он уже есть. Безопасно, только если
+        # держим общую для компьютера блокировку (winapi.acquire_single_instance): тогда
+        # другой копии монитора нет и сеанс остался от аварийно завершённого запуска.
+        self.takeover_stale = takeover_stale
         self.name = name
         self.want_dns = dns
         self.want_processes = processes
@@ -534,9 +540,9 @@ class EtwSession:
         buf, props = _make_properties(True)
         handle = ULONG64(0)
         rc = _StartTraceW(byref(handle), self.name, props)
-        if rc == ERROR_ALREADY_EXISTS:
+        if rc == ERROR_ALREADY_EXISTS and self.takeover_stale:
             # остался сеанс от предыдущего запуска (например, после аварийного выхода)
-            log.info('останавливаю старый сеанс %s', self.name)
+            log.info('останавливаю оставшийся сеанс %s', self.name)
             sbuf, sprops = _make_properties(False)
             _ControlTraceW(0, self.name, sprops, EVENT_TRACE_CONTROL_STOP)
             buf, props = _make_properties(True)
@@ -691,10 +697,15 @@ class EtwSession:
         data = ctypes.string_at(_PTR(hdr, _O_UD)[0], layout.size)
         pid, size, daddr, saddr, dport, sport = layout.unpack(data)
         proto, what = kind
-        if what == ACCEPT:
-            self.sink.on_accept(pid, sport)
-            return
         ts = (_I64(hdr, _O_TS)[0] - FILETIME_UNIX_EPOCH) * 1e-7
+        if what == ACCEPT:
+            self.sink.on_accept(pid, sport, ts)
+            return
+        if what == RECV and proto == 'UDP':
+            # У TCP (и у отправки UDP) saddr/sport — наш сокет, daddr/dport — удалённый.
+            # У приёма UDP поля описывают сам пакет: daddr/dport — наш сокет (или группа
+            # multicast), saddr/sport — отправитель. Приводим к общему виду, как SystemInformer.
+            daddr, saddr, dport, sport = saddr, daddr, sport, dport
         self.sink.on_traffic(pid, proto, what == SEND, size, daddr, dport, saddr, sport, ts)
 
     def _decode(self, addr, hdr):

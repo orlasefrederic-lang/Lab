@@ -43,6 +43,7 @@ class Monitor:
     FLUSH_EVERY = 5.0
     STATS_EVERY = 2.0
     RDNS_EVERY = 2.0
+    LOCAL_IPS_EVERY = 60.0
 
     def __init__(self, sysinfo, storage=None, source_factory=None, rdns=True):
         """sysinfo — WinSysInfo или DemoSysInfo; source_factory(model) -> EtwSession/демо."""
@@ -119,6 +120,7 @@ class Monitor:
 
     def _loop(self):
         next_snapshot = next_flush = next_stats = next_rdns = 0.0
+        next_local = time.time() + self.LOCAL_IPS_EVERY
         while True:
             stopping = self._stop.wait(0.5)
             try:
@@ -138,6 +140,12 @@ class Monitor:
                         (self.model.want_services() and now - self._services_at >= 3)):
                     self._services_at = now
                     self.model.set_services(self.sysinfo.services())
+                if now >= next_local:
+                    # новые интерфейсы (VPN и т.п.); адреса сокетов модель узнаёт и сама
+                    next_local = now + self.LOCAL_IPS_EVERY
+                    addresses = self.sysinfo.local_addresses()
+                    with self.model.lock:
+                        self.model.local_ips |= addresses
                 if self.resolver is not None and now >= next_rdns:
                     next_rdns = now + self.RDNS_EVERY
                     self.resolver.submit(self.model.take_rdns_wanted())
@@ -160,7 +168,8 @@ class Monitor:
 
     def _fill_details(self):
         for uid, pid in self.model.pending_details(100):
-            self.model.fill_details(uid, self.sysinfo.details(pid))
+            info = self.sysinfo.details(pid)
+            self.model.fill_details(uid, info, time.time())
 
     def _flush(self):
         if self.storage is None:
@@ -169,5 +178,6 @@ class Monitor:
         try:
             self.storage.save(procs, eps, deleted)
         except Exception:
-            self.model.mark_dirty([row[0] for row in procs])
+            # всё забранное (и изменения, и удаления) вернуть в очередь до следующей попытки
+            self.model.mark_dirty([row[0] for row in procs] + [row[0] for row in eps], deleted)
             raise

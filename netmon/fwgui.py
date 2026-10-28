@@ -86,10 +86,13 @@ class FirewallTab:
     def _fill(self):
         rows = []
         self._entries = {}
+        known = self.manager.state_known
         for e in sorted(self.manager.entries, key=lambda e: (entry_title(e).lower(), e.service.lower())):
             iid = 'f' + '|'.join(e.key)
             self._entries[iid] = e
-            if e.enabled is True:
+            if not known:
+                state, tags = 'неизвестно (не удалось прочитать правила)', ('paused',)
+            elif e.enabled is True:
                 state, tags = 'запрещено', ()
             elif e.enabled is False:
                 state, tags = 'временно разрешено', ('paused',)

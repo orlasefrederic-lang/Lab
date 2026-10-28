@@ -9,6 +9,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from model import Model, group_views  # noqa: E402
+from monitor import Monitor  # noqa: E402
 from storage import Storage  # noqa: E402
 from util import RateTracker, fmt_bytes, ip_category, parse_dns_results  # noqa: E402
 from winapi import parse_tcp_table_v4, parse_tcp_table_v6  # noqa: E402
@@ -54,17 +55,35 @@ class TrafficTest(unittest.TestCase):
         self.assertEqual((ep.first, ep.last), (1000.0, 1001))
         self.assertEqual(len(p.endpoints), 2)
 
-    def test_swapped_addresses_are_fixed(self):
-        # если бы провайдер записал адреса «наоборот» — локальный адрес не станет адресатом
-        self.m.on_traffic(7, 'TCP', False, 10, v4(LOCAL), port(50000), v4('9.9.9.9'), port(443), 1.0)
+    def test_remote_address_is_never_guessed_from_local_list(self):
+        # отчёт, п. 7: адрес нового интерфейса (VPN) ещё неизвестен — направление не путается
+        self.m.on_traffic(7, 'UDP', False, 60, v4('8.8.8.8'), port(53), v4('10.8.0.2'),
+                          port(55000), 1.0)
+        self.m.on_traffic(7, 'TCP', True, 10, v4(LOCAL), port(445), v4('10.8.0.2'), port(50000), 1.0)
         self.m.process_pending()
-        self.assertIn(('TCP', '9.9.9.9', 443, False), proc_by_pid(self.m, 7).endpoints)
+        eps = proc_by_pid(self.m, 7).endpoints
+        self.assertEqual(set(eps), {('UDP', '8.8.8.8', 53, False), ('TCP', LOCAL, 445, False)})
+        self.assertIn('10.8.0.2', self.m.local_ips)          # адрес сокета запомнен как наш
+
+    def test_own_multicast_echo_is_shown_as_group(self):
+        # своё же сообщение в группу 239.255.255.250 вернулось обратно (петля multicast)
+        traffic(self.m, 8, '239.255.255.250', 3702, 3702, sent=100, proto='UDP')
+        self.m.on_traffic(8, 'UDP', False, 100, v4(LOCAL), port(3702), v4('239.255.255.250'),
+                          port(3702), 1000.0)
+        self.m.on_traffic(8, 'UDP', False, 50, v4('192.168.1.77'), port(3702),
+                          v4('239.255.255.250'), port(3702), 1000.0)
+        self.m.process_pending()
+        eps = proc_by_pid(self.m, 8).endpoints
+        group = eps[('UDP', '239.255.255.250', 3702, False)]
+        self.assertEqual((group.sent, group.recv), (100, 100))
+        self.assertEqual(eps[('UDP', '192.168.1.77', 3702, False)].recv, 50)  # ответ соседа
+        self.assertNotIn('239.255.255.250', self.m.local_ips)
 
     def test_inbound_by_listen_table_and_accept(self):
         self.m.sync_tcp([(200, 2, '0.0.0.0', 8080, '0.0.0.0', 0)], 0)
         traffic(self.m, 200, '192.168.1.77', 51515, 8080, recv=500)
         traffic(self.m, 200, '140.82.121.4', 443, 50100, sent=5)
-        self.m.on_accept(201, port(9000))
+        self.m.on_accept(201, port(9000), 1000.0)
         traffic(self.m, 201, '10.0.0.8', 60000, 9000, sent=7)
         self.m.process_pending()
         eps = proc_by_pid(self.m, 200).endpoints
@@ -186,13 +205,116 @@ class LifecycleTest(unittest.TestCase):
         self.m.sync_tcp([], 4.0)
         self.assertEqual((ep.state, ep.conns), ('', 0))
 
+    def test_details_of_new_pid_owner_do_not_touch_old_record(self):
+        # отчёт, п. 3: old.exe (PID 100) завершился, PID достался new.exe
+        self.m.on_process_start(100, 1.0, 'C:\\old.exe')
+        traffic(self.m, 100, '1.1.1.1', 443, 50000, sent=10, ts=2.0)
+        self.m.on_process_stop(100, 3.0)
+        self.m.process_pending()
+        old = proc_by_pid(self.m, 100)
+        self.assertEqual(self.m.pending_details(), [])      # завершённым подробности не нужны
+        self.m.fill_details(old.uid, {'path': 'C:\\new.exe', 'started': 4.0}, now=5.0)
+        self.assertEqual((old.name, old.path, old.started, old.ended, old.sent),
+                         ('old.exe', 'C:\\old.exe', 1.0, 3.0, 10))
+
+    def test_details_from_reused_pid_start_a_new_record(self):
+        # запись создана по снимку; до чтения подробностей PID успел смениться
+        self.m.sync_processes({7: ('app.exe', 1)}, now=100.0)
+        (uid, pid), = self.m.pending_details()
+        traffic(self.m, 7, '1.1.1.1', 443, 50000, sent=10, ts=101.0)
+        self.m.process_pending()
+        self.m.fill_details(uid, {'path': 'C:\\other.exe', 'started': 150.0}, now=151.0)
+        old = self.m.procs[uid]
+        new = proc_by_pid(self.m, 7)
+        self.assertIsNot(old, new)
+        self.assertEqual((old.name, old.path, old.sent), ('app.exe', '', 10))
+        self.assertTrue(old.ended >= 101.0)
+        self.assertEqual((new.name, new.started, new.ended, new.sent), ('other.exe', 150.0, None, 0))
+
+    def test_details_name_mismatch_without_start_time(self):
+        self.m.sync_processes({7: ('app.exe', 1)}, now=100.0)
+        (uid, pid), = self.m.pending_details()
+        self.m.fill_details(uid, {'path': '\\Device\\HarddiskVolume3\\b.exe'}, now=101.0)
+        self.assertEqual(self.m.procs[uid].name, 'app.exe')
+        self.assertEqual(proc_by_pid(self.m, 7).name, 'b.exe')
+
+    def test_accept_ports_belong_to_instance(self):
+        # отчёт, п. 5: новый процесс с тем же PID не наследует «входящие» прежнего
+        self.m.on_process_start(100, 1.0, 'C:\\old.exe')
+        self.m.on_accept(100, port(50000), 1.5)
+        self.m.on_process_stop(100, 2.0)
+        self.m.on_process_start(100, 5.0, 'C:\\new.exe')
+        traffic(self.m, 100, '8.8.8.8', 443, 50000, sent=10, ts=6.0)
+        self.m.process_pending()
+        self.assertEqual(list(proc_by_pid(self.m, 100).endpoints), [('TCP', '8.8.8.8', 443, False)])
+
+    def test_connections_reset_when_process_ends(self):
+        self.m.sync_processes({7: ('a.exe', 1)}, now=1.0)
+        self.m.sync_tcp([(7, 5, LOCAL, 50000, '1.2.3.4', 443)], 1.0)
+        self.m.on_process_stop(7, 2.0)
+        self.m.on_process_start(7, 3.0, 'C:\\b.exe')
+        self.m.process_pending()
+        self.m.sync_processes({7: ('b.exe', 1)}, now=4.0)
+        self.m.sync_tcp([], 4.0)
+        self.assertEqual(sorted((p.name, p.conns) for p in self.m.procs.values()),
+                         [('a.exe', 0), ('b.exe', 0)])
+
+    def test_late_packet_goes_to_previous_instance(self):
+        self.m.on_process_start(100, 1.0, 'C:\\old.exe')
+        self.m.on_process_stop(100, 3.0)
+        self.m.on_process_start(100, 10.0, 'C:\\new.exe')
+        traffic(self.m, 100, '1.1.1.1', 443, 50000, sent=7, ts=2.5)    # пришёл с опозданием
+        traffic(self.m, 100, '2.2.2.2', 443, 50001, sent=9, ts=11.0)
+        self.m.process_pending()
+        by_name = {p.name: p for p in self.m.procs.values()}
+        self.assertEqual((by_name['old.exe'].sent, by_name['new.exe'].sent), (7, 9))
+
+    def test_traffic_after_exit_belongs_to_new_owner(self):
+        self.m.on_process_start(100, 1.0, 'C:\\old.exe')
+        self.m.on_process_stop(100, 3.0)
+        traffic(self.m, 100, '2.2.2.2', 443, 50001, sent=9, ts=8.0)    # запуск ещё не дошёл
+        self.m.on_process_start(100, 7.9, 'C:\\new.exe')
+        self.m.process_pending()
+        by_name = {p.name: p for p in self.m.procs.values()}
+        self.assertEqual(sorted(by_name), ['new.exe', 'old.exe'])
+        self.assertEqual((by_name['old.exe'].sent, by_name['new.exe'].sent), (0, 9))
+        self.assertEqual(by_name['new.exe'].started, 7.9)
+
+    def test_stop_event_after_next_start(self):
+        self.m.on_process_start(100, 1.0, 'C:\\old.exe')
+        self.m.on_process_start(100, 10.0, 'C:\\new.exe')
+        self.m.on_process_stop(100, 9.5)     # события из разных буферов пришли не по порядку
+        self.m.process_pending()
+        by_name = {p.name: p for p in self.m.procs.values()}
+        self.assertEqual((by_name['old.exe'].ended, by_name['new.exe'].ended), (9.5, None))
+
+    def test_late_stop_does_not_end_newer_instance_without_start_time(self):
+        self.m.on_process_start(100, 1.0, 'C:\\old.exe')
+        self.m.process_pending()
+        self.m.sync_processes({100: ('new.exe', 1)}, now=12.0)   # PID уже у нового процесса
+        self.m.on_process_stop(100, 10.0)                       # запоздавшая остановка old.exe
+        self.m.process_pending()
+        by_name = {p.name: p for p in self.m.procs.values()}
+        self.assertEqual((by_name['old.exe'].ended, by_name['new.exe'].ended), (10.0, None))
+
+    def test_empty_snapshot_is_ignored(self):
+        self.m.sync_processes({7: ('a.exe', 1)}, now=1.0)
+        self.m.sync_processes({}, now=2.0)
+        self.assertIsNone(proc_by_pid(self.m, 7).ended)
+
+    def test_dead_pid_in_tcp_table_is_not_a_new_process(self):
+        self.m.sync_processes({7: ('a.exe', 1), 8: ('b.exe', 1)}, now=1.0)
+        self.m.sync_processes({8: ('b.exe', 1)}, now=2.0)
+        self.m.sync_tcp([(7, 8, LOCAL, 50000, '1.2.3.4', 443)], 2.0)     # CLOSE_WAIT мертвеца
+        self.assertEqual(len([p for p in self.m.procs.values() if p.pid == 7]), 1)
+
     def test_group_views(self):
         for pid in (10, 11):
             traffic(self.m, pid, '8.8.8.8', 443, 50000 + pid, sent=100)
         self.m.process_pending()
         for uid, p in self.m.procs.items():
             self.m.fill_details(uid, {'path': 'C:\\app.exe'})
-        self.m.on_process_stop(11, 5.0)
+        self.m.on_process_stop(11, 1001.0)
         self.m.process_pending()
         (g,) = group_views(self.m.view())
         self.assertEqual((g.count, g.running, g.sent, g.pids), (2, 1, 200, [10]))
@@ -225,7 +347,7 @@ class HistoryTest(unittest.TestCase):
         m.resolve_names = False
         m.sync_processes({50: ('app.exe', 1), 60: ('gone.exe', 1)}, now=100.0)
         for uid, p in list(m.procs.items()):
-            m.fill_details(uid, {'path': 'C:\\%s' % p.name, 'started': 90.0 + p.pid})
+            m.fill_details(uid, {'path': 'C:\\%s' % p.name, 'started': 40.0 + p.pid}, now=100.0)
         m.on_dns(50, 'example.com', '93.184.215.14', 0)
         traffic(m, 50, '93.184.215.14', 443, 50000, sent=10, recv=20, ts=101)
         traffic(m, 60, '1.1.1.1', 443, 50001, sent=1, ts=102)
@@ -239,7 +361,7 @@ class HistoryTest(unittest.TestCase):
         self.assertEqual((ep.host, ep.sent, ep.recv), ('example.com', 10, 20))
         m2.sync_processes({50: ('app.exe', 1)}, now=200.0)
         for uid, pid in m2.pending_details():
-            m2.fill_details(uid, {'path': 'C:\\app.exe', 'started': 140.0})
+            m2.fill_details(uid, {'path': 'C:\\app.exe', 'started': 90.0}, now=200.0)
         traffic(m2, 50, '93.184.215.14', 443, 50000, sent=5, ts=201)
         m2.process_pending()
         self.assertEqual(len(m2.procs), 2)                # старая запись продолжена
@@ -265,6 +387,57 @@ class HistoryTest(unittest.TestCase):
         m2.fill_details(uid, {'path': 'C:\\app.exe', 'started': 150.0})   # другое время запуска
         self.assertEqual(len(m2.procs), 2)
         self.assertEqual(m2.procs[1].ended, 101)
+
+    def test_failed_save_keeps_deletions(self):
+        # отчёт, п. 4: после сбоя записи и повторной удачной записи в БД нет лишней строки
+        m = Model()
+        m.resolve_names = False
+        m.sync_processes({50: ('app.exe', 1)}, now=100.0)
+        m.fill_details(1, {'path': 'C:\\app.exe', 'started': 90.0}, now=100.0)
+        traffic(m, 50, '1.1.1.1', 443, 50000, sent=10, ts=101.0)
+        m.process_pending()
+        self._save(m)
+        m2 = self._load()
+        m2.sync_processes({50: ('app.exe', 1)}, now=200.0)
+        traffic(m2, 50, '1.1.1.1', 443, 50000, sent=10, ts=201.0)
+        m2.process_pending()
+        self._save(m2)                                   # временная запись попала в БД
+        (uid, _pid), = m2.pending_details()
+        m2.fill_details(uid, {'path': 'C:\\app.exe', 'started': 90.0}, now=202.0)  # слияние
+
+        class Sysinfo:
+            def nt_path_to_dos(self, path):
+                return path
+
+        storage = Storage(self.path)
+        self.addCleanup(storage.close)
+        monitor = Monitor(Sysinfo(), storage, rdns=False)
+        monitor.model = m2
+        real_save, calls = storage.save, []
+
+        def flaky_save(*args):
+            calls.append(1)
+            if len(calls) == 1:
+                raise OSError('диск занят')
+            return real_save(*args)
+        storage.save = flaky_save
+        with self.assertRaises(OSError):
+            monitor._flush()
+        monitor._flush()
+        db = {r['id']: r['sent'] for r in storage.load()}
+        self.assertEqual(db, {1: 20})
+        self.assertEqual({p.uid: p.sent for p in m2.procs.values()}, db)
+
+    def test_tcp_activity_time_is_saved(self):
+        # отчёт, п. 6: тихое открытое соединение продлевает «последнюю активность» и в БД
+        m = Model()
+        m.resolve_names = False
+        m.sync_processes({7: ('a.exe', 1)}, now=100.0)
+        m.sync_tcp([(7, 5, LOCAL, 50000, '1.2.3.4', 443)], 100.0)
+        self._save(m)
+        m.sync_tcp([(7, 5, LOCAL, 50000, '1.2.3.4', 443)], 200.0)
+        self._save(m)
+        self.assertEqual(self._load().procs[1].last_seen, 200.0)
 
     def test_purge_and_clear(self):
         st = Storage(self.path)

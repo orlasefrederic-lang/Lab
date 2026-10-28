@@ -39,7 +39,8 @@ def parse_args(argv=None):
     p.add_argument('--report', action='store_true',
                    help='напечатать отчёт по сохранённой истории и выйти')
     p.add_argument('--days', type=float, default=None,
-                   help='для --report: за сколько последних дней (по умолчанию — вся история)')
+                   help='для --report: только программы, активные за столько последних дней '
+                        '(объёмы — за всё время наблюдения); по умолчанию — вся история')
     p.add_argument('--top', type=int, default=30,
                    help='для --report и --console: сколько программ показать (30)')
     p.add_argument('--db', help='файл истории (по умолчанию '
@@ -151,7 +152,8 @@ def main(argv=None):
                 log.exception('не удалось перезапуститься с правами администратора')
             log.warning('работаем без прав администратора: байты считаться не будут')
         if not winapi.acquire_single_instance():
-            return fail('Программа уже запущена.', gui_mode)
+            return fail('Монитор уже запущен — в этом или в другом сеансе Windows '
+                        '(другой пользователь, удалённый рабочий стол).', gui_mode)
         if winapi.is_admin() and not winapi.enable_debug_privilege():
             log.warning('не удалось включить SeDebugPrivilege: у части служб не будет видно пути')
         from etw import EtwSession
@@ -160,7 +162,8 @@ def main(argv=None):
         firewall_backend = WindowsFirewall()
 
         def factory(model):
-            return EtwSession(model, use_filter=not args.no_etw_filter)
+            return EtwSession(model, use_filter=not args.no_etw_filter,
+                              takeover_stale=winapi.instance_lock_global)
         rdns = not args.no_rdns
 
     storage = None

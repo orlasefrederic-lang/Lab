@@ -8,6 +8,7 @@
 
 import ntpath
 import threading
+import time
 from collections import namedtuple
 
 from util import ip_category, ip_from_bytes, parse_dns_results
@@ -21,6 +22,8 @@ TCP_LISTEN = 2
 TCP_ESTABLISHED = 5
 
 SPECIAL_NAMES = {0: 'Ядро (PID 0)', 4: 'System'}
+SLACK = 0.25          # допуск (с) при сравнении времени событий с запуском/завершением процесса
+INSTANCES_PER_PID = 4  # сколько последних экземпляров с одним PID помнить
 
 
 def _port(value):
@@ -62,7 +65,7 @@ class Proc:
     __slots__ = ('uid', 'pid', 'name', 'snap_name', 'path', 'cmdline', 'services', 'started',
                  'ended', 'first_seen', 'last_seen', 'sent', 'recv', 'lo_sent', 'lo_recv',
                  'endpoints', 'lo_eps', 'conns', 'dirty', 'dirty_eps', 'persisted',
-                 'need_details', 'absent')
+                 'need_details', 'absent', 'accept_ports')
 
     def __init__(self, uid, pid, ts):
         self.uid = uid
@@ -85,6 +88,7 @@ class Proc:
         self.persisted = False
         self.need_details = True
         self.absent = False
+        self.accept_ports = set()   # локальные порты, на которые этот экземпляр принимал TCP
 
     @property
     def has_net(self):
@@ -156,8 +160,9 @@ class Model:
         self._rdns_asked = set()
         self._ep_index = {}          # ip -> [(Proc, Endpoint)] для обновления имён
         self.listen_table = set()    # (pid, порт) — слушающие TCP-сокеты
-        self.accept_ports = set()    # (pid, порт) — по событиям «принято соединение»
         self.listen_known = False
+        self._instances = {}         # pid -> последние экземпляры с этим PID (новые в конце)
+        self._conn_uids = set()      # uid процессов с ненулевым числом открытых соединений
         self.local_ips = {'127.0.0.1', '::1'}
         self._resumable = {}         # pid -> Proc из истории, который, возможно, ещё работает
         self._deleted = []           # uid, которые нужно удалить из БД
@@ -174,7 +179,11 @@ class Model:
     # ============================================= приём событий (поток ETW)
 
     def on_traffic(self, pid, proto, send, size, daddr, dport, saddr, sport, ts):
-        """daddr/saddr — байты адреса (4 или 16), dport/sport — порт (байты или int)."""
+        """daddr/dport — удалённый адрес и порт, saddr/sport — наш сокет.
+
+        Адреса — байты (4 или 16), порты — байты в сетевом порядке или int.
+        Для приёма UDP etw.py заранее меняет местами поля пакета.
+        """
         key = (pid, proto, daddr, dport, saddr, sport)
         with self._acc_lock:
             a = self._acc.get(key)
@@ -197,8 +206,8 @@ class Model:
                 self._acc = {}
             self._queue.append(item)
 
-    def on_accept(self, pid, local_port):
-        self._push(('accept', pid, _port(local_port)))
+    def on_accept(self, pid, local_port, ts=None):
+        self._push(('accept', pid, _port(local_port), ts))
 
     def on_process_start(self, pid, ts, image):
         self._push(('start', pid, ts, image))
@@ -232,7 +241,7 @@ class Model:
                 elif kind == 'dns':
                     self._apply_dns(*item[1:])
                 elif kind == 'accept':
-                    self.accept_ports.add((item[1], item[2]))
+                    self._apply_accept(*item[1:])
         return len(items)
 
     def _ip(self, raw):
@@ -256,6 +265,9 @@ class Model:
         proc.started = started
         self.procs[proc.uid] = proc
         self.by_pid[pid] = proc
+        instances = self._instances.setdefault(pid, [])
+        instances.append(proc)
+        del instances[:-INSTANCES_PER_PID]
         if proc.name.lower() == 'svchost.exe':
             self._want_services = True
         return proc
@@ -263,7 +275,34 @@ class Model:
     def _end(self, proc, ts):
         if proc.ended is None:
             proc.ended = ts
+            proc.conns = 0
             proc.dirty = True
+
+    def _instance_at(self, pid, ts):
+        """Известный экземпляр процесса с этим PID, который жил в момент ts, или None.
+
+        События ETW из разных буферов могут прийти не по порядку: поздний пакет
+        старого процесса не должен записываться новому владельцу PID.
+        """
+        for proc in reversed(self._instances.get(pid, ())):
+            if proc.started is not None and ts < proc.started - SLACK:
+                continue
+            if proc.ended is not None and ts > proc.ended + SLACK:
+                continue
+            return proc
+        return None
+
+    def _proc_at(self, pid, ts):
+        """Экземпляр, которому принадлежит событие; при необходимости создаёт новый."""
+        proc = self._instance_at(pid, ts)
+        if proc is not None:
+            return proc
+        current = self.by_pid.get(pid)
+        if current is not None and current.ended is None:
+            return current
+        # PID свободен или его прежний владелец уже завершился: это новый процесс,
+        # о запуске которого мы ещё не знаем
+        return self._new_proc(pid, ts)
 
     def _apply_start(self, pid, ts, image):
         path = self.nt_path(image) if image else ''
@@ -285,13 +324,25 @@ class Model:
         self._new_proc(pid, ts, name=name, path=path, started=ts)
 
     def _apply_stop(self, pid, ts):
-        proc = self.by_pid.get(pid)
-        if proc is not None:
-            self._end(proc, ts)
+        # завершиться мог только экземпляр, который в момент ts уже работал
+        for proc in reversed(self._instances.get(pid, ())):
+            if proc.started is not None and proc.started > ts:
+                continue          # запущен позже этого события
+            if proc.started is None and proc.first_seen > ts + SLACK:
+                continue          # мы видели его живым уже после этого момента
+            if proc.ended is None or ts < proc.ended:
+                proc.ended = ts   # событие точнее, чем время из догадок
+                proc.conns = 0
+                proc.dirty = True
+            return
 
-    def _is_inbound(self, pid, proto, lport, rport):
+    def _apply_accept(self, pid, port, ts):
+        proc = self._proc_at(pid, time.time() if ts is None else ts)
+        proc.accept_ports.add(port)
+
+    def _is_inbound(self, proc, proto, lport, rport):
         if proto == 'TCP':
-            if (pid, lport) in self.listen_table or (pid, lport) in self.accept_ports:
+            if (proc.pid, lport) in self.listen_table or lport in proc.accept_ports:
                 return True
             if self.listen_known:
                 return False
@@ -311,7 +362,7 @@ class Model:
         return '', -1
 
     def _endpoint(self, proc, proto, rip, rport, lport, ts):
-        inbound = self._is_inbound(proc.pid, proto, lport, rport)
+        inbound = self._is_inbound(proc, proto, lport, rport)
         key = (proto, rip, lport if inbound else rport, inbound)
         ep = proc.endpoints.get(key)
         if ep is None:
@@ -330,14 +381,17 @@ class Model:
     def _apply_traffic(self, acc):
         local = self.local_ips
         for (pid, proto, daddr, dport, saddr, sport), (s, ps, r, pr, t0, t1) in acc.items():
-            proc = self.by_pid.get(pid)
-            if proc is None:
-                proc = self._new_proc(pid, t0)
+            proc = self._proc_at(pid, t0)
+            # адреса уже приведены к виду «daddr — удалённый, saddr — наш» (см. etw.py)
             rip, lip = self._ip(daddr), self._ip(saddr)
             rport, lport = _port(dport), _port(sport)
-            if rip in local and lip not in local:
-                # защита на случай, если провайдер перепутал «свой» и «чужой» адрес
-                rip, lip, rport, lport = lip, rip, lport, rport
+            lcat = ip_category(lip)
+            if lcat in ('multicast', 'broadcast'):
+                if rip in local:
+                    # наша же групповая рассылка вернулась к нам: показываем группу
+                    rip, lip, rport, lport = lip, rip, lport, rport
+            elif lcat != 'unspecified':
+                local.add(lip)               # адрес нашего сокета — значит, наш адрес
             ep = self._endpoint(proc, proto, rip, rport, lport, t0)
             ep.sent += s
             ep.recv += r
@@ -391,6 +445,8 @@ class Model:
 
     def sync_processes(self, snapshot, now):
         """snapshot: {pid: (имя exe, pid родителя)}."""
+        if not snapshot:
+            return   # пустой снимок — сбой чтения списка процессов, а не «всё завершилось»
         with self.lock:
             self.snap_names = {pid: item[0] for pid, item in snapshot.items()}
             for pid, proc in self.by_pid.items():
@@ -400,10 +456,14 @@ class Model:
             for pid, item in snapshot.items():
                 name = item[0]
                 proc = self.by_pid.get(pid)
+                # имя, в котором мы уверены: из прошлого снимка или из пути к exe
+                known = None
+                if proc is not None:
+                    known = proc.snap_name or (ntpath.basename(proc.path) if proc.path else None)
                 reused = proc is not None and (
                     (proc.ended is not None and proc.absent) or
-                    (pid not in SPECIAL_NAMES and proc.snap_name and name and
-                     proc.snap_name.lower() != name.lower()))
+                    (pid not in SPECIAL_NAMES and known and name and
+                     known.lower() != name.lower()))
                 if proc is None or reused:
                     if proc is not None:
                         self._end(proc, now)
@@ -426,19 +486,25 @@ class Model:
                     self.local_ips.add(lip)
             self.listen_table = listen
             self.listen_known = True
-            for proc in self.by_pid.values():
-                proc.conns = 0
+            for uid in self._conn_uids:
+                proc = self.procs.get(uid)
+                if proc is not None:
+                    proc.conns = 0
+            conn_uids = set()
             seen = {}
             for pid, state, lip, lport, rip, rport in rows:
                 if state == TCP_LISTEN or not pid or not rport or rip in ('0.0.0.0', '::'):
                     continue
                 proc = self.by_pid.get(pid)
-                if proc is None:
-                    proc = self._new_proc(pid, now)
+                if (proc is None or proc.ended is not None) and pid not in self.snap_names:
+                    continue   # процесса с таким PID уже нет — не заводим «призрака»
+                proc = self._proc_at(pid, now)
                 ep = self._endpoint(proc, 'TCP', rip, rport, lport, now)
                 proc.conns += 1
+                conn_uids.add(proc.uid)
                 if now > proc.last_seen:
                     proc.last_seen = now
+                    proc.dirty = True      # «последняя активность» должна попасть в историю
                 k = (proc.uid, ep.key)
                 prev = seen.get(k)
                 name = TCP_STATES.get(state, str(state))
@@ -456,6 +522,7 @@ class Model:
             for ep, name, count in seen.values():
                 ep.state, ep.conns = name, count
             self._open_eps = set(seen)
+            self._conn_uids = conn_uids
 
     def set_services(self, mapping):
         """mapping: {pid: [имена служб]}."""
@@ -476,19 +543,56 @@ class Model:
         with self.lock:
             out = []
             for proc in self.by_pid.values():
-                if proc.need_details:
-                    out.append((proc.uid, proc.pid))
-                    if len(out) >= limit:
-                        break
+                if not proc.need_details:
+                    continue
+                if proc.ended is not None:
+                    proc.need_details = False   # процесс завершён: его PID может быть уже чужим
+                    self._drop_candidate(proc.pid)
+                    continue
+                out.append((proc.uid, proc.pid))
+                if len(out) >= limit:
+                    break
             return out
 
-    def fill_details(self, uid, info):
-        """info: dict(path, started, cmdline[, exited]) или None, если процесса уже нет."""
+    def _same_instance(self, proc, info):
+        """Сведения, прочитанные по PID, относятся к этой записи, а не к новому владельцу PID?"""
+        started = info.get('started')
+        if started is not None:
+            if proc.started is not None and abs(started - proc.started) > 2.0:
+                return False
+            # процесс не мог появиться позже, чем мы впервые увидели его PID
+            return started <= proc.first_seen + 2.0
+        path = info.get('path')
+        if path and proc.snap_name and proc.pid not in SPECIAL_NAMES:
+            base = ntpath.basename(self.nt_path(path)).lower()
+            if base and base != proc.snap_name.lower():
+                return False
+        return True
+
+    def fill_details(self, uid, info, now=None):
+        """info: dict(path, started, cmdline[, exited]) или None, если процесса уже нет.
+
+        Сведения читаются по PID уже после того, как запись создана; за это время
+        процесс мог завершиться, а PID — достаться другому. Поэтому экземпляр
+        сверяется по времени создания, и чужие сведения не попадают в старую запись.
+        """
+        now = time.time() if now is None else now
         with self.lock:
             proc = self.procs.get(uid)
             if proc is None:
                 return
             proc.need_details = False
+            if self.by_pid.get(proc.pid) is not proc:
+                return
+            if proc.ended is not None:
+                self._drop_candidate(proc.pid)
+                return
+            if info is not None and not self._same_instance(proc, info):
+                # PID уже принадлежит другому процессу: прежний завершился до его запуска
+                ends = [t for t in (info.get('started'), proc.last_seen, proc.started) if t]
+                self._end(proc, max(ends) if ends else now)
+                proc = self._new_proc(proc.pid, now)
+                proc.need_details = False
             cand = self._resumable.pop(proc.pid, None)
             if info is None:
                 if cand is not None:
@@ -557,6 +661,11 @@ class Model:
                 self.procs[proc.uid] = proc
                 self._next_uid = max(self._next_uid, proc.uid + 1)
 
+    def _drop_candidate(self, pid):
+        cand = self._resumable.pop(pid, None)
+        if cand is not None:
+            self._finalize(cand)
+
     def _finalize(self, cand):
         # кандидат из истории не продолжился в текущем запуске — сохраняем время окончания
         cand.dirty = True
@@ -597,6 +706,12 @@ class Model:
             cand.dirty_eps.add(key)
         self._open_eps = {(cand.uid if uid == new.uid else uid, key)
                           for uid, key in self._open_eps}
+        if new.uid in self._conn_uids:
+            self._conn_uids.discard(new.uid)
+            self._conn_uids.add(cand.uid)
+        cand.accept_ports |= new.accept_ports
+        instances = self._instances.get(new.pid, [])
+        instances[:] = [cand if p is new else p for p in instances]
         cand.dirty = True
         self.by_pid[new.pid] = cand
         del self.procs[new.uid]
@@ -627,14 +742,16 @@ class Model:
             deleted, self._deleted = self._deleted, []
         return procs, eps, deleted
 
-    def mark_dirty(self, uids):
-        """Вернуть признак «изменён», если запись в БД не удалась."""
+    def mark_dirty(self, uids, deleted=()):
+        """Вернуть изменения и удаления в очередь, если запись в БД не удалась."""
         with self.lock:
             for uid in uids:
                 proc = self.procs.get(uid)
                 if proc is not None:
                     proc.dirty = True
                     proc.dirty_eps.update(proc.endpoints)
+            pending = set(self._deleted)
+            self._deleted.extend(uid for uid in deleted if uid not in pending)
 
     def clear(self):
         with self._acc_lock:
@@ -646,6 +763,8 @@ class Model:
             self._ep_index.clear()
             self._resumable.clear()
             self._open_eps.clear()
+            self._instances.clear()
+            self._conn_uids.clear()
             self._deleted = []
             self.total_events = 0
 

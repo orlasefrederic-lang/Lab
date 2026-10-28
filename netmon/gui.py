@@ -158,7 +158,7 @@ class App:
         self.search_entry.pack(side='left', padx=(4, 2))
         self.search_entry.bind('<Escape>', lambda e: self.var_search.set(''))
         ttk.Button(row1, text='×', width=2, command=lambda: self.var_search.set('')).pack(side='left')
-        ttk.Label(row1, text='  Активность:').pack(side='left')
+        ttk.Label(row1, text='  Показывать активные:').pack(side='left')
         period = ttk.Combobox(row1, textvariable=self.var_period, state='readonly', width=18,
                               values=[p[0] for p in PERIODS])
         period.pack(side='left', padx=4)
@@ -397,10 +397,13 @@ class App:
         self._sync_tree(self.tree, self._tree_cache, [(r[0], r[1], r[2]) for r in rows])
 
         what = 'программ' if self.var_group.get() else 'процессов'
+        # фильтр периода отбирает строки по последней активности, а байты в них — за всё время
+        period_note = ('   ·   байты — за всё время наблюдения'
+                       if self._threshold(now) else '')
         self.summary.configure(text=(
-            'В списке %s: %d   ·   отправлено %s   ·   получено %s   ·   сейчас ↑ %s  ↓ %s%s'
+            'В списке %s: %d   ·   отправлено %s   ·   получено %s   ·   сейчас ↑ %s  ↓ %s%s%s'
             % (what, len(rows), fmt_bytes(total_sent), fmt_bytes(total_recv),
-               fmt_rate(total_up) or '0 Б/с', fmt_rate(total_down) or '0 Б/с',
+               fmt_rate(total_up) or '0 Б/с', fmt_rate(total_down) or '0 Б/с', period_note,
                '   ·   идёт поиск' if searching else '')))
 
     def _firewall_status(self, path, services, pid):

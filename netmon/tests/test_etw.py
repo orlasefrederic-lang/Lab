@@ -12,6 +12,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import etw  # noqa: E402
 from etw import (DNS_CLIENT, EVENT_RECORD, KERNEL_NETWORK, KERNEL_PROCESS, Prop,  # noqa: E402
                  compile_layout, decode_payload, fallback_layout, parse_trace_event_info)
+from model import Model  # noqa: E402
 from winapi import FILETIME_UNIX_EPOCH, GUID  # noqa: E402
 
 U8, U16, U32, U64, UNICODE, ANSI, BINARY, POINTER, FILETIME = 4, 6, 8, 10, 1, 2, 14, 16, 17
@@ -229,7 +230,8 @@ class SessionCallbackTest(unittest.TestCase):
         ft = FILETIME_UNIX_EPOCH + 17_000_000_000 * 10_000_000
         self.fire(KERNEL_NETWORK, 10, tcp_payload(100, 1500, '1.2.3.4', '10.0.0.2', 443, 50000),
                   filetime=ft)
-        self.fire(KERNEL_NETWORK, 43, tcp_payload(100, 60, '8.8.8.8', '10.0.0.2', 53, 50001))
+        # приём UDP: поля описывают пакет — daddr/dport это наш сокет, saddr/sport — отправитель
+        self.fire(KERNEL_NETWORK, 43, tcp_payload(100, 60, '10.0.0.2', '8.8.8.8', 50001, 53))
         self.fire(KERNEL_NETWORK, 99, b'\x00' * 40)  # неизвестное событие игнорируется
         (name, pid, proto, send, size, daddr, dport, saddr, sport, ts), second = self.sink.calls
         self.assertEqual((name, pid, proto, send, size), ('on_traffic', 100, 'TCP', True, 1500))
@@ -237,6 +239,27 @@ class SessionCallbackTest(unittest.TestCase):
         self.assertEqual(int.from_bytes(dport, 'big'), 443)
         self.assertAlmostEqual(ts, 17_000_000_000, places=3)
         self.assertEqual(second[2:5], ('UDP', False, 60))
+        # после нормализации: удалённый — отправитель 8.8.8.8:53, наш — 10.0.0.2:50001
+        self.assertEqual(socket.inet_ntoa(second[5]), '8.8.8.8')
+        self.assertEqual(int.from_bytes(second[6], 'big'), 53)
+        self.assertEqual(socket.inet_ntoa(second[7]), '10.0.0.2')
+        self.assertEqual(int.from_bytes(second[8], 'big'), 50001)
+
+    def test_udp_reply_on_new_interface_end_to_end(self):
+        # отчёт, п. 7: VPN 10.8.0.2 появился после запуска, TCP через него нет
+        model = Model()
+        model.resolve_names = False
+        self.session.sink = model
+        info = parse_trace_event_info(build_trace_event_info(tcp_props()))
+        self.infos[(KERNEL_NETWORK, 42)] = info
+        self.infos[(KERNEL_NETWORK, 43)] = info
+        self.fire(KERNEL_NETWORK, 42, tcp_payload(300, 40, '8.8.8.8', '10.8.0.2', 53, 55000))
+        self.fire(KERNEL_NETWORK, 43, tcp_payload(300, 90, '10.8.0.2', '8.8.8.8', 55000, 53))
+        model.process_pending()
+        eps = model.by_pid[300].endpoints
+        self.assertEqual(list(eps), [('UDP', '8.8.8.8', 53, False)])
+        ep = eps[('UDP', '8.8.8.8', 53, False)]
+        self.assertEqual((ep.sent, ep.recv), (40, 90))
 
     def test_network_fallback_without_tdh(self):
         self.fire(KERNEL_NETWORK, 26, tcp_payload(5, 10, '2001:db8::1', '2001:db8::2', 443,
@@ -269,6 +292,7 @@ class SessionCallbackTest(unittest.TestCase):
         names = [c[0] for c in self.sink.calls]
         self.assertEqual(names, ['on_accept', 'on_process_start', 'on_process_stop', 'on_dns'])
         self.assertEqual(int.from_bytes(self.sink.calls[0][2], 'big'), 8080)
+        self.assertIsInstance(self.sink.calls[0][3], float)        # время события передаётся
         self.assertEqual(self.sink.calls[1][1], 777)
         self.assertEqual(self.sink.calls[1][3], r'C:\x\app.exe')
         self.assertEqual(self.sink.calls[3][1:4], (777, 'example.com', '::ffff:93.184.215.14;'))
@@ -288,6 +312,59 @@ class SessionCallbackTest(unittest.TestCase):
         rec.UserDataLength = len(payload)
         self.session._on_event(ctypes.addressof(rec))
         self.assertEqual(self.session.errors, 1)
+
+
+
+class SessionStartTest(unittest.TestCase):
+    """Запуск сеанса ETW на заглушках Windows API (отчёт, п. 8)."""
+
+    def setUp(self):
+        self.calls = []
+        self.exists = True
+        fakes = {
+            'IS_WINDOWS': True,
+            '_StartTraceW': self.fake_start,
+            '_ControlTraceW': lambda handle, name, props, code: self.calls.append(('control', code)) or 0,
+            '_EnableTraceEx2': lambda *args: 0,
+            '_OpenTraceW': lambda logfile: 7,
+            '_ProcessTrace': lambda *args: 0,
+            '_CloseTrace': lambda handle: 0,
+        }
+        for name, value in fakes.items():
+            had = hasattr(etw, name)
+            old = getattr(etw, name, None)
+            setattr(etw, name, value)
+            self.addCleanup(setattr, etw, name, old) if had else self.addCleanup(delattr, etw, name)
+
+    def fake_start(self, handle, name, props):
+        self.calls.append(('start', name))
+        if self.exists:
+            return etw.ERROR_ALREADY_EXISTS
+        handle._obj.value = 42
+        return 0
+
+    def fake_stop_existing(self, handle, name, props, code):
+        self.calls.append(('control', code))
+        self.exists = False
+        return 0
+
+    def test_existing_session_is_not_stopped_without_global_lock(self):
+        session = etw.EtwSession(None, takeover_stale=False)
+        with self.assertRaises(etw.EtwError) as ctx:
+            session.start()
+        self.assertEqual(ctx.exception.code, etw.ERROR_ALREADY_EXISTS)
+        self.assertIn('другом сеансе', str(ctx.exception))
+        self.assertEqual(self.calls, [('start', 'NetActivityMonitor')])
+
+    def test_stale_session_is_replaced_with_global_lock(self):
+        etw._ControlTraceW = self.fake_stop_existing
+        session = etw.EtwSession(None, takeover_stale=True)
+        session.start()
+        self.addCleanup(session.stop)
+        self.assertEqual(self.calls[:3], [('start', 'NetActivityMonitor'),
+                                          ('control', etw.EVENT_TRACE_CONTROL_STOP),
+                                          ('start', 'NetActivityMonitor')])
+        self.assertEqual(session._session, 42)
 
 
 if __name__ == '__main__':

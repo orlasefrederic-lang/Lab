@@ -66,7 +66,11 @@ ERROR_INVALID_PARAMETER = 87
 ERROR_INSUFFICIENT_BUFFER = 122
 ERROR_ALREADY_EXISTS = 183
 ERROR_MORE_DATA = 234
+SC_MANAGER_CONNECT = 0x0001
 SC_MANAGER_ENUMERATE_SERVICE = 0x0004
+SERVICE_QUERY_STATUS = 0x0004
+ERROR_INVALID_NAME = 123
+ERROR_SERVICE_DOES_NOT_EXIST = 1060
 SC_ENUM_PROCESS_INFO = 0
 SERVICE_WIN32 = 0x00000030
 SERVICE_ACTIVE = 0x00000001
@@ -170,6 +174,7 @@ if IS_WINDOWS:
                                     DWORD, DWORD, ctypes.c_void_p, DWORD, POINTER(DWORD),
                                     POINTER(DWORD), POINTER(DWORD), ctypes.c_wchar_p)
     _CloseServiceHandle = _proto(advapi32.CloseServiceHandle, BOOL, HANDLE)
+    _OpenServiceW = _proto(advapi32.OpenServiceW, HANDLE, HANDLE, ctypes.c_wchar_p, DWORD)
     _GetExtendedTcpTable = _proto(iphlpapi.GetExtendedTcpTable, DWORD, ctypes.c_void_p,
                                   POINTER(DWORD), BOOL, ULONG, ctypes.c_int, ULONG)
     _ShellExecuteW = _proto(shell32.ShellExecuteW, HANDLE, HANDLE, ctypes.c_wchar_p,
@@ -203,21 +208,29 @@ def relaunch_as_admin():
 
 
 _instance_mutex = None
+instance_lock_global = False   # держим блокировку, общую для всех сеансов Windows
 
 
-def acquire_single_instance(name='Local\\NetActivityMonitor.SingleInstance'):
-    """False, если программа уже запущена (два экземпляра мешали бы друг другу)."""
-    global _instance_mutex
+def acquire_single_instance(name='Global\\NetActivityMonitor.SingleInstance'):
+    """False, если монитор уже запущен — в этом или в другом сеансе Windows.
+
+    Имя сеанса ETW одно на весь компьютер, поэтому и блокировка общая (Global\\),
+    а не на сеанс пользователя: иначе копия, запущенная через удалённый рабочий
+    стол или другим пользователем, остановила бы сеанс ETW первой.
+    """
+    global _instance_mutex, instance_lock_global
     if not IS_WINDOWS:
         return True
     handle = _CreateMutexW(None, False, name)
     err = ctypes.get_last_error()
     if not handle:
-        return True
+        # мьютекс уже создан другой копией, к которой у нас нет доступа
+        return err != ERROR_ACCESS_DENIED
     if err == ERROR_ALREADY_EXISTS:
         _CloseHandle(handle)
         return False
     _instance_mutex = handle
+    instance_lock_global = True
     return True
 
 
@@ -374,6 +387,25 @@ def services_by_pid():
     finally:
         _CloseServiceHandle(scm)
     return result
+
+
+def service_exists(name):
+    """True — служба с таким коротким именем есть, False — нет, None — проверить не удалось."""
+    if not IS_WINDOWS:
+        return None
+    scm = _OpenSCManagerW(None, None, SC_MANAGER_CONNECT)
+    if not scm:
+        return None
+    try:
+        handle = _OpenServiceW(scm, name, SERVICE_QUERY_STATUS)
+        if handle:
+            _CloseServiceHandle(handle)
+            return True
+        if ctypes.get_last_error() in (ERROR_SERVICE_DOES_NOT_EXIST, ERROR_INVALID_NAME):
+            return False
+        return None   # например, нет доступа: служба, скорее всего, существует
+    finally:
+        _CloseServiceHandle(scm)
 
 
 # ------------------------------------------------------------ TCP-соединения

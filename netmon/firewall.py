@@ -107,6 +107,32 @@ def stale_rule_ids(entries, plan):
     return [i for e in entries if e.key in keys for i in e.rule_ids if i not in new_ids]
 
 
+RESERVED_SERVICE_NAMES = {'any', '*', 'all'}
+_SERVICE_NAME_RE = re.compile(r'^[^\\/\s,;]{1,256}$')
+
+
+def service_exists(name):
+    """True/False — есть ли служба с таким коротким именем; None, если проверить нельзя."""
+    if sys.platform != 'win32':
+        return None
+    from winapi import service_exists as check
+    return check(name)
+
+
+def check_services(services):
+    """Текст ошибки для недопустимых имён служб, иначе None."""
+    for service in services:
+        if service.lower() in RESERVED_SERVICE_NAMES:
+            return ('«%s» — не имя службы: в правилах брандмауэра это значит «все службы». '
+                    'Укажите короткое имя конкретной службы, например wuauserv.' % service)
+        if not _SERVICE_NAME_RE.match(service):
+            return ('Недопустимое имя службы «%s». Нужно короткое имя (как в столбце «Имя» '
+                    'оснастки services.msc), например wuauserv.' % service)
+        if service_exists(service) is False:
+            return 'Служба «%s» в Windows не найдена. Проверьте короткое имя службы.' % service
+    return None
+
+
 def check_blockable(program, services, pid=None):
     """Текст ошибки, если такую программу запрещать нельзя, иначе None."""
     if pid in (0, 4) or (program or '').strip().lower() == 'system':
@@ -119,7 +145,7 @@ def check_blockable(program, services, pid=None):
     if ntpath.basename(normalize_path(program)) == 'svchost.exe' and not services:
         return ('svchost.exe — общий процесс для служб Windows. Запрет его целиком отрежет от '
                 'сети почти всю систему. Укажите, каким службам запретить сеть.')
-    return None
+    return check_services(services)
 
 
 def warnings_for(program, services):
@@ -163,6 +189,80 @@ def group_rules(rules):
     return entries
 
 
+def apply_block(backend, program, services=(), directions=('out', 'in')):
+    """Создаёт или обновляет правила запрета, а лишние правила этой программы удаляет
+    последними. Если что-то пойдёт не так, прежний запрет останется в силе.
+
+    Возвращает (план, id удалённых лишних правил).
+    """
+    error = check_blockable(program, services)
+    if error:
+        raise FirewallError(error)
+    plan = block_plan(program, services, directions)
+    stale = stale_rule_ids(group_rules(backend.state()[0]), plan)
+    backend.add(plan)
+    if stale:
+        backend.remove(stale)
+    return plan, stale
+
+
+def _rule_matches(rule, item):
+    return (rule is not None and rule.enabled
+            and rule.direction == _FROM_PS_DIRECTION.get(item['direction'])
+            and normalize_path(rule.program) == normalize_path(item['program'])
+            and (rule.service or '').lower() == (item['service'] or '').lower())
+
+
+def verify_block(rules, plan):
+    """Проверка по фактически прочитанным правилам: все правила плана есть и включены,
+    а других правил для этих программ (служб) нет. None — всё так, иначе текст проблемы."""
+    by_id = {r.id: r for r in rules}
+    keys = {entry_key(item['program'], item['service']) for item in plan}
+    ids = {item['id'] for item in plan}
+    missing = [item for item in plan if not _rule_matches(by_id.get(item['id']), item)]
+    left = [r.id for r in rules if r.id not in ids and entry_key(r.program, r.service) in keys]
+    problems = []
+    if missing:
+        problems.append('Брандмауэр не подтвердил запрет: %s.' % ', '.join(
+            '%s — %s' % (_plan_title(item), directions_label((_FROM_PS_DIRECTION[item['direction']],)))
+            for item in missing))
+    if left:
+        problems.append('Не удалось убрать прежние правила (их осталось %d).' % len(left))
+    return ' '.join(problems) or None
+
+
+def verify_removed(rules, ids):
+    left = {r.id for r in rules} & set(ids)
+    if left:
+        return 'Правила не удалены (осталось %d): запрет всё ещё действует.' % len(left)
+    return None
+
+
+def verify_enabled(rules, ids, enabled):
+    by_id = {r.id: r for r in rules}
+    wrong = [i for i in ids if i in by_id and by_id[i].enabled != bool(enabled)]
+    if wrong:
+        return 'Брандмауэр не подтвердил изменение (правил: %d).' % len(wrong)
+    return None
+
+
+def describe_state(entries, keys):
+    """Как сейчас обстоят дела с запретом для указанных пар (программа, служба)."""
+    found = [e for e in entries if e.key in keys]
+    if not found:
+        return 'Сейчас запрета нет.'
+    parts = []
+    for e in found:
+        state = {True: 'действует', False: 'выключен'}.get(e.enabled, 'действует частично')
+        parts.append('%s — %s, %s' % (_entry_title(e), directions_label(e.directions), state))
+    return 'Сейчас запрет: %s.' % '; '.join(parts)
+
+
+def _plan_title(item):
+    name = ntpath.basename(item['program']) or item['program']
+    return '%s (%s)' % (name, item['service']) if item['service'] else name
+
+
 def directions_label(directions):
     if set(directions) == {'out', 'in'}:
         return 'исходящие и входящие'
@@ -195,8 +295,8 @@ _LIST_BODY = r"""
     $rules = New-Object System.Collections.Generic.List[object]
     foreach ($r in @(Get-NetFirewallRule -Group '%GROUP%' -ErrorAction SilentlyContinue)) {
         if ($null -eq $r) { continue }
-        $app = Get-NetFirewallApplicationFilter -AssociatedNetFirewallRule $r
-        $svc = Get-NetFirewallServiceFilter -AssociatedNetFirewallRule $r
+        $app = Get-NetFirewallApplicationFilter -AssociatedNetFirewallRule $r -ErrorAction Stop
+        $svc = Get-NetFirewallServiceFilter -AssociatedNetFirewallRule $r -ErrorAction Stop
         $rules.Add([pscustomobject]@{
             id = [string]$r.Name; name = [string]$r.DisplayName
             direction = [string]$r.Direction; action = [string]$r.Action
@@ -204,32 +304,60 @@ _LIST_BODY = r"""
             program = [string]$app.Program; service = [string]$svc.Service })
     }
     $profiles = New-Object System.Collections.Generic.List[object]
-    foreach ($p in @(Get-NetFirewallProfile -PolicyStore ActiveStore)) {
+    foreach ($p in @(Get-NetFirewallProfile -PolicyStore ActiveStore -ErrorAction Stop)) {
         $profiles.Add([pscustomobject]@{ name = [string]$p.Name; enabled = ([string]$p.Enabled -ne 'False') })
     }
     Send-Result ([pscustomobject]@{ rules = $rules.ToArray(); profiles = $profiles.ToArray() })
 """
 
+# Существующее правило обновляется на месте, новое создаётся; ничего не удаляется,
+# поэтому ошибка посередине не снимает прежний запрет.
 _ADD_BODY = r"""
     foreach ($i in @($data)) {
-        Remove-NetFirewallRule -Name $i.id -ErrorAction SilentlyContinue
-        $params = @{ Name = $i.id; DisplayName = $i.name; Group = '%GROUP%'
-                     Description = $i.description; Direction = $i.direction; Action = 'Block'
-                     Program = $i.program; Profile = 'Any'; Enabled = 'True' }
-        if ($i.service) { $params['Service'] = $i.service }
-        New-NetFirewallRule @params | Out-Null
+        if ([string]::IsNullOrWhiteSpace([string]$i.program)) { throw 'не указан путь к программе' }
+        if ($i.service -and (@('any', '*', 'all') -contains ([string]$i.service).ToLowerInvariant())) {
+            throw ('недопустимое имя службы: ' + $i.service)
+        }
+        $existing = @(Get-NetFirewallRule -Name $i.id -ErrorAction SilentlyContinue | Where-Object { $null -ne $_ })
+        if ($existing.Count -gt 0) {
+            Set-NetFirewallRule -Name $i.id -Direction $i.direction -Action Block -Profile Any -Enabled True -ErrorAction Stop
+            $app = Get-NetFirewallApplicationFilter -AssociatedNetFirewallRule $existing[0] -ErrorAction Stop
+            if ([string]$app.Program -ne [string]$i.program) {
+                $app | Set-NetFirewallApplicationFilter -Program $i.program -ErrorAction Stop
+            }
+            $wantService = if ($i.service) { [string]$i.service } else { 'Any' }
+            $svc = Get-NetFirewallServiceFilter -AssociatedNetFirewallRule $existing[0] -ErrorAction Stop
+            if ([string]$svc.Service -ne $wantService) {
+                $svc | Set-NetFirewallServiceFilter -Service $wantService -ErrorAction Stop
+            }
+        } else {
+            $params = @{ Name = $i.id; DisplayName = $i.name; Group = '%GROUP%'
+                         Description = $i.description; Direction = $i.direction; Action = 'Block'
+                         Program = $i.program; Profile = 'Any'; Enabled = 'True' }
+            if ($i.service) { $params['Service'] = $i.service }
+            New-NetFirewallRule @params -ErrorAction Stop | Out-Null
+        }
     }
     Send-Result $true
 """
 
+# Отсутствующее правило пропускается; любая другая ошибка удаления прерывает скрипт.
 _REMOVE_BODY = r"""
-    foreach ($id in @($data)) { Remove-NetFirewallRule -Name $id -ErrorAction SilentlyContinue }
+    foreach ($id in @($data)) {
+        $found = @(Get-NetFirewallRule -Name $id -ErrorAction SilentlyContinue | Where-Object { $null -ne $_ })
+        if ($found.Count -eq 0) { continue }
+        Remove-NetFirewallRule -Name $id -ErrorAction Stop
+    }
     Send-Result $true
 """
 
 _ENABLE_BODY = r"""
     $state = if ($data.enabled) { 'True' } else { 'False' }
-    foreach ($id in @($data.ids)) { Set-NetFirewallRule -Name $id -Enabled $state }
+    foreach ($id in @($data.ids)) {
+        $found = @(Get-NetFirewallRule -Name $id -ErrorAction SilentlyContinue | Where-Object { $null -ne $_ })
+        if ($found.Count -eq 0) { continue }
+        Set-NetFirewallRule -Name $id -Enabled $state -ErrorAction Stop
+    }
     Send-Result $true
 """
 
@@ -381,65 +509,96 @@ class FirewallManager:
         self._pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix='firewall')
         self.entries = []
         self.profiles = []
-        self.loaded = False
+        self.loaded = False        # правила хоть раз прочитаны
+        self.state_known = False   # кэш совпадает с последним успешным чтением
         self.busy = 0
         self.version = 0
         self.error = ''
         self._index = {}
+        self._uncertain = set()    # (программа, служба), состояние которых сейчас неизвестно
         self._messages = []
 
     # ---- команды (выполняются в фоне, после каждой список перечитывается)
 
     def refresh(self):
-        return self._submit(None, None)
+        return self._submit(None, None, None, ())
 
     def block(self, program, services=(), directions=('out', 'in')):
-        plan = block_plan(program, services, directions)
+        services, directions = list(services), tuple(directions)
         what = ntpath.basename(program) + (' (службы: %s)' % ', '.join(services) if services else '')
+        result = {}
 
         def action():
-            stale = stale_rule_ids(group_rules(self.backend.state()[0]), plan)
-            if stale:
-                self.backend.remove(stale)
-            self.backend.add(plan)
-        return self._submit(action, 'Запрещено: %s — %s' % (what, directions_label(tuple(directions))))
+            result['plan'], result['stale'] = apply_block(self.backend, program, services, directions)
+
+        def verify(rules):
+            return verify_block(rules, result.get('plan') or block_plan(program, services, directions))
+        keys = {entry_key(program, s) for s in services or ['']}
+        return self._submit(action, 'Запрещено: %s — %s' % (what, directions_label(directions)),
+                            verify, keys)
 
     def unblock(self, entries):
         ids = [i for e in entries for i in e.rule_ids]
         names = ', '.join(_entry_title(e) for e in entries)
-        return self._submit(lambda: self.backend.remove(ids), 'Убрано из списка: %s' % names)
+        return self._submit(lambda: self.backend.remove(ids), 'Убрано из списка: %s' % names,
+                            lambda rules: verify_removed(rules, ids), {e.key for e in entries})
 
     def set_enabled(self, entries, enabled):
         ids = [i for e in entries for i in e.rule_ids]
         names = ', '.join(_entry_title(e) for e in entries)
         text = ('Снова запрещено: %s' if enabled else 'Временно разрешено: %s') % names
-        return self._submit(lambda: self.backend.set_enabled(ids, enabled), text)
+        return self._submit(lambda: self.backend.set_enabled(ids, enabled), text,
+                            lambda rules: verify_enabled(rules, ids, enabled),
+                            {e.key for e in entries})
 
-    def _submit(self, action, success_text):
+    def _submit(self, action, success_text, verify, keys):
         with self._lock:
             self.busy += 1
-        return self._pool.submit(self._run, action, success_text)
+        return self._pool.submit(self._run, action, success_text, verify, set(keys))
 
-    def _run(self, action, success_text):
+    def _run(self, action, success_text, verify, keys):
+        """Выполняет команду и ВСЕГДА перечитывает правила: показывается то, что есть на деле."""
         try:
+            action_error = None
             if action is not None:
-                action()
-            rules, profiles = self.backend.state()
+                try:
+                    action()
+                except Exception as exc:
+                    action_error = exc
+                    log.warning('команда брандмауэра не выполнена: %s', exc)
+            try:
+                rules, profiles = self.backend.state()
+            except Exception as exc:
+                log.exception('не удалось прочитать правила брандмауэра')
+                with self._lock:
+                    self.state_known = False
+                    self._uncertain.update(keys)
+                    self.error = 'не удалось прочитать правила: %s' % exc
+                    if action is not None:
+                        first = str(action_error) if action_error else 'Команда выполнена'
+                        self._messages.append(('error', '%s\n\nПроверить результат не удалось (%s), '
+                                                        'поэтому состояние запрета неизвестно.'
+                                                        % (first, exc)))
+                return
             entries = group_rules(rules)
+            problem = verify(rules) if verify is not None else None
             with self._lock:
                 self.entries = entries
                 self.profiles = profiles
                 self._index = {e.key: e for e in entries}
                 self.loaded = True
+                self.state_known = True
+                self._uncertain.clear()
                 self.error = ''
-                if success_text:
+                if action is None:
+                    return
+                if problem is None:
+                    if action_error is not None:
+                        log.info('команда сообщила об ошибке, но правила в нужном состоянии')
                     self._messages.append(('info', success_text))
-        except Exception as exc:
-            log.exception('ошибка брандмауэра')
-            with self._lock:
-                self.error = str(exc)
-                if action is not None:
-                    self._messages.append(('error', str(exc)))
+                else:
+                    text = str(action_error) if action_error is not None else problem
+                    self._messages.append(('error', '%s\n\n%s' % (text, describe_state(entries, keys))))
         finally:
             with self._lock:
                 self.busy -= 1
@@ -463,12 +622,17 @@ class FirewallManager:
             return [name for name, enabled in self.profiles if not enabled]
 
     def status(self, program, services_text=''):
-        """('blocked' | 'partial' | 'allowed' | '', подпись) для строки таблицы процессов."""
+        """('blocked' | 'partial' | 'allowed' | 'unknown' | '', подпись) для таблицы процессов."""
         if not program:
             return '', ''
         with self._lock:
             index = self._index
+            known = self.state_known
+            uncertain = set(self._uncertain)
         path = normalize_path(program)
+        keys = {(path, '')} | {(path, s.lower()) for s in split_services(services_text)}
+        if keys & uncertain or (not known and any(k in index for k in keys)):
+            return 'unknown', 'неизвестно'
         whole = index.get((path, ''))
         if whole is not None:
             if whole.enabled is True:
