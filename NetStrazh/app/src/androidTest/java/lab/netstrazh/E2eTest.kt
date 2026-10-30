@@ -499,6 +499,22 @@ class E2eTest {
     }
 
     /**
+     * Rebuilding the interface while it runs (rule or IPv6 changes, and the capture check's repair)
+     * closes the old interface right after the new one is up. Android then destroys every socket on
+     * the VPN address; the engine's server socket must survive that, and traffic must keep flowing.
+     */
+    @Test fun t17_rebuildingTheInterfaceKeepsTrafficFlowing() {
+        for (round in 1..3) {
+            val t0 = System.currentTimeMillis()
+            FirewallService.reconfigure()
+            waitFor(15_000, "rebuilt interface verified (round $round)") { FirewallService.captureVerifiedAt >= t0 }
+            val t1 = System.currentTimeMillis()
+            assertTrue("TCP after rebuilding (round $round)", httpGet("example.com").startsWith("HTTP/1."))
+            waitSeen("TCP captured after rebuilding (round $round)") { it.proto == "TCP" && it.port == 80 && it.uid == myUid && it.ts >= t1 }
+        }
+    }
+
+    /**
      * Runs last: the user's switch off and on again, three times. After every start, traffic must
      * really go through the VPN (an answer alone does not show that): the capture probe, this app's
      * TCP and UDP, and another app's TCP (the shell, uid 2000) are all checked, and every failure is
