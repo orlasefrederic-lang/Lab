@@ -508,7 +508,7 @@ class E2eTest {
         val problems = ArrayList<String>()
         fun diag() = "\nip rule:\n" + shell("ip rule") + "\nrecent: " + seen().take(10).joinToString("\n  ")
         fun check(what: String, block: () -> Unit) {
-            try { block() } catch (e: AssertionError) { problems += "$what: ${e.message}" }
+            try { block() } catch (e: AssertionError) { problems += "$what: ${e.message}" } catch (e: Exception) { problems += "$what: $e" }
         }
         for (cycle in 1..3) {
             ActivityScenario.launch(MainActivity::class.java).use { sc ->

@@ -89,8 +89,8 @@ class Engine(val host: EngineHost, private val pfd: ParcelFileDescriptor, val cf
     val nat = NatTable()
     val upstream = Upstream(host)
     private val wake: Array<FileDescriptor> = Os.pipe()
-    private var tcp4: ServerSocketChannel? = null
-    private var tcp6: ServerSocketChannel? = null
+    @Volatile private var tcp4: ServerSocketChannel? = null
+    @Volatile private var tcp6: ServerSocketChannel? = null
     @Volatile private var port4 = -1
     @Volatile private var port6 = -1
     private val udp = UdpRelay(this)
@@ -107,12 +107,12 @@ class Engine(val host: EngineHost, private val pfd: ParcelFileDescriptor, val cf
 
     fun start() {
         running = true
-        val s4 = bindServer(InetAddress.getByAddress(cfg.t4))
+        val s4 = bindServer(false)
         tcp4 = s4
         port4 = s4.socket().localPort
         if (cfg.v6) {
             try {
-                val s6 = bindServer(InetAddress.getByAddress(cfg.t6))
+                val s6 = bindServer(true)
                 tcp6 = s6
                 port6 = s6.socket().localPort
             } catch (e: Exception) {
@@ -121,8 +121,8 @@ class Engine(val host: EngineHost, private val pfd: ParcelFileDescriptor, val cf
         }
         udp.start()
         threads += thread(name = "ns-tun", isDaemon = true) { readLoop() }
-        threads += thread(name = "ns-accept4", isDaemon = true) { acceptLoop(s4) }
-        tcp6?.let { s6 -> threads += thread(name = "ns-accept6", isDaemon = true) { acceptLoop(s6) } }
+        threads += thread(name = "ns-accept4", isDaemon = true) { acceptLoop(false) }
+        if (tcp6 != null) threads += thread(name = "ns-accept6", isDaemon = true) { acceptLoop(true) }
         house.scheduleWithFixedDelay({ housekeeping() }, 5, 5, TimeUnit.SECONDS)
         // Learn the proxy app early, so its first lookups after a (re)start go directly.
         if (upstream.enabled) house.execute { upstream.ensureProxyUid() }
@@ -153,13 +153,22 @@ class Engine(val host: EngineHost, private val pfd: ParcelFileDescriptor, val cf
         nat.clear()
     }
 
-    private fun bindServer(addr: InetAddress): ServerSocketChannel {
+    /**
+     * The local server socket that NAT-ed connections end on. It listens on the wildcard address, not
+     * on the interface address: Android destroys every socket bound to an address when that address
+     * goes away, and Android 10 removes and re-adds the VPN address while establishing the interface
+     * (setting its netmask). A listener on 10.111.0.1 bound in that moment was destroyed, and every
+     * app then got "connection refused". Connections that do not come from our NAT are closed at
+     * accept (see [acceptLoop]).
+     */
+    private fun bindServer(v6: Boolean): ServerSocketChannel {
+        val any = InetAddress.getByAddress(ByteArray(if (v6) 16 else 4))
         var last: Exception? = null
         repeat(12) {
             val ch = ServerSocketChannel.open()
             try {
                 ch.socket().reuseAddress = true
-                ch.bind(InetSocketAddress(addr, 0), 1024)
+                ch.bind(InetSocketAddress(any, 0), 1024)
                 return ch
             } catch (e: Exception) {
                 last = e
@@ -277,12 +286,27 @@ class Engine(val host: EngineHost, private val pfd: ParcelFileDescriptor, val cf
         write(p.buf, p.len)
     }
 
-    private fun acceptLoop(ss: ServerSocketChannel) {
+    private fun acceptLoop(v6: Boolean) {
+        var ss = (if (v6) tcp6 else tcp4) ?: return
+        var errors = 0
         while (running) {
             val ch: SocketChannel = try {
-                ss.accept() ?: continue
+                (ss.accept() ?: continue).also { errors = 0 }
             } catch (e: Exception) {
                 if (!running) break
+                // A listener the system destroyed fails every accept: replace it, new flows use the new port.
+                if (++errors >= 3) {
+                    try {
+                        val fresh = bindServer(v6)
+                        closeQuietly(ss)
+                        ss = fresh
+                        if (v6) { tcp6 = fresh; port6 = fresh.socket().localPort } else { tcp4 = fresh; port4 = fresh.socket().localPort }
+                        if (!running) closeQuietly(fresh)
+                        Log.w(TAG, "server socket replaced after accept errors: $e")
+                        errors = 0
+                    } catch (_: Exception) {
+                    }
+                }
                 Thread.sleep(50)
                 continue
             }
