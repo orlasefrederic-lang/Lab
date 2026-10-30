@@ -26,6 +26,8 @@ class TestSocks(
     private val resolve: (String) -> InetAddress,
     /** Waits this long before accepting each connection, like a busy or briefly frozen proxy app. */
     private val acceptDelayMs: Long = 0,
+    /** Answers CONNECT only after this long, like a proxy that first reaches a slow server (Tor). */
+    private val connectReplyDelayMs: Long = 0,
 ) : Closeable {
     private val lo = InetAddress.getByAddress(byteArrayOf(127, 0, 0, 1))
     private val server = ServerSocket(0, 64, lo)
@@ -73,6 +75,7 @@ class TestSocks(
                     try {
                         protectTcp(out.socket())
                         out.socket().connect(InetSocketAddress(target, port), 10_000)
+                        if (connectReplyDelayMs > 0) Thread.sleep(connectReplyDelayMs)
                         o.write(byteArrayOf(5, 0, 0, 1, 0, 0, 0, 0, 0, 0))
                         // Channel I/O on the upstream side: the stream adaptors of a SocketChannel share
                         // one lock, so a blocked read would stall the write in the other direction.

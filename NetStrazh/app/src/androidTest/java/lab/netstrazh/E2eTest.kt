@@ -442,43 +442,116 @@ class E2eTest {
         }
     }
 
-    /** Runs last: the user's switch off and on again, with the screens refreshing meanwhile. */
-    @Test fun t20_powerSwitchOffAndOn() {
-        ActivityScenario.launch(MainActivity::class.java).use { sc ->
-            sc.onActivity { it.onPowerToggle(false) }
-            waitFor(10_000, "VPN stopped") { !FirewallService.running }
-            // Our own VPN network lingers for a moment after stopping: it is not "another VPN",
-            // and checking that must work on every API level (the header asks it right away).
-            val end = SystemClock.uptimeMillis() + 2_000
-            while (SystemClock.uptimeMillis() < end) {
-                assertFalse("own VPN network taken for another VPN", FirewallService.otherVpnActive(ctx))
-                Thread.sleep(100)
+    /** "Block DNS too" switched on and off while a DNS socket stays open: each next query follows. */
+    @Test fun t15_dnsPolicyChangeAppliesToAnOpenSocket() {
+        Rules.setHostBlocked(Rules.ALL, "blocked.example.org", true)
+        try {
+            Thread.sleep(300)
+            DatagramSocket().use { s ->
+                s.soTimeout = 4000
+                s.connect(InetSocketAddress(InetAddress.getByName(TunConfig.DNS4), 53))
+                // A refused first query leaves the flow open without a path.
+                assertEquals(5, rcode(dnsOn(s, 0x6401, "x.blocked.example.org")))
+                Rules.set(ctx.packageName, Rules.BLOCK_ALL)
+                Rules.setBlockDns(true)
+                Thread.sleep(300)
+                assertEquals("blocked together with the app, on the same socket", 5, rcode(dnsOn(s, 0x6402, "example.org")))
+                Rules.setBlockDns(false)
+                Rules.set(ctx.packageName, 0)
+                Thread.sleep(300)
+                assertEquals("allowed again on the same socket", 0, rcode(dnsOn(s, 0x6403, "example.org")))
             }
-            Thread.sleep(1_000) // header refresh while off
+        } finally {
+            Rules.setBlockDns(false)
+            Rules.set(ctx.packageName, 0)
+            Rules.setHostBlocked(Rules.ALL, "blocked.example.org", false)
         }
-        ActivityScenario.launch(SettingsActivity::class.java).use { Thread.sleep(1500) }
-        ActivityScenario.launch(MainActivity::class.java).use { sc ->
-            sc.onActivity { it.onPowerToggle(true) }
-            waitFor(25_000, "VPN running again") { FirewallService.running }
-            Thread.sleep(1_000)
+    }
+
+    /**
+     * A proxy that greets at once but answers CONNECT only once it reached the server (Tor and the
+     * like can take many seconds) works, and is not reported as a frozen proxy app.
+     */
+    @Test fun t16_slowConnectReplyIsNotAFrozenProxy() {
+        val svc = FirewallService.instance!!
+        TestSocks({ svc.protect(it) }, { svc.protect(it) }, { svc.resolve(it) }, connectReplyDelayMs = 7_500).use { socks ->
+            try {
+                Prefs.proxy = ProxyConfig(ProxyType.SOCKS5, "127.0.0.1", socks.port, dnsViaProxy = false)
+                FirewallService.applyProxy()
+                waitFor(5_000, "proxy applied") { svc.upstream?.cfg?.port == socks.port }
+                val t0 = SystemClock.uptimeMillis()
+                Socket().use { s ->
+                    s.soTimeout = 20_000
+                    s.connect(InetSocketAddress(InetAddress.getByName("example.com"), 80), 20_000)
+                    s.getOutputStream().write("GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n".toByteArray())
+                    val head = s.getInputStream().readBytes().toString(Charsets.ISO_8859_1)
+                    assertTrue(head.take(80), head.startsWith("HTTP/1."))
+                }
+                assertTrue("the reply really waited", SystemClock.uptimeMillis() - t0 >= 7_000)
+                val silent = svc.upstream!!.recentEvents().filter { it.msg.contains("не отвечает") }
+                assertTrue("no frozen-proxy report: $silent", silent.isEmpty())
+            } finally {
+                Prefs.proxy = ProxyConfig.OFF
+                FirewallService.applyProxy()
+                waitFor(5_000, "proxy off") { svc.upstream?.cfg?.enabled == false }
+            }
         }
-        // After switching back on, traffic must really go through the VPN again (an answer alone
-        // does not show that): for this app and for another one (the shell, uid 2000).
-        val t0 = System.currentTimeMillis()
+    }
+
+    /**
+     * Runs last: the user's switch off and on again, three times. After every start, traffic must
+     * really go through the VPN (an answer alone does not show that): the capture probe, this app's
+     * TCP and UDP, and another app's TCP (the shell, uid 2000) are all checked, and every failure is
+     * reported, not just the first.
+     */
+    @Test fun t20_powerSwitchOffAndOn() {
+        val problems = ArrayList<String>()
         fun diag() = "\nip rule:\n" + shell("ip rule") + "\nrecent: " + seen().take(10).joinToString("\n  ")
-        assertTrue(httpGet("example.com").startsWith("HTTP/1."))
-        try {
-            waitSeen("own TCP captured after switching on") { it.proto == "TCP" && it.port == 80 && it.uid == myUid && it.ts >= t0 }
-        } catch (e: AssertionError) {
-            throw AssertionError("own traffic bypasses the VPN after switching on" + diag(), e)
+        fun check(what: String, block: () -> Unit) {
+            try { block() } catch (e: AssertionError) { problems += "$what: ${e.message}" }
         }
-        val nc = shell("toybox nc -w 3 1.1.1.1 80")
-        assertFalse("toybox nc is missing on this image: $nc", nc.contains("not found") || nc.contains("inaccessible"))
-        try {
-            waitSeen("shell TCP captured after switching on") { it.proto == "TCP" && it.port == 80 && it.uid == 2000 && it.ts >= t0 }
-        } catch (e: AssertionError) {
-            throw AssertionError("another app's traffic bypasses the VPN after switching on; nc: $nc" + diag(), e)
+        for (cycle in 1..3) {
+            ActivityScenario.launch(MainActivity::class.java).use { sc ->
+                sc.onActivity { it.onPowerToggle(false) }
+                waitFor(10_000, "VPN stopped") { !FirewallService.running }
+                if (cycle == 1) {
+                    // Our own VPN network lingers for a moment after stopping: it is not "another VPN",
+                    // and checking that must work on every API level (the header asks it right away).
+                    val end = SystemClock.uptimeMillis() + 2_000
+                    while (SystemClock.uptimeMillis() < end) {
+                        assertFalse("own VPN network taken for another VPN", FirewallService.otherVpnActive(ctx))
+                        Thread.sleep(100)
+                    }
+                }
+                Thread.sleep(1_000) // header refresh while off
+            }
+            if (cycle == 1) ActivityScenario.launch(SettingsActivity::class.java).use { Thread.sleep(1500) }
+            val tOn = System.currentTimeMillis()
+            ActivityScenario.launch(MainActivity::class.java).use { sc ->
+                sc.onActivity { it.onPowerToggle(true) }
+                waitFor(25_000, "VPN running again") { FirewallService.running }
+                Thread.sleep(500)
+            }
+            check("cycle $cycle: capture probe") {
+                waitFor(15_000, "capture probe verified after switching on") { FirewallService.captureVerifiedAt >= tOn }
+            }
+            val t0 = System.currentTimeMillis()
+            check("cycle $cycle: own TCP") {
+                assertTrue(httpGet("example.com").startsWith("HTTP/1."))
+                waitSeen("own TCP captured") { it.proto == "TCP" && it.port == 80 && it.uid == myUid && it.ts >= t0 }
+            }
+            check("cycle $cycle: own UDP") {
+                assertTrue("UDP answer", dnsQueryUdp("1.1.1.1", "example.org") != null)
+                waitSeen("own UDP captured") { it.proto == "UDP" && it.ip == "1.1.1.1" && it.uid == myUid && it.ts >= t0 }
+            }
+            check("cycle $cycle: shell TCP") {
+                val nc = shell("toybox nc -w 3 1.1.1.1 80")
+                assertFalse("toybox nc is missing on this image: $nc", nc.contains("not found") || nc.contains("inaccessible"))
+                waitSeen("shell TCP captured") { it.proto == "TCP" && it.port == 80 && it.uid == 2000 && it.ts >= t0 }
+            }
+            if (problems.isNotEmpty()) break
         }
-        Log.i(TAG, "capture after switching on verified for uid $myUid and the shell")
+        Log.i(TAG, "power cycles: capture losses detected and repaired by the probe: ${FirewallService.captureRecoveries}")
+        if (problems.isNotEmpty()) throw AssertionError(problems.joinToString("\n") + diag())
     }
 }

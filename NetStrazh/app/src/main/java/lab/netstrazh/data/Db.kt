@@ -63,6 +63,8 @@ class Db private constructor(ctx: Context) : SQLiteOpenHelper(ctx, "netstrazh.db
     companion object {
         private lateinit var helper: Db
         private val queue = ConcurrentLinkedQueue<Conn>()
+        /** Rows waiting in [queue] (its size() walks the whole queue). */
+        private val queued = java.util.concurrent.atomic.AtomicInteger()
         private val exec = Executors.newSingleThreadScheduledExecutor { r -> Thread(r, "ns-db").apply { isDaemon = true } }
 
         fun init(ctx: Context) {
@@ -71,6 +73,12 @@ class Db private constructor(ctx: Context) : SQLiteOpenHelper(ctx, "netstrazh.db
         }
 
         fun log(c: Conn) {
+            // Bounded: if the database falls far behind (a flood of connections), rows are dropped
+            // rather than piling up in memory.
+            if (queued.incrementAndGet() > MAX_QUEUED) {
+                queued.decrementAndGet()
+                return
+            }
             queue.add(c)
         }
 
@@ -82,6 +90,7 @@ class Db private constructor(ctx: Context) : SQLiteOpenHelper(ctx, "netstrazh.db
                 try {
                     while (true) {
                         val c = queue.poll() ?: break
+                        queued.decrementAndGet()
                         val v = ContentValues(13)
                         v.put("ts", c.start)
                         v.put("te", if (c.end == 0L) System.currentTimeMillis() else c.end)
@@ -123,6 +132,7 @@ class Db private constructor(ctx: Context) : SQLiteOpenHelper(ctx, "netstrazh.db
         fun clear() {
             exec.submit {
                 queue.clear()
+                queued.set(0)
                 helper.writableDatabase.delete("conn", null, null)
             }.get()
         }
@@ -135,6 +145,7 @@ class Db private constructor(ctx: Context) : SQLiteOpenHelper(ctx, "netstrazh.db
         const val F_ALL = 0
         /** Journal rows kept at most (about 50 MB). */
         const val MAX_ROWS = 300_000
+        private const val MAX_QUEUED = 20_000
         const val F_BLOCKED = 1
         const val F_DNS = 2
         const val F_CONN = 3

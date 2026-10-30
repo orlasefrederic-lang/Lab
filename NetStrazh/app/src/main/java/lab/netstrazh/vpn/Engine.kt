@@ -132,6 +132,11 @@ class Engine(val host: EngineHost, private val pfd: ParcelFileDescriptor, val cf
         if (!running) return
         running = false
         try { Os.write(wake[1], byteArrayOf(1), 0, 1) } catch (_: Exception) {}
+        // Let the TUN reader stop first: a SYN it rewrote after the server socket closed would be
+        // answered with a reset, and the app would see "connection refused" during a restart.
+        threads.firstOrNull { it.name == "ns-tun" }?.let { t ->
+            if (t !== Thread.currentThread()) try { t.join(1000) } catch (_: InterruptedException) {}
+        }
         closeQuietly(tcp4)
         closeQuietly(tcp6)
         udp.stop()
@@ -415,11 +420,18 @@ class Engine(val host: EngineHost, private val pfd: ParcelFileDescriptor, val cf
         var tcpRefused = false
         while (true) {
             head.clear()
-            if (!readExactly(client, head)) return
-            val n = ((head.get(0).toInt() and 0xFF) shl 8) or (head.get(1).toInt() and 0xFF)
-            if (n < 12) return
-            val q = ByteArray(n)
-            if (!readExactly(client, ByteBuffer.wrap(q))) return
+            // An idle or half-sent query does not hold a connection slot for ever (RFC 7766 6.2.3).
+            val q: ByteArray = try {
+                lab.netstrazh.net.withDeadline(client, DNS_TCP_IDLE_MS) {
+                    if (!readExactly(client, head)) return@withDeadline null
+                    val len = ((head.get(0).toInt() and 0xFF) shl 8) or (head.get(1).toInt() and 0xFF)
+                    if (len < 12) return@withDeadline null
+                    ByteArray(len).takeIf { readExactly(client, ByteBuffer.wrap(it)) }
+                }
+            } catch (e: lab.netstrazh.net.DeadlineException) {
+                null
+            } ?: return
+            val n = q.size
             conn.addTx(n + 2L)
             val name = Dns.parse(q, 0, n)?.qname
             if (conn.host == null && name != null) conn.host = name
@@ -437,13 +449,18 @@ class Engine(val host: EngineHost, private val pfd: ParcelFileDescriptor, val cf
                 } else {
                     val server = host.upstreamDns()
                     var a: ByteArray? = null
-                    if (!tcpRefused) try {
-                        val ch = out.get() ?: upstream.openTcpDirect(InetSocketAddress(server, 53), DNS_TCP_CONNECT_MS) { out.set(it) }
-                        a = lab.netstrazh.net.withDeadline(ch, Upstream.DNS_TIMEOUT_MS) { DnsTcp.query(ch, q, 0, n) }
-                    } catch (e: IOException) {
-                        // A resolver without DNS over TCP (many home routers, the emulator): ask over UDP.
-                        tcpRefused = true
-                        closeQuietly(out.getAndSet(null))
+                    var attempt = 0
+                    while (a == null && !tcpRefused && attempt++ < 2) {
+                        val reused = out.get()
+                        try {
+                            val ch = reused ?: upstream.openTcpDirect(InetSocketAddress(server, 53), DNS_TCP_CONNECT_MS) { out.set(it) }
+                            a = lab.netstrazh.net.withDeadline(ch, Upstream.DNS_TIMEOUT_MS) { DnsTcp.query(ch, q, 0, n) }
+                        } catch (e: IOException) {
+                            closeQuietly(out.getAndSet(null))
+                            // A connection the resolver closed meanwhile gets one fresh try; a resolver that
+                            // does not take TCP at all (many home routers, the emulator) is asked over UDP.
+                            if (reused == null) tcpRefused = true
+                        }
                     }
                     a ?: udpDnsQuery(server, q, n)
                 }
@@ -578,6 +595,17 @@ class Engine(val host: EngineHost, private val pfd: ParcelFileDescriptor, val cf
 
     fun isFakeDns(addr: ByteArray): Boolean = addr.contentEquals(cfg.dns4)
 
+    /** Nonce of the last capture probe that came in through the interface (see FirewallService). */
+    @Volatile var lastProbe = 0L
+        private set
+
+    /** A probe datagram from our own process reached the interface: Android routes apps into us. */
+    internal fun onProbe(b: ByteArray, off: Int, n: Int) {
+        if (n != PROBE_MAGIC.size + 8) return
+        for (i in PROBE_MAGIC.indices) if (b[off + i] != PROBE_MAGIC[i]) return
+        lastProbe = ByteBuffer.wrap(b, off + PROBE_MAGIC.size, 8).long
+    }
+
     fun isBlocked(uid: Int): Boolean = Rules.isBlocked(uid, host.netType())
 
     /** Why a DNS query of [uid] for [name] is answered "refused", or null to resolve it. */
@@ -638,8 +666,12 @@ class Engine(val host: EngineHost, private val pfd: ParcelFileDescriptor, val cf
         const val TAG = "NetStrazh"
         const val CONNECT_TIMEOUT_MS = 15_000
         const val PREREAD_MS = 400L
-        const val MAX_TCP_RELAYS = 2000
+        const val MAX_TCP_RELAYS = 1024
+        /** UDP port on our resolver address that receives capture probes. */
+        const val PROBE_PORT = 7
+        val PROBE_MAGIC = "NSPROBE1".toByteArray()
         const val DNS_TCP_CONNECT_MS = 3_000
+        const val DNS_TCP_IDLE_MS = 30_000L
         const val TCP_IDLE_MS = 2 * 3_600_000L
         const val NOTE_HOST_BLOCKED = "адрес заблокирован"
         const val NOTE_DNS_WITH_APP = "DNS запрещён вместе с приложением"

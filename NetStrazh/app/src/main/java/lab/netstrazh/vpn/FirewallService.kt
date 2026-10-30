@@ -21,6 +21,7 @@ import lab.netstrazh.data.Db
 import lab.netstrazh.data.ProxyApps
 import lab.netstrazh.data.Rules
 import lab.netstrazh.ui.MainActivity
+import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
 import java.net.InetSocketAddress
@@ -35,6 +36,16 @@ class FirewallService : VpnService(), EngineHost {
     private val rulesListener: () -> Unit = { main.post { onRulesChanged() } }
 
     private val netChanged = Runnable { onNetworkChanged() }
+    /**
+     * Android sometimes reports the VPN as up while it routes apps around it (seen on Android 10
+     * after switching off and on, and after rebuilding the interface). So after every start, and
+     * every minute, a probe from our own process (which, like every app, belongs inside the VPN)
+     * must arrive through the interface; if not, the interface is built anew.
+     */
+    private val captureCheck = Runnable { checkCapture() }
+    private val checker = java.util.concurrent.Executors.newSingleThreadExecutor { r -> Thread(r, "ns-capture").apply { isDaemon = true } }
+    private var captureFailures = 0
+
     /** The journal keeps only the configured number of days, also while the VPN runs for weeks. */
     private val prune = object : Runnable {
         override fun run() {
@@ -124,6 +135,63 @@ class FirewallService : VpnService(), EngineHost {
         main.removeCallbacks(prune)
         main.post(prune)
         updateNotification()
+        main.removeCallbacks(captureCheck)
+        main.postDelayed(captureCheck, CAPTURE_FIRST_MS)
+    }
+
+    private fun checkCapture() {
+        val e = engine ?: return
+        try {
+            checker.execute {
+                val ok = probe(e)
+                main.post { onCaptureChecked(e, ok) }
+            }
+        } catch (_: java.util.concurrent.RejectedExecutionException) {
+        }
+    }
+
+    /** Sends probes into the interface from this process; true once one arrived. */
+    private fun probe(e: Engine): Boolean {
+        val nonce = java.util.Random().nextLong().let { if (it == 0L) 1L else it }
+        val payload = java.nio.ByteBuffer.allocate(Engine.PROBE_MAGIC.size + 8).put(Engine.PROBE_MAGIC).putLong(nonce).array()
+        val dst = InetSocketAddress(InetAddress.getByName(TunConfig.DNS4), Engine.PROBE_PORT)
+        repeat(3) {
+            try {
+                DatagramSocket().use { s -> s.send(DatagramPacket(payload, payload.size, dst)) }
+            } catch (_: Exception) {
+            }
+            val end = android.os.SystemClock.elapsedRealtime() + 700
+            while (android.os.SystemClock.elapsedRealtime() < end) {
+                if (e.lastProbe == nonce) return true
+                Thread.sleep(25)
+            }
+        }
+        return false
+    }
+
+    private fun onCaptureChecked(e: Engine, ok: Boolean) {
+        if (engine !== e) return // restarted meanwhile; the new engine has its own check
+        if (ok) {
+            captureFailures = 0
+            captureVerifiedAt = System.currentTimeMillis()
+            if (captureBroken) {
+                captureBroken = false
+                updateNotification()
+            }
+            main.postDelayed(captureCheck, CAPTURE_EVERY_MS)
+            return
+        }
+        captureFailures++
+        captureRecoveries++
+        Log.w(Engine.TAG, "capture probe lost ($captureFailures): Android routes around the VPN interface")
+        if (captureFailures <= MAX_CAPTURE_RESTARTS) {
+            // A new interface while the old one is still up: Android installs fresh routing for it.
+            restartEngine()
+        } else {
+            captureBroken = true
+            updateNotification()
+            main.postDelayed(captureCheck, CAPTURE_EVERY_MS)
+        }
     }
 
     private fun establishTun(cfg: TunConfig): ParcelFileDescriptor? {
@@ -167,6 +235,9 @@ class FirewallService : VpnService(), EngineHost {
     private fun shutdown() {
         main.removeCallbacks(netChanged)
         main.removeCallbacks(prune)
+        main.removeCallbacks(captureCheck)
+        captureFailures = 0
+        captureBroken = false
         stopEngine()
         net.stop()
         running = false
@@ -291,7 +362,7 @@ class FirewallService : VpnService(), EngineHost {
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
         return Notification.Builder(this, CHANNEL)
             .setSmallIcon(R.drawable.ic_stat_shield)
-            .setContentTitle(getString(R.string.notif_on))
+            .setContentTitle(if (captureBroken) getString(R.string.notif_bypassed) else getString(R.string.notif_on))
             .setContentText(
                 (if (blocked == 0) getString(R.string.notif_no_rules) else getString(R.string.notif_blocked, blocked)) +
                     if (Prefs.proxy.enabled) " · " + getString(R.string.notif_via_proxy) else ""
@@ -324,6 +395,9 @@ class FirewallService : VpnService(), EngineHost {
         const val ACTION_START = "lab.netstrazh.START"
         const val ACTION_STOP = "lab.netstrazh.STOP"
         private const val PRUNE_EVERY_MS = 6 * 3_600_000L
+        private const val CAPTURE_FIRST_MS = 800L
+        private const val CAPTURE_EVERY_MS = 60_000L
+        private const val MAX_CAPTURE_RESTARTS = 3
         private val V6_ROUTES = listOf(
             "::" to 1, "8000::" to 2, "c000::" to 3, "e000::" to 4, "f000::" to 5,
             "f800::" to 6, "fc00::" to 7, "fe00::" to 9, "fec0::" to 10,
@@ -340,6 +414,15 @@ class FirewallService : VpnService(), EngineHost {
             private set
         /** An app (not a known proxy client) that serves the proxy port, for the user to confirm. */
         @Volatile var suggestedProxyPkg: String? = null
+        /** When a probe last proved that traffic really goes through the interface. */
+        @Volatile var captureVerifiedAt = 0L
+            private set
+        /** Rebuilding the interface did not help: Android keeps routing apps around the VPN. */
+        @Volatile var captureBroken = false
+            private set
+        /** How many times a lost capture was detected (for diagnostics and tests). */
+        @Volatile var captureRecoveries = 0
+            private set
 
         fun start(ctx: Context) {
             val i = Intent(ctx, FirewallService::class.java).setAction(ACTION_START)

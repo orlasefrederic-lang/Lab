@@ -262,15 +262,17 @@ class Upstream(private val host: EngineHost) {
                 val ch = proxyChannel(uid, track)
                 try {
                     val target = if (name != null) InetSocketAddress.createUnresolved(name, dst.port) else dst
-                    withDeadline(ch, if (handshakeMs > 0) handshakeMs else handshakeTimeout()) {
-                        when (c.type) {
-                            ProxyType.HTTP -> HttpConnect.connect(ch, c.user, c.pass, target)
-                            else -> Socks5.connect(ch, c.user, c.pass, target)
+                    val connectMs = if (handshakeMs > 0) handshakeMs else HANDSHAKE_MS
+                    when (c.type) {
+                        // The reply comes once the proxy reached the destination (Tor: seconds).
+                        ProxyType.HTTP -> withDeadline(ch, connectMs) { HttpConnect.connect(ch, c.user, c.pass, target) }
+                        else -> {
+                            greet(ch, c, connectMs)
+                            withDeadline(ch, connectMs) { Socks5.connectRequest(ch, target) }
                         }
                     }
                 } catch (e: Exception) {
                     Engine.closeQuietly(ch)
-                    if (e is DeadlineException) noteSilentProxy()
                     throw e
                 }
                 lastOkAt = System.currentTimeMillis()
@@ -313,13 +315,11 @@ class Upstream(private val host: EngineHost) {
                     val ctlCh = proxyChannel(uid) {}
                     ctl = ctlCh
                     val relay = try {
-                        withDeadline(ctlCh, handshakeTimeout()) { Socks5.udpAssociate(ctlCh, c.user, c.pass, proxyEndpoint()) }
+                        greet(ctlCh, c, HANDSHAKE_MS)
+                        withDeadline(ctlCh, HANDSHAKE_MS) { Socks5.udpAssociateRequest(ctlCh, proxyEndpoint()) }
                     } catch (e: ProxyException) {
                         // Only an explicit refusal of the command means "no UDP"; a restart or timeout does not.
                         if (e.code == 7 || e.code == 1 || e.code == 2) udpUnsupportedAt = System.currentTimeMillis()
-                        throw e
-                    } catch (e: DeadlineException) {
-                        noteSilentProxy()
                         throw e
                     }
                     val d = DatagramChannel.open()
@@ -371,37 +371,53 @@ class Upstream(private val host: EngineHost) {
     /** True when DNS queries of [uid] are resolved through the proxy. */
     fun dnsViaProxy(uid: Int): Boolean = cfg.enabled && cfg.dnsViaProxy && proxied(uid)
 
-    /** Resolves one DNS query (wire format) over a pipelined TCP connection through the proxy. */
-    fun dnsQuery(q: ByteArray, off: Int, len: Int): ByteArray = try {
-        // Short enough to leave time for the fallback before the system resolver gives up (~5 s).
-        dnsPipe.query(q, off, len, DNS_PIPE_TIMEOUT_MS)
-    } catch (e: IOException) {
-        // Resolvers that answer only one query per connection: fall back to a dedicated connection.
-        dnsQueryOnce(InetSocketAddress(host.resolve(cfg.dnsServer), 53), q, off, len)
+    /**
+     * Resolves one DNS query (wire format) through the proxy: over the pipelined connection, then
+     * (resolvers that answer one query per connection, a broken pipe) over a dedicated one, about
+     * [DNS_TOTAL_MS] in all.
+     */
+    fun dnsQuery(q: ByteArray, off: Int, len: Int): ByteArray {
+        val start = System.nanoTime()
+        return try {
+            // Short enough to leave time for the fallback before the system resolver gives up (~5 s).
+            dnsPipe.query(q, off, len, DNS_PIPE_TIMEOUT_MS)
+        } catch (e: IOException) {
+            val left = DNS_TOTAL_MS - (System.nanoTime() - start) / 1_000_000
+            dnsQueryOnce(InetSocketAddress(host.resolve(cfg.dnsServer), 53), q, off, len, maxOf(left, DNS_MIN_ONCE_MS))
+        }
     }
 
-    /** One DNS-over-TCP query to [server] through the proxy, on its own connection, within a few seconds. */
-    fun dnsQueryOnce(server: InetSocketAddress, q: ByteArray, off: Int, len: Int): ByteArray {
-        val o = openTcp(server, UID_DNS, PROXY_CONNECT_MS, handshakeMs = minOf(handshakeTimeout(), DNS_ONCE_MS)) {}
+    /** One DNS-over-TCP query to [server] through the proxy, on its own connection, within [budgetMs]. */
+    fun dnsQueryOnce(server: InetSocketAddress, q: ByteArray, off: Int, len: Int, budgetMs: Long = DNS_ONCE_MS): ByteArray {
+        val deadline = System.nanoTime() + budgetMs * 1_000_000
+        val o = openTcp(server, UID_DNS, PROXY_CONNECT_MS, handshakeMs = budgetMs) {}
         try {
-            return withDeadline(o.ch, DNS_ONCE_MS) { DnsTcp.query(o.ch, q, off, len) }
+            val left = maxOf(1L, (deadline - System.nanoTime()) / 1_000_000)
+            return withDeadline(o.ch, left) { DnsTcp.query(o.ch, q, off, len) }
         } catch (e: DeadlineException) {
             // The proxy took the request, but no answer came back through the tunnel.
-            throw IOException("DNS-сервер ${server.address.hostAddress} не ответил через туннель за ${DNS_ONCE_MS / 1000} с", e)
+            throw IOException("DNS-сервер ${server.address.hostAddress} не ответил через туннель за ${(budgetMs + 999) / 1000} с", e)
         } finally {
             Engine.closeQuietly(o.ch)
         }
     }
 
     /**
-     * SOCKS/HTTP handshake limit. A proxy app on this phone answers at once (it replies before even
-     * dialing the server): if it stays silent, it is frozen or stuck, so give up sooner than for a
-     * proxy across the network.
+     * The SOCKS5 greeting (and login). Any working proxy answers it at once, before any remote
+     * connection is involved: a proxy app on this phone that stays silent here is frozen or stuck, so
+     * it is given up on sooner than one across the network, and said so.
      */
-    private fun handshakeTimeout(): Long =
-        if (try { isLoopback(proxyEndpoint().address) } catch (_: Exception) { false }) LOCAL_HANDSHAKE_MS else HANDSHAKE_MS
+    private fun greet(ch: SocketChannel, c: ProxyConfig, limitMs: Long) {
+        val local = try { isLoopback(proxyEndpoint().address) } catch (_: Exception) { false }
+        try {
+            withDeadline(ch, if (local) minOf(limitMs, LOCAL_HANDSHAKE_MS) else limitMs) { Socks5.handshake(ch, c.user, c.pass) }
+        } catch (e: DeadlineException) {
+            noteSilentProxy()
+            throw e
+        }
+    }
 
-    /** The proxy accepted the connection but did not answer the handshake. */
+    /** The proxy accepted the connection but did not answer the greeting. */
     private fun noteSilentProxy() {
         val local = try { isLoopback(proxyEndpoint().address) } catch (_: Exception) { false }
         noteError(if (local) "${host.proxyAppLabel() ?: "приложение прокси"} принимает соединения, но не отвечает: " +
@@ -457,6 +473,8 @@ class Upstream(private val host: EngineHost) {
         const val HANDSHAKE_MS = 20_000L
         const val LOCAL_HANDSHAKE_MS = 6_000L
         const val DNS_ONCE_MS = 4_000L
+        const val DNS_TOTAL_MS = 6_000L
+        const val DNS_MIN_ONCE_MS = 1_500L
         const val DNS_TIMEOUT_MS = 8_000L
         const val DNS_PIPE_TIMEOUT_MS = 3_000L
         const val MAX_EVENTS = 20

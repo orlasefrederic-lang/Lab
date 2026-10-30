@@ -143,6 +143,11 @@ object Socks5 {
     /** CONNECT; an unresolved [dst] (InetSocketAddress.createUnresolved) is sent as a domain name. */
     fun connect(ch: SocketChannel, user: String, pass: String, dst: InetSocketAddress) {
         handshake(ch, user, pass)
+        connectRequest(ch, dst)
+    }
+
+    /** The CONNECT request after [handshake]; its reply may wait until the proxy reached [dst]. */
+    fun connectRequest(ch: SocketChannel, dst: InetSocketAddress) {
         if (dst.isUnresolved) command(ch, requestDomain(CMD_CONNECT, dst.hostString, dst.port))
         else command(ch, CMD_CONNECT, dst.address, dst.port)
     }
@@ -153,6 +158,11 @@ object Socks5 {
      */
     fun udpAssociate(ch: SocketChannel, user: String, pass: String, proxy: InetSocketAddress): InetSocketAddress {
         handshake(ch, user, pass)
+        return udpAssociateRequest(ch, proxy)
+    }
+
+    /** The UDP ASSOCIATE request after [handshake]. */
+    fun udpAssociateRequest(ch: SocketChannel, proxy: InetSocketAddress): InetSocketAddress {
         val any = if (proxy.address is Inet6Address) InetAddress.getByAddress(ByteArray(16)) else InetAddress.getByAddress(ByteArray(4))
         val bind = command(ch, CMD_UDP_ASSOCIATE, any, 0)
         val addr = if (bind.address.isAnyLocalAddress) proxy.address else bind.address

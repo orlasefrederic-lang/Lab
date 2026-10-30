@@ -148,6 +148,8 @@ class MainActivity : Activity() {
         val direct = Prefs.proxy.directIfDown
         headerAction = null
         status.text = when {
+            on && FirewallService.captureBroken ->
+                "⚠ Android пускает трафик мимо Стража. Выключите и включите защиту переключателем"
             on && proxyDown -> {
                 headerAction = { startActivity(Intent(this, SettingsActivity::class.java)) }
                 if (direct) "⚠ Прокси недоступен — трафик идёт напрямую, без прокси. Нажмите, чтобы проверить"
@@ -166,6 +168,7 @@ class MainActivity : Activity() {
             else -> "Защита выключена"
         }
         status.setTextColor(when {
+            on && FirewallService.captureBroken -> Pal.danger
             proxyDown -> if (direct) Pal.warn else Pal.danger
             on -> Pal.ok
             headerAction != null -> Pal.warn

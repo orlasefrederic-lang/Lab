@@ -43,8 +43,6 @@ class UdpRelay(private val eng: Engine) {
         @Volatile var retryAt = 0L
         /** DNS datagrams to a third-party resolver when the proxy cannot carry UDP. */
         @Volatile var dnsServer: InetSocketAddress? = null
-        /** DNS of a blocked app while "block DNS too" is on: every query of this flow is refused. */
-        @Volatile var refuseAll = false
         /** Owner lookups made so far while the owner is unknown (0: it is known). */
         @Volatile var uidLookups = 0
         val closed = AtomicBoolean(false)
@@ -86,6 +84,10 @@ class UdpRelay(private val eng: Engine) {
         if (!p.srcIs(t)) return
         val n = p.udpPayloadLen
         if (n < 0) return
+        if (p.dstPort == Engine.PROBE_PORT && p.dstIs(eng.cfg.dns4)) {
+            eng.onProbe(p.buf, p.udpPayloadOff, n)
+            return
+        }
         val key = FlowKey.of(p)
         var s = sessions[key]
         if (s == null || s.closed.get()) s = create(p, key) ?: return
@@ -106,8 +108,9 @@ class UdpRelay(private val eng: Engine) {
         if (s.isDns) {
             val name = Dns.parse(p.buf, off, n)?.qname
             if (s.conn.host == null && name != null) s.conn.host = name
-            // Decided per query: one socket may ask for several names, and only blocked ones are refused.
-            val why = if (s.refuseAll) s.conn.note else if (Rules.hostBlocked(s.conn.uid, name)) Engine.NOTE_HOST_BLOCKED else null
+            // Decided per query, by the rules as they are now: one socket may ask for several names, and
+            // "block DNS too" or a rule switched on while the socket is open applies to its next query.
+            val why = eng.dnsRefusal(s.conn.uid, name)
             if (why != null) {
                 // Answer at once: silence would make the system resolver retry and wait.
                 refuse(s, p.buf, off, n)
@@ -184,21 +187,12 @@ class UdpRelay(private val eng: Engine) {
         Live.open(conn)
         sessions[key] = s
         conn.killer = { close(s) }
-        // DNS of a blocked app is resolved unless the user asked to block it too; blocked names are
-        // refused query by query in fromApp. REFUSED is not cached by the shared system resolver.
-        if (isDns) {
-            if (Rules.blockDns && eng.isBlocked(uid)) {
-                conn.blocked = true
-                conn.note = Engine.NOTE_DNS_WITH_APP
-                s.refuseAll = true
-                s.state = DROP
-                return s
-            }
-            if (Rules.hostBlocked(uid, Dns.parse(p.buf, p.udpPayloadOff, p.udpPayloadLen)?.qname)) {
-                // No path until a query for an allowed name comes.
-                s.state = NOPATH
-                return s
-            }
+        // DNS of a blocked app is resolved unless the user asked to block it too; refused queries are
+        // answered in fromApp, query by query. REFUSED is not cached by the shared system resolver.
+        if (isDns && eng.dnsRefusal(uid, Dns.parse(p.buf, p.udpPayloadOff, p.udpPayloadLen)?.qname) != null) {
+            // No path until a query that is allowed comes.
+            s.state = NOPATH
+            return s
         }
         if (!isDns && eng.isBlocked(uid)) {
             conn.blocked = true
