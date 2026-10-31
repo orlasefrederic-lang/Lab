@@ -1,10 +1,13 @@
 """Модель: учёт байт, направления, имена хостов, жизненный цикл процессов, история."""
 
+import contextlib
+import io
 import os
 import socket
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -308,6 +311,62 @@ class LifecycleTest(unittest.TestCase):
         self.m.sync_tcp([(7, 8, LOCAL, 50000, '1.2.3.4', 443)], 2.0)     # CLOSE_WAIT мертвеца
         self.assertEqual(len([p for p in self.m.procs.values() if p.pid == 7]), 1)
 
+    def _fast_reuse(self, gap, new_name):
+        # снимок увидел old.exe; через gap секунд PID уже у другого процесса, а подробности
+        # читаются только после этого (отчёт 1.1, R3)
+        self.m.sync_processes({100: ('old.exe', 1)}, now=100.0)
+        uid = proc_by_pid(self.m, 100).uid
+        traffic(self.m, 100, '1.1.1.1', 443, 50000, sent=10, ts=100.1)
+        self.m.process_pending()
+        self.m.fill_details(uid, {'path': 'C:\\%s' % new_name, 'started': 100.0 + gap},
+                            now=100.0 + gap + 0.1)
+        return self.m.procs[uid], proc_by_pid(self.m, 100)
+
+    def test_fast_pid_reuse_by_other_exe(self):
+        for gap in (0.1, 0.5, 1.9):
+            self.m = Model()
+            self.m.resolve_names = False
+            old, new = self._fast_reuse(gap, 'new.exe')
+            self.assertIsNot(old, new, gap)
+            self.assertEqual((old.name, old.sent), ('old.exe', 10), gap)
+            self.assertEqual((new.name, new.started, new.sent), ('new.exe', 100.0 + gap, 0), gap)
+
+    def test_fast_pid_reuse_by_same_exe(self):
+        # имя то же — различаем по времени: процесс создан позже, чем мы видели PID живым
+        for gap in (0.1, 0.5, 1.9):
+            self.m = Model()
+            self.m.resolve_names = False
+            old, new = self._fast_reuse(gap, 'old.exe')
+            self.assertIsNot(old, new, gap)
+            self.assertEqual((old.sent, new.sent), (10, 0), gap)
+
+    def test_details_of_the_same_process_are_accepted(self):
+        self.m.sync_processes({100: ('app.exe', 1)}, now=100.0)
+        uid = proc_by_pid(self.m, 100).uid
+        self.m.fill_details(uid, {'path': 'C:\\App.EXE', 'started': 99.99}, now=100.2)
+        self.assertEqual(len(self.m.procs), 1)
+        self.assertEqual((proc_by_pid(self.m, 100).path, proc_by_pid(self.m, 100).started),
+                         ('C:\\App.EXE', 99.99))
+        self.m.on_process_start(200, 50.0, 'C:\\b.exe')
+        self.m.process_pending()
+        b = proc_by_pid(self.m, 200)
+        self.m.fill_details(b.uid, {'path': 'C:\\b.exe', 'started': 50.01}, now=60.0)
+        self.assertIs(proc_by_pid(self.m, 200), b)
+
+    def test_late_packet_with_same_addresses(self):
+        # отчёт 1.1, R4: одинаковые адреса и порты у старого и нового процесса с одним PID
+        for order in ([(2.5, 7), (11.0, 9)], [(11.0, 9), (2.5, 7)]):
+            self.m = Model()
+            self.m.resolve_names = False
+            self.m.on_process_start(100, 1.0, 'C:\\old.exe')
+            self.m.on_process_stop(100, 3.0)
+            self.m.on_process_start(100, 10.0, 'C:\\new.exe')
+            for ts, size in order:
+                traffic(self.m, 100, '1.1.1.1', 443, 50000, sent=size, ts=ts)
+            self.m.process_pending()
+            self.assertEqual({p.name: p.sent for p in self.m.procs.values()},
+                             {'old.exe': 7, 'new.exe': 9}, order)
+
     def test_group_views(self):
         for pid in (10, 11):
             traffic(self.m, pid, '8.8.8.8', 443, 50000 + pid, sent=100)
@@ -439,6 +498,27 @@ class HistoryTest(unittest.TestCase):
         self._save(m)
         self.assertEqual(self._load().procs[1].last_seen, 200.0)
 
+    def test_snapshot_time_is_taken_after_reading(self):
+        # момент «видели живым» — после чтения списка процессов, а не до него
+        clock = [1000.0]
+
+        class Sysinfo:
+            def nt_path_to_dos(self, path):
+                return path
+
+            def processes(self):
+                clock[0] += 3.0          # медленный снимок
+                return {7: ('a.exe', 1)}
+
+            def tcp_connections(self):
+                return []
+
+        monitor = Monitor(Sysinfo(), None, rdns=False)
+        with mock.patch('monitor.time') as fake_time:
+            fake_time.time.side_effect = lambda: clock[0]
+            monitor._snapshot()
+        self.assertEqual(monitor.model.by_pid[7].first_seen, 1003.0)
+
     def test_purge_and_clear(self):
         st = Storage(self.path)
         st.save([(1, 5, 'a', '', '', '', None, 1.0, 1.0, 1.0, 1, 1, 0, 0)],
@@ -449,6 +529,14 @@ class HistoryTest(unittest.TestCase):
 
 
 class UtilTest(unittest.TestCase):
+    def test_version(self):
+        import main
+        from version import __version__
+        out = io.StringIO()
+        with self.assertRaises(SystemExit), contextlib.redirect_stdout(out):
+            main.parse_args(['--version'])
+        self.assertEqual(out.getvalue().strip(), 'netmon ' + __version__)
+
     def test_fmt_bytes(self):
         self.assertEqual(fmt_bytes(0), '0 Б')
         self.assertEqual(fmt_bytes(1536), '1,5 КБ')

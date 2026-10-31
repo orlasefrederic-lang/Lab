@@ -230,6 +230,43 @@ class ManagerTest(unittest.TestCase):
         self.m.refresh().result()
         self.assertEqual(self.m.status(EXPLORER), ('', ''))           # правда: запрета нет
 
+    def test_reblock_restores_missing_rules(self):
+        # отчёт 1.1, R2: пока запрет был временно выключен, исходящее правило удалили снаружи
+        self.m.block(EXPLORER).result()
+        self.m.set_enabled(self.m.entries, False).result()
+        self.m.take_messages()
+        selected = list(self.m.entries)                      # строка, выбранная в окне
+        self.backend.rules.pop(rule_id(EXPLORER, '', 'out'))
+        self.m.set_enabled(selected, True).result()
+        self.assertEqual({(r.direction, r.enabled) for r in self.backend.rules.values()},
+                         {('out', True), ('in', True)})
+        self.assertEqual(self.m.take_messages()[0][0], 'info')
+        self.assertEqual(self.m.status(EXPLORER), ('blocked', 'запрещена'))
+        self.backend.rules.clear()                           # пропали оба правила
+        self.m.set_enabled(selected, True).result()
+        self.assertEqual(len(self.backend.rules), 2)
+
+    def test_reblock_failure_is_not_reported_as_success(self):
+        self.m.block(EXPLORER).result()
+        self.m.set_enabled(self.m.entries, False).result()
+        self.m.take_messages()
+        selected = list(self.m.entries)
+        self.backend.rules.pop(rule_id(EXPLORER, '', 'out'))
+        self.backend.fail_add_after = 0
+        self.m.set_enabled(selected, True).result()
+        ((kind, text),) = self.m.take_messages()
+        self.assertEqual(kind, 'error')
+        self.assertNotIn('Снова запрещено', text)
+
+    def test_pause_with_missing_rule_is_fine(self):
+        self.m.block(EXPLORER).result()
+        self.m.take_messages()
+        selected = list(self.m.entries)
+        self.backend.rules.pop(rule_id(EXPLORER, '', 'in'))
+        self.m.set_enabled(selected, False).result()
+        self.assertEqual(self.m.take_messages()[0][0], 'info')
+        self.assertEqual({r.enabled for r in self.backend.rules.values()}, {False})
+
     def test_reserved_service_is_rejected_without_changes(self):
         self.m.block(SVCHOST, ['Any']).result()
         self.assertEqual(self.backend.rules, {})
@@ -291,6 +328,7 @@ FAKE_CMDLETS = r"""
 function Load-Store { if (Test-Path $env:FAKE_FW_STORE) { @(Get-Content -Raw -Encoding UTF8 $env:FAKE_FW_STORE | ConvertFrom-Json) } else { @() } }
 function Save-Store($items) { ConvertTo-Json -InputObject @($items) -Depth 4 | Set-Content -Encoding UTF8 $env:FAKE_FW_STORE }
 function Get-NetFirewallRule { [CmdletBinding()] param([string]$Group, [string]$Name)
+    if ($env:FAKE_FW_DENY_READ) { Write-Error -Category PermissionDenied 'Access denied reading rules'; return }
     if ($Name) { $found = @(Load-Store | Where-Object { $_.Name -eq $Name }) }
     else { $found = @(Load-Store | Where-Object { $_.Group -eq $Group }) }
     if (-not $found) { Write-Error -Category ObjectNotFound "No MSFT_NetFirewallRule objects found"; return }
@@ -338,7 +376,8 @@ class PowerShellScriptsTest(unittest.TestCase):
         self.dir = tempfile.TemporaryDirectory()
         self.addCleanup(self.dir.cleanup)
         os.environ['FAKE_FW_STORE'] = os.path.join(self.dir.name, 'rules.json')
-        for name in ('FAKE_FW_DENY_NEW', 'FAKE_FW_DENY_REMOVE', 'FAKE_FW_DENY_SET'):
+        for name in ('FAKE_FW_DENY_NEW', 'FAKE_FW_DENY_REMOVE', 'FAKE_FW_DENY_SET',
+                     'FAKE_FW_DENY_READ'):
             os.environ.pop(name, None)
             self.addCleanup(os.environ.pop, name, None)
         self.fw = WindowsFirewall(executable=PWSH, prelude=FAKE_CMDLETS)
@@ -397,6 +436,36 @@ class PowerShellScriptsTest(unittest.TestCase):
         os.environ.pop('FAKE_FW_DENY_REMOVE')
         self.fw.remove(['NetMon-missing', rule_id(EXPLORER, '', 'out')])
         self.assertEqual([r.direction for r in self.fw.state()[0]], ['in'])
+
+    def test_read_errors_are_not_treated_as_no_rules(self):
+        # отчёт 1.1, R1: отказ чтения правил при рабочем чтении профилей — это ошибка
+        self.fw.add(block_plan(EXPLORER))
+        os.environ['FAKE_FW_DENY_READ'] = '1'
+        for call in (self.fw.state, lambda: self.fw.remove([rule_id(EXPLORER, '', 'out')]),
+                     lambda: self.fw.set_enabled([rule_id(EXPLORER, '', 'out')], False),
+                     lambda: self.fw.add(block_plan(EXPLORER))):
+            with self.assertRaisesRegex(FirewallError, 'Access denied reading rules'):
+                call()
+        os.environ.pop('FAKE_FW_DENY_READ')
+        self.assertEqual(len(self.fw.state()[0]), 2)         # ничего не тронуто
+
+    def test_manager_unblock_with_unreadable_rules(self):
+        firewall.log.disabled = True
+        self.addCleanup(setattr, firewall.log, 'disabled', False)
+        manager = FirewallManager(self.fw)
+        self.addCleanup(manager.shutdown)
+        manager.block(EXPLORER).result()
+        manager.take_messages()
+        entries = manager.entries_for(EXPLORER)
+        os.environ['FAKE_FW_DENY_READ'] = '1'
+        manager.unblock(entries).result()
+        os.environ.pop('FAKE_FW_DENY_READ')
+        ((kind, text),) = manager.take_messages()
+        self.assertEqual(kind, 'error')
+        self.assertNotIn('Убрано', text)
+        self.assertFalse(manager.state_known)
+        self.assertEqual(manager.status(EXPLORER), ('unknown', 'неизвестно'))
+        self.assertEqual(len(self.fw.state()[0]), 2)         # правила на месте
 
     def test_reserved_service_rejected_by_script(self):
         plan = block_plan(SVCHOST, ['Any'], ('out',))

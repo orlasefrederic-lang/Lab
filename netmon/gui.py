@@ -18,6 +18,7 @@ from fwgui import BlockDialog, FirewallTab
 from model import display_name, group_views
 from util import (CATEGORY_LABELS, RateTracker, fmt_bytes, fmt_datetime, fmt_rate, fmt_time,
                   ip_category, port_label)
+from version import APP_NAME, __version__
 
 log = logging.getLogger('netmon.gui')
 
@@ -106,7 +107,7 @@ class App:
         self.var_all = tk.BooleanVar(value=settings.get('all', False))
         self.var_hide_lo = tk.BooleanVar(value=settings.get('hide_lo', True))
 
-        root.title('Сетевая активность программ' + (' — ДЕМО' if demo else ''))
+        root.title('%s %s%s' % (APP_NAME, __version__, ' — ДЕМО' if demo else ''))
         root.geometry(settings.get('geometry') or '1300x820')
         root.minsize(800, 500)
         self._setup_style()

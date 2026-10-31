@@ -213,22 +213,31 @@ def _rule_matches(rule, item):
             and (rule.service or '').lower() == (item['service'] or '').lower())
 
 
+def _missing_text(rules, plan):
+    by_id = {r.id: r for r in rules}
+    missing = [item for item in plan if not _rule_matches(by_id.get(item['id']), item)]
+    if not missing:
+        return None
+    return 'Брандмауэр не подтвердил запрет: %s.' % ', '.join(
+        '%s — %s' % (_plan_title(item), directions_label((_FROM_PS_DIRECTION[item['direction']],)))
+        for item in missing)
+
+
 def verify_block(rules, plan):
     """Проверка по фактически прочитанным правилам: все правила плана есть и включены,
     а других правил для этих программ (служб) нет. None — всё так, иначе текст проблемы."""
-    by_id = {r.id: r for r in rules}
     keys = {entry_key(item['program'], item['service']) for item in plan}
     ids = {item['id'] for item in plan}
-    missing = [item for item in plan if not _rule_matches(by_id.get(item['id']), item)]
     left = [r.id for r in rules if r.id not in ids and entry_key(r.program, r.service) in keys]
-    problems = []
-    if missing:
-        problems.append('Брандмауэр не подтвердил запрет: %s.' % ', '.join(
-            '%s — %s' % (_plan_title(item), directions_label((_FROM_PS_DIRECTION[item['direction']],)))
-            for item in missing))
+    problems = [_missing_text(rules, plan) or '']
     if left:
         problems.append('Не удалось убрать прежние правила (их осталось %d).' % len(left))
-    return ' '.join(problems) or None
+    return ' '.join(p for p in problems if p) or None
+
+
+def verify_present(rules, plan):
+    """Все правила плана есть, включены и блокируют (лишние правила не мешают)."""
+    return _missing_text(rules, plan)
 
 
 def verify_removed(rules, ids):
@@ -238,12 +247,21 @@ def verify_removed(rules, ids):
     return None
 
 
-def verify_enabled(rules, ids, enabled):
-    by_id = {r.id: r for r in rules}
-    wrong = [i for i in ids if i in by_id and by_id[i].enabled != bool(enabled)]
+def verify_disabled(rules, ids):
+    """Временное разрешение: ни одно из этих правил не должно действовать.
+    Отсутствующее правило тоже ничего не блокирует, это допустимый итог."""
+    wrong = [r for r in rules if r.id in set(ids) and r.enabled]
     if wrong:
-        return 'Брандмауэр не подтвердил изменение (правил: %d).' % len(wrong)
+        return 'Брандмауэр не подтвердил изменение: правил всё ещё действует %d.' % len(wrong)
     return None
+
+
+def entries_plan(entries):
+    """План правил, восстанавливающий запреты этих строк списка целиком."""
+    plan = []
+    for e in entries:
+        plan.extend(block_plan(e.program, [e.service] if e.service else [], e.directions))
+    return plan
 
 
 def describe_state(entries, keys):
@@ -282,6 +300,21 @@ function Send-Result($obj) {
     $json = ConvertTo-Json -InputObject $obj -Depth 5 -Compress
     [Console]::Out.Write('NETMON-OK:' + [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes([string]$json)))
 }
+# Правила по фильтру (@{ Group = ... } или @{ Name = ... }). «Не найдено» — это просто
+# пустой результат; любая другая ошибка чтения (нет доступа и т.п.) прерывает скрипт,
+# чтобы она не выглядела как «правил нет».
+function Find-NetMonRules([hashtable]$Filter) {
+    $problems = $null
+    $found = @(Get-NetFirewallRule @Filter -ErrorAction SilentlyContinue -ErrorVariable problems |
+               Where-Object { $null -ne $_ })
+    foreach ($e in @($problems)) {
+        if ($null -eq $e) { continue }
+        $notFound = ([string]$e.CategoryInfo.Category -eq 'ObjectNotFound') -or
+                    ([string]$e.FullyQualifiedErrorId -like 'CmdletizationQuery_NotFound*')
+        if (-not $notFound) { throw $e.Exception }
+    }
+    $found
+}
 try {
     $data = ConvertFrom-Json ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('%DATA%')))
 %BODY%
@@ -293,8 +326,7 @@ try {
 
 _LIST_BODY = r"""
     $rules = New-Object System.Collections.Generic.List[object]
-    foreach ($r in @(Get-NetFirewallRule -Group '%GROUP%' -ErrorAction SilentlyContinue)) {
-        if ($null -eq $r) { continue }
+    foreach ($r in @(Find-NetMonRules @{ Group = '%GROUP%' })) {
         $app = Get-NetFirewallApplicationFilter -AssociatedNetFirewallRule $r -ErrorAction Stop
         $svc = Get-NetFirewallServiceFilter -AssociatedNetFirewallRule $r -ErrorAction Stop
         $rules.Add([pscustomobject]@{
@@ -318,7 +350,7 @@ _ADD_BODY = r"""
         if ($i.service -and (@('any', '*', 'all') -contains ([string]$i.service).ToLowerInvariant())) {
             throw ('недопустимое имя службы: ' + $i.service)
         }
-        $existing = @(Get-NetFirewallRule -Name $i.id -ErrorAction SilentlyContinue | Where-Object { $null -ne $_ })
+        $existing = @(Find-NetMonRules @{ Name = $i.id })
         if ($existing.Count -gt 0) {
             Set-NetFirewallRule -Name $i.id -Direction $i.direction -Action Block -Profile Any -Enabled True -ErrorAction Stop
             $app = Get-NetFirewallApplicationFilter -AssociatedNetFirewallRule $existing[0] -ErrorAction Stop
@@ -341,10 +373,10 @@ _ADD_BODY = r"""
     Send-Result $true
 """
 
-# Отсутствующее правило пропускается; любая другая ошибка удаления прерывает скрипт.
+# Отсутствующее правило пропускается; любая другая ошибка чтения или удаления прерывает скрипт.
 _REMOVE_BODY = r"""
     foreach ($id in @($data)) {
-        $found = @(Get-NetFirewallRule -Name $id -ErrorAction SilentlyContinue | Where-Object { $null -ne $_ })
+        $found = @(Find-NetMonRules @{ Name = $id })
         if ($found.Count -eq 0) { continue }
         Remove-NetFirewallRule -Name $id -ErrorAction Stop
     }
@@ -354,7 +386,7 @@ _REMOVE_BODY = r"""
 _ENABLE_BODY = r"""
     $state = if ($data.enabled) { 'True' } else { 'False' }
     foreach ($id in @($data.ids)) {
-        $found = @(Get-NetFirewallRule -Name $id -ErrorAction SilentlyContinue | Where-Object { $null -ne $_ })
+        $found = @(Find-NetMonRules @{ Name = $id })
         if ($found.Count -eq 0) { continue }
         Set-NetFirewallRule -Name $id -Enabled $state -ErrorAction Stop
     }
@@ -544,12 +576,18 @@ class FirewallManager:
                             lambda rules: verify_removed(rules, ids), {e.key for e in entries})
 
     def set_enabled(self, entries, enabled):
-        ids = [i for e in entries for i in e.rule_ids]
         names = ', '.join(_entry_title(e) for e in entries)
-        text = ('Снова запрещено: %s' if enabled else 'Временно разрешено: %s') % names
-        return self._submit(lambda: self.backend.set_enabled(ids, enabled), text,
-                            lambda rules: verify_enabled(rules, ids, enabled),
-                            {e.key for e in entries})
+        keys = {e.key for e in entries}
+        if enabled:
+            # «Снова запретить» = создать или обновить ВСЕ правила этих строк: если какое-то
+            # успели удалить (например, в wf.msc), оно будет восстановлено, а не пропущено
+            plan = entries_plan(entries)
+            return self._submit(lambda: self.backend.add(plan), 'Снова запрещено: %s' % names,
+                                lambda rules: verify_present(rules, plan), keys)
+        ids = [i for e in entries for i in e.rule_ids]
+        return self._submit(lambda: self.backend.set_enabled(ids, False),
+                            'Временно разрешено: %s' % names,
+                            lambda rules: verify_disabled(rules, ids), keys)
 
     def _submit(self, action, success_text, verify, keys):
         with self._lock:

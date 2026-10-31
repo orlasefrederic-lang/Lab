@@ -162,9 +162,12 @@ class Monitor:
                 break
 
     def _snapshot(self):
-        now = time.time()
-        self.model.sync_processes(self.sysinfo.processes(), now)
-        self.model.sync_tcp(self.sysinfo.tcp_connections(), now)
+        # время берётся ПОСЛЕ чтения: всё, что попало в снимок, к этому моменту уже существовало
+        # (по нему модель отличает процесс от нового владельца того же PID)
+        processes = self.sysinfo.processes()
+        self.model.sync_processes(processes, time.time())
+        connections = self.sysinfo.tcp_connections()
+        self.model.sync_tcp(connections, time.time())
 
     def _fill_details(self):
         for uid, pid in self.model.pending_details(100):

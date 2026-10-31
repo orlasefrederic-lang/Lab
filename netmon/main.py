@@ -24,6 +24,7 @@ if HERE not in sys.path:
 import winapi  # noqa: E402
 from monitor import Monitor  # noqa: E402
 from storage import Storage, default_data_dir  # noqa: E402
+from version import APP_NAME, __version__  # noqa: E402
 
 log = logging.getLogger('netmon')
 
@@ -33,6 +34,7 @@ def parse_args(argv=None):
         prog='netmon',
         description='Показывает, какие программы работают с сетью: сколько байт они '
                     'отправили и получили и с какими адресами.')
+    p.add_argument('--version', action='version', version='%(prog)s ' + __version__)
     p.add_argument('--demo', action='store_true',
                    help='демо-режим с выдуманными данными (права администратора не нужны)')
     p.add_argument('--console', action='store_true', help='текстовый режим вместо окна')
@@ -109,6 +111,7 @@ def main(argv=None):
     gui_mode = not (args.console or args.report)
     data_dir = default_data_dir()
     setup_logging(data_dir, not gui_mode)
+    log.info('%s %s, Python %s', APP_NAME, __version__, sys.version.split()[0])
     db_name = 'demo-history.sqlite3' if args.demo else 'history.sqlite3'
     db_path = args.db or os.path.join(data_dir, db_name)
 

@@ -9,6 +9,7 @@ from firewall import (FirewallError, apply_block, block_plan, check_blockable, d
                       verify_removed, warnings_for)
 from model import Model, display_name, group_views
 from util import RateTracker, fmt_bytes, fmt_datetime, fmt_rate, fmt_time, ip_category
+from version import APP_NAME, __version__
 
 
 def _cut(text, width):
@@ -51,7 +52,8 @@ def run_console(monitor, keep_days=None, interval=2.0, top=25, hide_lo=True):
             rows.sort(key=lambda r: (r[0], r[1]), reverse=True)
             st = monitor.status()
             out = ['\x1b[2J\x1b[H',
-                   'Сетевая активность программ — %s   (Ctrl+C — выход)' % time.strftime('%H:%M:%S'),
+                   '%s %s — %s   (Ctrl+C — выход)' % (APP_NAME, __version__,
+                                                    time.strftime('%H:%M:%S')),
                    ('ETW: событий %s, потеряно %s' % (st.get('events', 0), st.get('lost', 0)))
                    if st.get('source_ok') else 'ETW не работает: %s' % st.get('source_error'),
                    '',
@@ -88,6 +90,7 @@ def run_report(storage, days=None, top=30, include_lo=False, destinations=5):
         if v.sent or v.recv:
             views.append(v)
     groups = sorted(group_views(views), key=lambda g: g.sent + g.recv, reverse=True)
+    print('%s %s — отчёт по истории' % (APP_NAME, __version__))
     print('История: %s' % storage.path)
     if days:
         print('Программы, активные за последние %g дн. (с %s). Объёмы — за всё время '

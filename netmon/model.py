@@ -6,6 +6,7 @@
 процессам происходят в process_pending() в рабочем потоке.
 """
 
+import bisect
 import ntpath
 import threading
 import time
@@ -24,6 +25,11 @@ TCP_ESTABLISHED = 5
 SPECIAL_NAMES = {0: 'Ядро (PID 0)', 4: 'System'}
 SLACK = 0.25          # допуск (с) при сравнении времени событий с запуском/завершением процесса
 INSTANCES_PER_PID = 4  # сколько последних экземпляров с одним PID помнить
+# Время создания процесса из Windows и момент, когда мы видели процесс, берутся из одних
+# системных часов; допуск покрывает только их шаг (до ~16 мс), а не задержки.
+CLOCK_EPS = 0.05
+START_MATCH = 0.5     # время запуска из события ETW и из GetProcessTimes одного процесса
+BOUNDS_PER_PID = 8    # сколько последних запусков/остановок PID помнить в накопителе
 
 
 def _port(value):
@@ -175,6 +181,7 @@ class Model:
         self._acc_lock = threading.Lock()
         self._acc = {}
         self._queue = []
+        self._bounds = {}            # pid -> времена запусков/остановок, известные потоку ETW
 
     # ============================================= приём событий (поток ETW)
 
@@ -184,8 +191,12 @@ class Model:
         Адреса — байты (4 или 16), порты — байты в сетевом порядке или int.
         Для приёма UDP etw.py заранее меняет местами поля пакета.
         """
-        key = (pid, proto, daddr, dport, saddr, sport)
         with self._acc_lock:
+            # события разных «жизней» одного PID (до и после перезапуска) не складываются
+            # вместе, даже если пришли не по порядку: номер жизни входит в ключ
+            bounds = self._bounds.get(pid)
+            key = (pid, bisect.bisect_right(bounds, ts) if bounds else 0,
+                   proto, daddr, dport, saddr, sport)
             a = self._acc.get(key)
             if a is None:
                 self._acc[key] = [size, 1, 0, 0, ts, ts] if send else [0, 0, size, 1, ts, ts]
@@ -198,22 +209,30 @@ class Model:
                 a[3] += 1
                 a[5] = ts
 
-    def _push(self, item):
+    def _push(self, item, pid=None, boundary=None):
         # порядок важен: накопленный трафик — раньше следующего события
         with self._acc_lock:
             if self._acc:
                 self._queue.append(('traffic', self._acc))
                 self._acc = {}
             self._queue.append(item)
+            if boundary is not None:
+                bounds = self._bounds.get(pid)
+                if bounds is None:
+                    if len(self._bounds) > 100000:
+                        self._bounds.clear()
+                    bounds = self._bounds[pid] = []
+                bisect.insort(bounds, boundary)
+                del bounds[:-BOUNDS_PER_PID]
 
     def on_accept(self, pid, local_port, ts=None):
         self._push(('accept', pid, _port(local_port), ts))
 
     def on_process_start(self, pid, ts, image):
-        self._push(('start', pid, ts, image))
+        self._push(('start', pid, ts, image), pid, ts)
 
     def on_process_stop(self, pid, ts):
-        self._push(('stop', pid, ts))
+        self._push(('stop', pid, ts), pid, ts)
 
     def on_dns(self, pid, name, results, ts):
         self._push(('dns', pid, name, results))
@@ -380,7 +399,7 @@ class Model:
 
     def _apply_traffic(self, acc):
         local = self.local_ips
-        for (pid, proto, daddr, dport, saddr, sport), (s, ps, r, pr, t0, t1) in acc.items():
+        for (pid, _life, proto, daddr, dport, saddr, sport), (s, ps, r, pr, t0, t1) in acc.items():
             proc = self._proc_at(pid, t0)
             # адреса уже приведены к виду «daddr — удалённый, saddr — наш» (см. etw.py)
             rip, lip = self._ip(daddr), self._ip(saddr)
@@ -555,19 +574,24 @@ class Model:
             return out
 
     def _same_instance(self, proc, info):
-        """Сведения, прочитанные по PID, относятся к этой записи, а не к новому владельцу PID?"""
-        started = info.get('started')
-        if started is not None:
-            if proc.started is not None and abs(started - proc.started) > 2.0:
-                return False
-            # процесс не мог появиться позже, чем мы впервые увидели его PID
-            return started <= proc.first_seen + 2.0
+        """Сведения, прочитанные по PID, относятся к этой записи, а не к новому владельцу PID?
+
+        first_seen — момент, когда этот экземпляр точно был жив (время после снимка
+        процессов, время события ETW). Процесс, созданный позже, — другой экземпляр,
+        как бы быстро ни сменился владелец PID.
+        """
         path = info.get('path')
-        if path and proc.snap_name and proc.pid not in SPECIAL_NAMES:
+        known = proc.snap_name or (ntpath.basename(proc.path) if proc.path else None)
+        if path and known and proc.pid not in SPECIAL_NAMES:
             base = ntpath.basename(self.nt_path(path)).lower()
-            if base and base != proc.snap_name.lower():
-                return False
-        return True
+            if base and base != known.lower():
+                return False                      # другой exe — точно другой процесс
+        started = info.get('started')
+        if started is None:
+            return True
+        if proc.started is not None:
+            return abs(started - proc.started) <= START_MATCH
+        return started <= proc.first_seen + CLOCK_EPS
 
     def fill_details(self, uid, info, now=None):
         """info: dict(path, started, cmdline[, exited]) или None, если процесса уже нет.
@@ -757,6 +781,7 @@ class Model:
         with self._acc_lock:
             self._acc = {}
             self._queue = []
+            self._bounds.clear()
         with self.lock:
             self.procs.clear()
             self.by_pid.clear()
