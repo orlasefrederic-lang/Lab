@@ -494,7 +494,9 @@ def _make_properties(for_start):
     props.Wnode.Flags = WNODE_FLAG_TRACED_GUID
     props.LoggerNameOffset = base
     if for_start:
-        props.Wnode.ClientContext = 1          # отметки времени по QPC
+        # отметки времени по системным часам — тем же, что у GetProcessTimes и time.time();
+        # QPC (1) после пересчёта в дату постепенно расходится с ними (NTP, дрейф)
+        props.Wnode.ClientContext = 2
         props.LogFileMode = EVENT_TRACE_REAL_TIME_MODE
         props.BufferSize = 64                  # КБ
         props.MinimumBuffers = 8

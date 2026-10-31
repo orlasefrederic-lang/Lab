@@ -8,6 +8,7 @@
 
 import bisect
 import ntpath
+import re
 import threading
 import time
 from collections import namedtuple
@@ -23,13 +24,16 @@ TCP_LISTEN = 2
 TCP_ESTABLISHED = 5
 
 SPECIAL_NAMES = {0: 'Ядро (PID 0)', 4: 'System'}
-SLACK = 0.25          # допуск (с) при сравнении времени событий с запуском/завершением процесса
+# Допуск (с) для неточных границ: время снимка процессов — момент после конца чтения,
+# а ядро ещё недолго отправляет данные уже завершённого процесса. Применяется, только
+# если событие не попало точно ни в чьё время жизни.
+SLACK = 0.25
 INSTANCES_PER_PID = 4  # сколько последних экземпляров с одним PID помнить
-# Время создания процесса из Windows и момент, когда мы видели процесс, берутся из одних
-# системных часов; допуск покрывает только их шаг (до ~16 мс), а не задержки.
+# Время создания процесса из Windows, время событий ETW (сеанс пишет системное время)
+# и момент, когда мы видели процесс, берутся из одних часов; допуск — только их шаг.
 CLOCK_EPS = 0.05
-START_MATCH = 0.5     # время запуска из события ETW и из GetProcessTimes одного процесса
 BOUNDS_PER_PID = 8    # сколько последних запусков/остановок PID помнить в накопителе
+_DRIVE_PATH = re.compile(r'^[a-z]:\\')
 
 
 def _port(value):
@@ -40,6 +44,20 @@ def _port(value):
 
 def _default_name(pid):
     return SPECIAL_NAMES.get(pid, 'PID %d' % pid)
+
+
+def _path_key(path):
+    """Полный путь для сравнения, если он вида C:\\…, иначе None.
+
+    Сетевые пути и пути вида \\Device\\… разные функции Windows записывают по-разному
+    (подключённый диск, \\Device\\Mup\\;LanmanRedirector\\…), поэтому их не сравниваем.
+    """
+    if not path:
+        return None
+    key = path.strip().strip('"').replace('/', '\\').lower()
+    if key.startswith('\\\\?\\'):
+        key = key[4:]
+    return key if _DRIVE_PATH.match(key) else None
 
 
 class Endpoint:
@@ -287,6 +305,8 @@ class Model:
         instances = self._instances.setdefault(pid, [])
         instances.append(proc)
         del instances[:-INSTANCES_PER_PID]
+        if started is not None:
+            self._clamp_previous(proc)
         if proc.name.lower() == 'svchost.exe':
             self._want_services = True
         return proc
@@ -297,19 +317,58 @@ class Model:
             proc.conns = 0
             proc.dirty = True
 
+    def _lifetimes(self, pid):
+        """[(экземпляр, начало, конец)] для экземпляров PID в порядке появления.
+
+        Неизвестные границы берутся у соседей: PID не может одновременно принадлежать
+        двум процессам, поэтому следующий владелец появился после ухода предыдущего.
+        """
+        instances = self._instances.get(pid, ())
+        result = []
+        for i, proc in enumerate(instances):
+            begin, end = proc.started, proc.ended
+            if begin is None and i > 0:
+                begin = instances[i - 1].ended
+            if end is None and i + 1 < len(instances):
+                end = instances[i + 1].started
+            result.append((proc, begin, end))
+        return result
+
     def _instance_at(self, pid, ts):
         """Известный экземпляр процесса с этим PID, который жил в момент ts, или None.
 
         События ETW из разных буферов могут прийти не по порядку: поздний пакет
         старого процесса не должен записываться новому владельцу PID.
+        1. Точное попадание во время жизни, без допусков.
+        2. Иначе — последний экземпляр, запущенный не позже ts: процесс не может
+           отправить пакет до своего запуска, а данные завершённого процесса ядро
+           ещё какое-то время досылает от его имени. Если это последний известный
+           экземпляр и он завершился раньше чем за SLACK до ts, PID, видимо, уже
+           у нового процесса, о котором мы пока не знаем (None).
         """
-        for proc in reversed(self._instances.get(pid, ())):
-            if proc.started is not None and ts < proc.started - SLACK:
-                continue
-            if proc.ended is not None and ts > proc.ended + SLACK:
-                continue
-            return proc
-        return None
+        lifetimes = self._lifetimes(pid)
+        for proc, begin, end in reversed(lifetimes):
+            if (begin is None or begin <= ts) and (end is None or ts <= end):
+                return proc
+        for i in range(len(lifetimes) - 1, -1, -1):
+            proc, begin, end = lifetimes[i]
+            if begin is not None and ts < begin:
+                continue                    # тогда этот процесс ещё не был запущен
+            if i + 1 < len(lifetimes) or end is None or ts <= end + SLACK:
+                return proc
+            return None
+        return lifetimes[0][0] if lifetimes else None   # раньше всех известных экземпляров
+
+    def _clamp_previous(self, proc):
+        """Предыдущие владельцы PID завершились до запуска proc (время из снимка — с запасом)."""
+        if proc.started is None:
+            return
+        for other in self._instances.get(proc.pid, ()):
+            if other is proc:
+                break
+            if other.ended is not None and other.ended > proc.started:
+                other.ended = proc.started
+                other.dirty = True
 
     def _proc_at(self, pid, ts):
         """Экземпляр, которому принадлежит событие; при необходимости создаёт новый."""
@@ -330,16 +389,23 @@ class Model:
         if cand is not None:
             self._finalize(cand)
         cur = self.by_pid.get(pid)
-        if cur is not None and cur.ended is None and cur.first_seen >= ts - 2.0:
-            # запись уже создана по снимку процессов или по трафику — это тот же процесс
-            if path and not cur.path:
-                cur.path = path
-                cur.name = name
-            if not cur.started:
-                cur.started = ts
-            return
         if cur is not None:
-            self._end(cur, ts)   # событие о завершении прежнего процесса было потеряно
+            if cur.started is not None and cur.started > ts + CLOCK_EPS:
+                return   # запоздавшее событие о запуске одного из прежних владельцев PID
+            if cur.first_seen >= ts - CLOCK_EPS:
+                # запись этого же процесса уже создана по снимку процессов или по трафику:
+                # её впервые увидели не раньше этого запуска (время создания из
+                # GetProcessTimes, если оно уже известно, чуть раньше события ETW — оставляем его)
+                if path and not cur.path:
+                    cur.path = path
+                    cur.name = name
+                if cur.started is None:
+                    cur.started = ts
+                    self._clamp_previous(cur)
+                return
+            # запись — о прежнем владельце PID (его видели ещё до этого запуска):
+            # событие о его завершении потеряно или ещё не дошло
+            self._end(cur, ts)
         self._new_proc(pid, ts, name=name, path=path, started=ts)
 
     def _apply_stop(self, pid, ts):
@@ -576,22 +642,27 @@ class Model:
     def _same_instance(self, proc, info):
         """Сведения, прочитанные по PID, относятся к этой записи, а не к новому владельцу PID?
 
-        first_seen — момент, когда этот экземпляр точно был жив (время после снимка
-        процессов, время события ETW). Процесс, созданный позже, — другой экземпляр,
-        как бы быстро ни сменился владелец PID.
+        1. Другой exe — другой процесс. Полные пути сравниваются целиком (C:\\Old\\app.exe и
+           C:\\Other\\app.exe — разные программы); если какой-то путь не вида C:\\… (сетевой,
+           \\Device\\…), сравниваются имена файлов.
+        2. first_seen — момент, когда этот экземпляр точно был жив (событие ETW, время после
+           снимка процессов). Процесс, созданный позже, — другой экземпляр, как бы быстро
+           ни сменился владелец PID и даже если exe тот же самый.
         """
         path = info.get('path')
-        known = proc.snap_name or (ntpath.basename(proc.path) if proc.path else None)
-        if path and known and proc.pid not in SPECIAL_NAMES:
-            base = ntpath.basename(self.nt_path(path)).lower()
-            if base and base != known.lower():
-                return False                      # другой exe — точно другой процесс
+        if path and proc.pid not in SPECIAL_NAMES:
+            new_path = self.nt_path(path)
+            old_key, new_key = _path_key(proc.path), _path_key(new_path)
+            if old_key and new_key:
+                if old_key != new_key:
+                    return False
+            else:
+                known = proc.snap_name or (ntpath.basename(proc.path) if proc.path else None)
+                base = ntpath.basename(new_path)
+                if known and base and base.lower() != known.lower():
+                    return False
         started = info.get('started')
-        if started is None:
-            return True
-        if proc.started is not None:
-            return abs(started - proc.started) <= START_MATCH
-        return started <= proc.first_seen + CLOCK_EPS
+        return started is None or started <= proc.first_seen + CLOCK_EPS
 
     def fill_details(self, uid, info, now=None):
         """info: dict(path, started, cmdline[, exited]) или None, если процесса уже нет.
@@ -628,6 +699,7 @@ class Model:
                     proc.name = ntpath.basename(proc.path) or proc.name
             if info.get('started'):
                 proc.started = info['started']
+                self._clamp_previous(proc)
             if info.get('cmdline'):
                 proc.cmdline = info['cmdline']
             if info.get('exited'):

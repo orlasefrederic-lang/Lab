@@ -366,6 +366,11 @@ class SessionStartTest(unittest.TestCase):
                                           ('start', 'NetActivityMonitor')])
         self.assertEqual(session._session, 42)
 
+    def test_session_uses_system_clock(self):
+        # время событий должно совпадать по часам с GetProcessTimes и time.time()
+        _buf, props = etw._make_properties(True)
+        self.assertEqual(props.Wnode.ClientContext, 2)
+
 
 if __name__ == '__main__':
     unittest.main()

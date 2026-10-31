@@ -367,6 +367,137 @@ class LifecycleTest(unittest.TestCase):
             self.assertEqual({p.name: p.sent for p in self.m.procs.values()},
                              {'old.exe': 7, 'new.exe': 9}, order)
 
+    def _fresh(self):
+        self.m = Model()
+        self.m.resolve_names = False
+        return self.m
+
+    def test_same_exe_name_in_other_directory(self):
+        # отчёт 1.2, V12-1: C:\Old\app.exe и C:\Other\app.exe — разные программы
+        # (и когда время создания известно, и когда его прочитать не удалось)
+        for started in (100.4, None):
+            m = self._fresh()
+            m.on_process_start(100, 100.0, 'C:\\Old\\app.exe')
+            traffic(m, 100, '1.1.1.1', 443, 50000, sent=10, ts=100.1)
+            m.process_pending()
+            old = proc_by_pid(m, 100)
+            m.fill_details(old.uid, {'path': 'C:\\Other\\app.exe', 'started': started}, now=100.5)
+            new = proc_by_pid(m, 100)
+            self.assertIsNot(old, new, started)
+            self.assertEqual((old.path, old.started, old.sent), ('C:\\Old\\app.exe', 100.0, 10),
+                             started)
+            self.assertEqual((new.path, new.started, new.sent), ('C:\\Other\\app.exe', started, 0),
+                             started)
+
+    def test_same_full_path_started_right_after(self):
+        # отчёт 1.2, V12-1: тот же exe по тому же пути запущен почти сразу после прежнего;
+        # различаем по времени создания, а не по каталогу
+        for gap in (0.1, 0.4):
+            m = self._fresh()
+            m.on_process_start(100, 100.0, 'C:\\App\\app.exe')
+            traffic(m, 100, '1.1.1.1', 443, 50000, sent=10, ts=100.05)
+            m.process_pending()
+            old = proc_by_pid(m, 100)
+            m.fill_details(old.uid, {'path': 'C:\\App\\app.exe', 'started': 100.0 + gap},
+                           now=100.0 + gap + 0.1)
+            new = proc_by_pid(m, 100)
+            self.assertIsNot(old, new, gap)
+            self.assertEqual((old.started, old.sent), (100.0, 10), gap)
+            self.assertEqual((new.path, new.started, new.sent),
+                             ('C:\\App\\app.exe', 100.0 + gap, 0), gap)
+
+    def test_second_start_of_same_exe_without_stop_event(self):
+        # запуск того же exe с тем же PID, а остановка прежнего дошла последней
+        self.m.on_process_start(100, 100.0, 'C:\\App\\app.exe')
+        traffic(self.m, 100, '1.1.1.1', 443, 50000, sent=10, ts=100.05)
+        self.m.on_process_start(100, 100.1, 'C:\\App\\app.exe')
+        traffic(self.m, 100, '1.1.1.1', 443, 50000, sent=9, ts=100.2)
+        self.m.on_process_stop(100, 100.08)
+        self.m.process_pending()
+        old, new = sorted(self.m.procs.values(), key=lambda p: p.started)
+        self.assertEqual((old.started, old.ended, old.sent), (100.0, 100.08, 10))
+        self.assertEqual((new.started, new.ended, new.sent), (100.1, None, 9))
+
+    def test_path_forms_that_cannot_be_compared_fall_back_to_name(self):
+        # сетевой путь и путь \Device\… разные функции Windows пишут по-разному: тут
+        # сравниваются имена файлов, а экземпляры различает время создания
+        for etw_path, info_path in (('\\\\srv\\share\\app.exe', 'Z:\\app.exe'),
+                                    ('\\Device\\HarddiskVolume9\\App\\app.exe', 'C:\\App\\app.exe')):
+            m = self._fresh()
+            m.on_process_start(100, 100.0, etw_path)
+            m.process_pending()
+            proc = proc_by_pid(m, 100)
+            m.fill_details(proc.uid, {'path': info_path, 'started': 99.99}, now=100.5)
+            self.assertIs(proc_by_pid(m, 100), proc, etw_path)
+            self.assertEqual((len(m.procs), proc.path), (1, info_path), etw_path)
+
+    def test_delayed_packet_near_close_lifetimes(self):
+        # отчёт 1.2, V12-2: old.exe 1.0–3.0, new.exe с тем же PID с 3.1; пакет в 2.9 точно
+        # попадает во время жизни old.exe и не должен уйти в допуск new.exe
+        for order in ([(2.9, 7), (3.2, 9)], [(3.2, 9), (2.9, 7)]):
+            m = self._fresh()
+            m.on_process_start(100, 1.0, 'C:\\old.exe')
+            m.on_process_stop(100, 3.0)
+            m.on_process_start(100, 3.1, 'C:\\new.exe')
+            for ts, size in order:
+                traffic(m, 100, '1.1.1.1', 443, 50000, sent=size, ts=ts)
+            m.process_pending()
+            self.assertEqual({p.name: p.sent for p in m.procs.values()},
+                             {'old.exe': 7, 'new.exe': 9}, order)
+
+    def test_packets_near_stop_and_start(self):
+        # остановка old.exe в 3.0, запуск new.exe в 3.1; пакет между ними — ещё old.exe:
+        # new.exe тогда не существовал. Пакет у границы и пакеты из середины жизни обоих
+        # процессов (с теми же адресами) приходят в обоих порядках
+        for ts, owner in ((2.99, 'old.exe'), (3.0, 'old.exe'), (3.04, 'old.exe'),
+                          (3.1, 'new.exe'), (3.11, 'new.exe')):
+            for edge_first in (True, False):
+                m = self._fresh()
+                m.on_process_start(100, 1.0, 'C:\\old.exe')
+                m.on_process_stop(100, 3.0)
+                m.on_process_start(100, 3.1, 'C:\\new.exe')
+                packets = [(2.0, 100), (5.0, 1000)]
+                packets.insert(0 if edge_first else 2, (ts, 1))
+                for when, size in packets:
+                    traffic(m, 100, '1.1.1.1', 443, 50000, sent=size, ts=when)
+                m.process_pending()
+                expected = {'old.exe': 100, 'new.exe': 1000}
+                expected[owner] += 1
+                self.assertEqual({p.name: p.sent for p in m.procs.values()}, expected,
+                                 (ts, edge_first))
+
+    def test_data_sent_right_after_exit_stays_with_process(self):
+        # ядро ещё недолго досылает данные завершённого процесса от его имени
+        self.m.on_process_start(100, 1.0, 'C:\\old.exe')
+        self.m.on_process_stop(100, 3.0)
+        traffic(self.m, 100, '1.1.1.1', 443, 50000, sent=5, ts=3.2)
+        self.m.process_pending()
+        self.assertEqual([(p.name, p.sent) for p in self.m.procs.values()], [('old.exe', 5)])
+
+    def test_newer_instance_without_start_time_does_not_take_old_packet(self):
+        self.m.on_process_start(100, 1.0, 'C:\\old.exe')
+        self.m.on_process_stop(100, 3.0)
+        self.m.process_pending()
+        self.m.sync_processes({100: ('new.exe', 1)}, now=5.0)   # время запуска пока неизвестно
+        traffic(self.m, 100, '1.1.1.1', 443, 50000, sent=7, ts=2.9)    # запоздавший пакет old.exe
+        traffic(self.m, 100, '1.1.1.1', 443, 50000, sent=9, ts=5.5)
+        self.m.process_pending()
+        self.assertEqual({p.name: p.sent for p in self.m.procs.values()},
+                         {'old.exe': 7, 'new.exe': 9})
+
+    def test_start_time_limits_previous_owner_end(self):
+        # прежний владелец PID пропал из снимка в 10.0, а новый запущен в 9.0:
+        # значит, прежний завершился не позже 9.0
+        self.m.sync_processes({100: ('old.exe', 1)}, now=5.0)
+        self.m.sync_processes({1: ('other.exe', 0)}, now=10.0)
+        old = proc_by_pid(self.m, 100)
+        self.assertEqual(old.ended, 10.0)
+        self.m.on_process_start(100, 9.0, 'C:\\new.exe')
+        traffic(self.m, 100, '1.1.1.1', 443, 50000, sent=9, ts=9.5)
+        self.m.process_pending()
+        new = proc_by_pid(self.m, 100)
+        self.assertEqual((old.ended, old.sent, new.started, new.sent), (9.0, 0, 9.0, 9))
+
     def test_group_views(self):
         for pid in (10, 11):
             traffic(self.m, pid, '8.8.8.8', 443, 50000 + pid, sent=100)
@@ -536,6 +667,13 @@ class UtilTest(unittest.TestCase):
         with self.assertRaises(SystemExit), contextlib.redirect_stdout(out):
             main.parse_args(['--version'])
         self.assertEqual(out.getvalue().strip(), 'netmon ' + __version__)
+
+    def test_network_image_paths(self):
+        from winapi import nt_path_to_dos
+        self.assertEqual(nt_path_to_dos('\\Device\\Mup\\srv\\share\\a.exe'), '\\\\srv\\share\\a.exe')
+        self.assertEqual(nt_path_to_dos('\\Device\\Mup\\;LanmanRedirector\\;Z:00000000000a1b2c'
+                                        '\\srv\\share\\a.exe'), '\\\\srv\\share\\a.exe')
+        self.assertEqual(nt_path_to_dos('\\Device\\Mup\\srv'), '\\Device\\Mup\\srv')
 
     def test_fmt_bytes(self):
         self.assertEqual(fmt_bytes(0), '0 Б')

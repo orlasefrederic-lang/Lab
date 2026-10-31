@@ -505,6 +505,12 @@ def nt_path_to_dos(path):
     low = path.lower()
     if low.startswith('\\systemroot\\'):
         return os.environ.get('SystemRoot', r'C:\Windows') + path[11:]
+    if low.startswith(('\\device\\mup\\', '\\device\\lanmanredirector\\')):
+        # сетевой путь: \Device\Mup\[;LanmanRedirector\;Z:000…\]сервер\ресурс\… -> \\сервер\ресурс\…
+        parts = path.split('\\')[3:]
+        while parts and parts[0].startswith(';'):
+            del parts[0]
+        return '\\\\' + '\\'.join(parts) if len(parts) > 1 else path
     if not low.startswith('\\device\\') or not IS_WINDOWS:
         return path
     for attempt in range(2):
