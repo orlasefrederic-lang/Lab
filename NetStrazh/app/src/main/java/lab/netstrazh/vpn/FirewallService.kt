@@ -143,7 +143,9 @@ class FirewallService : VpnService(), EngineHost {
 
     private fun checkCapture() {
         val e = engine ?: return
-        // Right after a start a lost capture is likeliest, and every second of it lets apps around us.
+        // Right after a start Android may need seconds to install the interface's routes (a loaded
+        // system; until then apps go around us and nothing can hurry it): probe often, so the first
+        // packet through is seen at once, but rebuild only if the routes do not come at all.
         val windowMs = if (captureVerifiedAt < Live.startedAt) CAPTURE_FIRST_WINDOW_MS else CAPTURE_WINDOW_MS
         try {
             checker.execute {
@@ -405,7 +407,7 @@ class FirewallService : VpnService(), EngineHost {
         private const val CAPTURE_FIRST_MS = 200L
         private const val CAPTURE_EVERY_MS = 60_000L
         /** How long probes may go unanswered before the capture counts as lost. */
-        private const val CAPTURE_FIRST_WINDOW_MS = 1_500L
+        private const val CAPTURE_FIRST_WINDOW_MS = 5_000L
         private const val CAPTURE_WINDOW_MS = 2_500L
         private const val PROBE_EVERY_MS = 200L
         private const val MAX_CAPTURE_RESTARTS = 3

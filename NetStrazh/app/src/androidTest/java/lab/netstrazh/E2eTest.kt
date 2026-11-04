@@ -87,6 +87,7 @@ class E2eTest {
             Rules.set(pkg, 0)
             Prefs.proxy = ProxyConfig.OFF
             val prepared = android.net.VpnService.prepare(ctx) == null
+            val tStart = System.currentTimeMillis()
             // Start like the app's own switch does: from a visible activity (FGS start from the
             // background is restricted, and the service needs BIND_VPN_SERVICE, which the shell lacks).
             ActivityScenario.launch(MainActivity::class.java).use { sc ->
@@ -102,6 +103,9 @@ class E2eTest {
             waitFor(10_000, "default network is our VPN") {
                 cm.getNetworkCapabilities(cm.activeNetwork)?.hasTransport(NetworkCapabilities.TRANSPORT_VPN) == true
             }
+            // Android reports the VPN as the default network before its routes exist (a loaded system
+            // takes seconds): only the capture probe shows traffic really enters the interface.
+            waitFor(25_000, "capture verified") { FirewallService.captureVerifiedAt >= tStart }
         }
 
         @AfterClass @JvmStatic
