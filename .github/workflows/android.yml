@@ -19,6 +19,8 @@ permissions:
 
 jobs:
   build:
+    outputs:
+      apk: ${{ steps.name.outputs.apk }}
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -51,12 +53,16 @@ jobs:
         run: ./gradlew --no-daemon assembleRelease
 
       - name: Name the APK
-        # Same number as versionName in app/build.gradle.kts (1.1.<build>).
-        run: cp app/build/outputs/apk/release/app-release.apk "NetStrazh-1.1.${{ github.run_number }}.apk"
+        id: name
+        # The version the app shows (VERSION, e.g. 2.0) and the build number (versionCode - 100).
+        run: |
+          apk="NetStrazh-$(tr -d '[:space:]' < VERSION)-build${{ github.run_number }}"
+          cp app/build/outputs/apk/release/app-release.apk "$apk.apk"
+          echo "apk=$apk" >> "$GITHUB_OUTPUT"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: NetStrazh-1.1.${{ github.run_number }}
+          name: ${{ steps.name.outputs.apk }}
           path: NetStrazh/NetStrazh-*.apk
 
   e2e:
@@ -119,13 +125,13 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: NetStrazh-1.1.${{ github.run_number }}
+          name: ${{ needs.build.outputs.apk }}
 
       - name: Publish to Releases
         uses: softprops/action-gh-release@v2
         with:
           tag_name: build-${{ github.run_number }}
-          name: Сетевой страж 1.1.${{ github.run_number }}
+          name: ${{ needs.build.outputs.apk }}
           target_commitish: ${{ github.sha }}
           files: NetStrazh-*.apk
           body: |

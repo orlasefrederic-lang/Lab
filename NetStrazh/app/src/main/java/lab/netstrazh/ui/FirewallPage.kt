@@ -15,7 +15,10 @@ import lab.netstrazh.vpn.FirewallService
 
 /** "Файрвол": the list of apps that are not allowed to use the internet. */
 class FirewallPage(act: MainActivity) : Page(act) {
-    private class Item(val pkg: String, val label: String, val flags: Int)
+    /** One rule: [pkg] is the rule key, a package or the key of a UID without one. */
+    private class Item(val pkg: String, val label: String, val flags: Int) {
+        val uid: Int? get() = Rules.uidOfKey(pkg)
+    }
 
     private val warn = act.text("", 13.5f, Pal.danger)
     private val list = ListView(act)
@@ -47,7 +50,8 @@ class FirewallPage(act: MainActivity) : Page(act) {
         list.adapter = adapter
         list.emptyView = emptyText
         list.setOnItemClickListener { _, _, pos, _ ->
-            Apps.forPackage(adapter.items[pos].pkg)?.let { AppActivity.open(act, it.uid) }
+            val item = adapter.items[pos]
+            (item.uid ?: Apps.forPackage(item.pkg)?.uid)?.let { AppActivity.open(act, it) }
         }
         addView(list, lp(MATCH, 0, 1f))
         addView(emptyText, lp(MATCH, WRAP))
@@ -96,7 +100,9 @@ class FirewallPage(act: MainActivity) : Page(act) {
     private fun load() {
         tick()
         warn.text = "⚠ Защита выключена — блокировка сейчас не действует. Включите переключатель вверху."
-        val items = Rules.all().map { (pkg, f) -> Item(pkg, Apps.labelForPackage(pkg), f) }
+        val items = Rules.all().map { (pkg, f) ->
+            Item(pkg, Rules.uidOfKey(pkg)?.let { Apps.forUid(it).label } ?: Apps.labelForPackage(pkg), f)
+        }
             .sortedWith(compareBy(String.CASE_INSENSITIVE_ORDER) { it.label })
         adapter.items = items
     }
@@ -174,7 +180,7 @@ class FirewallPage(act: MainActivity) : Page(act) {
                 f and Rules.BLOCK_ALL == Rules.BLOCK_ALL -> "интернет запрещён полностью"
                 f and Rules.WIFI != 0 -> "запрещён Wi-Fi, мобильный разрешён"
                 f and Rules.MOBILE != 0 -> "запрещён мобильный, Wi-Fi разрешён"
-                else -> it.pkg
+                else -> it.uid?.let { u -> "UID $u" } ?: it.pkg
             }
             sub.setTextColor(if (f and Rules.BLOCK_ALL != 0) Pal.danger else Pal.sub)
             context.stylePill(wifi, if (f and Rules.WIFI != 0) 4 else 3)

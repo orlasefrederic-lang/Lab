@@ -107,6 +107,13 @@ object Fmt {
 
 // ------------------------------------------------------------------ view helpers
 
+/** " v.2.0": the version the app shows after its name (empty if unknown). */
+fun Context.appVersion(): String = try {
+    packageManager.getPackageInfo(packageName, 0).versionName?.let { " v.$it" } ?: ""
+} catch (_: Exception) {
+    ""
+}
+
 fun Context.dp(v: Int): Int = (v * resources.displayMetrics.density + 0.5f).toInt()
 fun Context.dpf(v: Float): Float = v * resources.displayMetrics.density
 

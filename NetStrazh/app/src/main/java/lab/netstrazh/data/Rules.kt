@@ -11,6 +11,8 @@ import java.util.concurrent.CopyOnWriteArrayList
  * Firewall rules per package: block on Wi-Fi, block on mobile data, or exclude from the VPN entirely.
  * Rules are applied by app id (uid % 100000), so they also cover work profiles and app clones.
  * Besides, host names can be blocked for one app or for all, and DNS can be blocked with the app.
+ * A UID without a package (the kernel, system services, connections Android could not attribute)
+ * gets its rules under the key [keyForUid]; such a UID cannot be excluded from the VPN.
  */
 object Rules {
     const val WIFI = 1
@@ -20,6 +22,10 @@ object Rules {
 
     /** Package key of host rules that apply to every app. */
     const val ALL = "*"
+
+    /** Owner of a flow Android could not name (Process.INVALID_UID). */
+    const val UNKNOWN_UID = -1
+    private const val UID_PREFIX = "uid:"
 
     private lateinit var sp: SharedPreferences
     private lateinit var hsp: SharedPreferences
@@ -48,9 +54,8 @@ object Rules {
         for ((k, v) in sp.all) if (v is Int && v != 0) m[k] = v
         byPkg = m
         val ids = HashMap<Int, Int>()
-        for ((pkg, f) in m) {
-            val uid = try { pm.getApplicationInfo(pkg, 0).uid } catch (_: Exception) { continue }
-            val id = uid % 100000
+        for ((key, f) in m) {
+            val id = appIdOf(key) ?: continue
             ids[id] = (ids[id] ?: 0) or f
         }
         byAppId = ids
@@ -70,13 +75,25 @@ object Rules {
             val host = k.substring(i + 1)
             if (pkg == ALL) { all += host; continue }
             pkgs.getOrPut(pkg) { HashSet() } += host
-            val uid = try { pm.getApplicationInfo(pkg, 0).uid } catch (_: Exception) { continue }
-            ids.getOrPut(uid % 100000) { HashSet() } += host
+            val id = appIdOf(pkg) ?: continue
+            ids.getOrPut(id) { HashSet() } += host
         }
         hostsByPkg = pkgs
         hostsByAppId = ids
         globalHosts = all
     }
+
+    /** Rule key of a UID without a package. */
+    fun keyForUid(uid: Int): String = UID_PREFIX + appId(uid)
+
+    /** The UID a [keyForUid] key stands for, or null for a package key. */
+    fun uidOfKey(key: String): Int? = if (key.startsWith(UID_PREFIX)) key.substring(UID_PREFIX.length).toIntOrNull() else null
+
+    private fun appId(uid: Int): Int = if (uid < 0) uid else uid % 100000
+
+    /** App id a rule key applies to; null for a package that is not installed. */
+    private fun appIdOf(key: String): Int? = uidOfKey(key)
+        ?: try { pm.getApplicationInfo(key, 0).uid % 100000 } catch (_: Exception) { null }
 
     fun flags(pkg: String): Int = byPkg[pkg] ?: 0
 
@@ -98,7 +115,7 @@ object Rules {
 
     /** True when [host] (or a parent domain of it) is blocked for [uid] or for all apps. */
     fun hostBlocked(uid: Int, host: String?): Boolean =
-        Hosts.blocked(host, if (uid >= 0) hostsByAppId[uid % 100000] else null, globalHosts)
+        Hosts.blocked(host, hostsByAppId[appId(uid)], globalHosts)
 
     fun normalizeHost(h: String): String = Hosts.normalize(h)
 
@@ -112,9 +129,9 @@ object Rules {
 
     fun blockedPackages(): Set<String> = byPkg.filterValues { it and BLOCK_ALL != 0 }.keys
 
-    fun excludedPackages(): Set<String> = byPkg.filterValues { it and EXCLUDE != 0 }.keys
+    fun excludedPackages(): Set<String> = byPkg.filter { (k, f) -> f and EXCLUDE != 0 && uidOfKey(k) == null }.keys
 
-    fun flagsForUid(uid: Int): Int = if (uid < 0) 0 else byAppId[uid % 100000] ?: 0
+    fun flagsForUid(uid: Int): Int = byAppId[appId(uid)] ?: 0
 
     fun isBlocked(uid: Int, net: NetType): Boolean {
         val f = flagsForUid(uid)

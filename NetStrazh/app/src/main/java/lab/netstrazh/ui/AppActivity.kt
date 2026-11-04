@@ -140,30 +140,34 @@ class AppActivity : Activity() {
     // ------------------------------------------------------------ firewall
 
     // System components share a UID (1000 runs dozens of services): they can be blocked too, as a whole.
-    private val canRule: Boolean get() = info.pkg != null && uid != android.os.Process.myUid()
+    // So can a UID without a package (the kernel, "Неизвестно"): by its UID; only excluding needs a package.
+    private val canRule: Boolean get() = (info.pkg != null || uid >= Rules.UNKNOWN_UID) && uid != android.os.Process.myUid()
+    private val canExclude: Boolean get() = canRule && info.pkg != null
     private val systemUid: Boolean get() = uid % 100000 < 10000
+
+    /** What this screen's rules are stored under: the main package, or the UID itself. */
+    private val ruleKey: String get() = info.pkg ?: Rules.keyForUid(uid)
 
     /** All packages of this UID; for "Система Android" Apps lists none, so ask the package manager. */
     private val uidPkgs: List<String> by lazy { info.pkgs.ifEmpty { Apps.packagesForUid(uid) } }
 
-    private fun currentFlags(): Int = uidPkgs.fold(0) { a, p -> a or Rules.flags(p) }.let {
-        if (uidPkgs.isEmpty()) Rules.flagsForUid(uid) else it
-    }
+    /** Rules in force for this UID: of all its packages, or of the UID itself. */
+    private fun currentFlags(): Int = Rules.flagsForUid(uid)
 
     private fun setFlags(f: Int) {
-        val pkg = info.pkg ?: return
+        val key = ruleKey
         val adds = f and Rules.BLOCK_ALL and currentFlags().inv() != 0
         if (adds && systemUid) {
-            confirmSystemBlock(this, info.label, uid, uidPkgs) { applyFlags(pkg, f) }
+            confirmSystemBlock(this, info.label, uid, uidPkgs) { applyFlags(key, f) }
             return
         }
-        applyFlags(pkg, f)
+        applyFlags(key, f)
     }
 
-    private fun applyFlags(pkg: String, f: Int) {
+    private fun applyFlags(key: String, f: Int) {
         // Shared-UID apps: keep the rule on the main package only.
-        for (p in uidPkgs) if (p != pkg && Rules.flags(p) != 0) Rules.set(p, 0)
-        Rules.set(pkg, f)
+        for (p in uidPkgs) if (p != key && Rules.flags(p) != 0) Rules.set(p, 0)
+        Rules.set(key, f)
         renderRules()
     }
 
@@ -173,7 +177,7 @@ class AppActivity : Activity() {
     }
 
     private fun setExclude(on: Boolean) {
-        if (!canRule) return
+        if (!canExclude) return
         setFlags(if (on) Rules.EXCLUDE else 0)
     }
 
@@ -189,34 +193,38 @@ class AppActivity : Activity() {
         val excluded = f and Rules.EXCLUDE != 0
         wifi.isEnabled = canRule && !excluded
         mobile.isEnabled = canRule && !excluded
-        exclude.isEnabled = canRule
+        exclude.isEnabled = canExclude
         wifi.alpha = if (wifi.isEnabled) 1f else 0.4f
         mobile.alpha = if (mobile.isEnabled) 1f else 0.4f
         ruleNote.text = when {
-            !canRule -> if (info.pkg == null) "Это служба ядра Android без пакета — её блокировка не поддерживается."
-                else "Это сам Сетевой страж."
+            !canRule -> if (uid == android.os.Process.myUid()) "Это сам Сетевой страж." else "Это сводная строка, а не владелец соединений."
             excluded -> "Приложение идёт мимо Стража."
             f and Rules.BLOCK_ALL == Rules.BLOCK_ALL -> "Интернет запрещён. Нажмите, чтобы разрешить."
             f and Rules.WIFI != 0 -> "Запрещён Wi-Fi. Мобильный интернет разрешён."
             f and Rules.MOBILE != 0 -> "Запрещён мобильный интернет. Wi-Fi разрешён."
-            else -> "Доступ в интернет разрешён. Нажмите на сеть, чтобы запретить." +
-                if (systemUid) "\nЭто системный UID: блокировка действует на все его службы сразу. " +
-                    "Точнее — блокировать отдельные адреса в списке «Куда подключалось»." else ""
-        } + if (!FirewallService.running && canRule) "\n⚠ Защита выключена — правила не действуют." else ""
+            else -> "Доступ в интернет разрешён. Нажмите на сеть, чтобы запретить." + when {
+                uid == Rules.UNKNOWN_UID -> "\nСюда попадают соединения, для которых Android не сообщил приложение. " +
+                    "Что это, подскажут адреса ниже."
+                systemUid -> "\nЭто системный UID: блокировка действует на все его службы сразу. " +
+                    "Точнее — блокировать отдельные адреса в списке «Куда подключалось»."
+                else -> ""
+            }
+        } + (if (canRule && !canExclude) "\nПускать мимо Стража можно только приложение с пакетом." else "") +
+            if (!FirewallService.running && canRule) "\n⚠ Защита выключена — правила не действуют." else ""
     }
 
     // ------------------------------------------------------------ host rules
 
     private fun renderHosts() {
         hostsBox.removeAllViews()
-        val pkg = info.pkg
-        val own = if (pkg != null) Rules.blockedHosts(pkg) else emptySet()
+        val key = if (canRule) ruleKey else null
+        val own = if (key != null) Rules.blockedHosts(key) else emptySet()
         val all = Rules.blockedHosts(Rules.ALL)
         if (own.isEmpty() && all.isEmpty()) {
-            line(hostsBox, "Нет", if (pkg != null) "Нажмите на адрес в списке «Куда подключалось» или «DNS», чтобы заблокировать его." else null)
+            line(hostsBox, "Нет", if (key != null) "Нажмите на адрес в списке «Куда подключалось» или «DNS», чтобы заблокировать его." else null)
             return
         }
-        for (h in own.sorted()) hostLine(h, "для этого приложения · нажмите, чтобы разблокировать") { Rules.setHostBlocked(pkg!!, h, false) }
+        for (h in own.sorted()) hostLine(h, "для этого приложения · нажмите, чтобы разблокировать") { Rules.setHostBlocked(key!!, h, false) }
         for (h in all.sorted()) hostLine(h, "для всех приложений · нажмите, чтобы разблокировать") { Rules.setHostBlocked(Rules.ALL, h, false) }
     }
 
@@ -236,7 +244,7 @@ class AppActivity : Activity() {
             toast("Блокировать можно адрес с именем, а не голый IP")
             return
         }
-        val pkg = info.pkg
+        val pkg = if (canRule) ruleKey else null
         val parent = parentDomain(h)
         val labels = ArrayList<String>()
         val actions = ArrayList<() -> Unit>()
@@ -400,11 +408,26 @@ class AppActivity : Activity() {
 
         /** Asks before blocking a system UID: all of its services lose the network at once. */
         fun confirmSystemBlock(ctx: Context, label: String, uid: Int, pkgs: List<String>, onYes: () -> Unit) {
+            if (uid == Rules.UNKNOWN_UID) {
+                android.app.AlertDialog.Builder(ctx)
+                    .setTitle("Запретить неизвестные соединения?")
+                    .setMessage("Это соединения, для которых Android так и не сообщил, какое приложение их открыло. " +
+                        "Страж переспрашивает несколько раз; если ответа нет, запрет срабатывает.\n\n" +
+                        "Обычно это редкие соединения системы. Если после запрета что-то перестанет работать, " +
+                        "снимите его здесь же.")
+                    .setPositiveButton("Запретить") { _, _ -> onYes() }
+                    .setNegativeButton("Отмена", null)
+                    .show()
+                return
+            }
             val names = pkgs.take(8).joinToString("\n") { "• $it" } + if (pkgs.size > 8) "\n• …и ещё ${pkgs.size - 8}" else ""
             android.app.AlertDialog.Builder(ctx)
                 .setTitle("Заблокировать системный UID ${uid % 100000}?")
-                .setMessage("«$label» — общий UID для системных служб" +
-                    (if (pkgs.isNotEmpty()) ":\n$names" else ".") +
+                .setMessage(if (pkgs.isEmpty()) "«$label» — служба Android без пакета. Блокировка запретит сеть " +
+                    "ей целиком, и что-то в системе может перестать работать (без «DNS-резолвера», например, " +
+                    "не откроются сайты). Снять блокировку можно в любой момент.\n\nТочнее — блокировать " +
+                    "отдельные адреса: нажмите на адрес в списке «Куда подключалось»."
+                else "«$label» — общий UID для системных служб:\n$names" +
                     "\n\nБлокировка запретит сеть им всем сразу (у Xiaomi там обычно обновления системы, " +
                     "«Безопасность», «Найти устройство», облако). Что-то из этого может перестать работать. " +
                     "Снять блокировку можно в любой момент.\n\nТочнее — блокировать отдельные адреса: " +

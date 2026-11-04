@@ -20,6 +20,7 @@ import lab.netstrazh.ui.PickerActivity
 import lab.netstrazh.ui.SettingsActivity
 import lab.netstrazh.vpn.FirewallService
 import lab.netstrazh.vpn.Live
+import lab.netstrazh.vpn.NetType
 import lab.netstrazh.vpn.ProxyConfig
 import lab.netstrazh.vpn.ProxyTester
 import lab.netstrazh.vpn.ProxyType
@@ -512,6 +513,28 @@ class E2eTest {
             assertTrue("TCP after rebuilding (round $round)", httpGet("example.com").startsWith("HTTP/1."))
             waitSeen("TCP captured after rebuilding (round $round)") { it.proto == "TCP" && it.port == 80 && it.uid == myUid && it.ts >= t1 }
         }
+    }
+
+    /**
+     * Connections Android cannot attribute ("Неизвестно") can be blocked like an app, by their UID.
+     * Known apps are not affected, and such a rule never becomes a VPN exclusion.
+     */
+    @Test fun t18_unknownOwnersCanBeBlocked() {
+        val key = Rules.keyForUid(Rules.UNKNOWN_UID)
+        Rules.set(key, Rules.BLOCK_ALL)
+        try {
+            assertTrue("unknown owner blocked on Wi-Fi", Rules.isBlocked(Rules.UNKNOWN_UID, NetType.WIFI))
+            assertTrue("unknown owner blocked on mobile", Rules.isBlocked(Rules.UNKNOWN_UID, NetType.MOBILE))
+            assertFalse("a UID rule is not an exclusion", key in Rules.excludedPackages())
+            val t0 = System.currentTimeMillis()
+            assertTrue("own TCP still flows", httpGet("example.com").startsWith("HTTP/1."))
+            waitSeen("own TCP attributed and allowed") { it.proto == "TCP" && it.port == 80 && it.uid == myUid && it.ts >= t0 && !it.blocked }
+            // The card of "Неизвестно" opens with its switches.
+            ActivityScenario.launch<AppActivity>(Intent(ctx, AppActivity::class.java).putExtra("uid", Rules.UNKNOWN_UID)).use { Thread.sleep(1000) }
+        } finally {
+            Rules.set(key, 0)
+        }
+        assertFalse("unblocked again", Rules.isBlocked(Rules.UNKNOWN_UID, NetType.WIFI))
     }
 
     /**

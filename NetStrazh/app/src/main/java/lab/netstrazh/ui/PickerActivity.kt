@@ -76,45 +76,52 @@ class PickerActivity : Activity() {
         setContentView(root)
 
         Bg.run({ Apps.installed().filter { it.hasInternet && it.pkg != packageName } }) {
-            all = it
+            // Owners without a package can be blocked too: by their UID.
+            all = listOf(Apps.forUid(Rules.UNKNOWN_UID), Apps.forUid(0)) + it
             loading.visibility = View.GONE
             applyFilter()
         }
     }
 
+    private fun key(a: Apps.Info): String = a.pkg ?: Rules.keyForUid(a.uid)
+
     private fun applyFilter() {
         val q = search.text.toString().trim()
         val showSys = sys.isChecked
         adapter.items = all.filter { a ->
-            val pkg = a.pkg ?: return@filter false
-            val blocked = Rules.flags(pkg) != 0
-            (showSys || !a.system || blocked) &&
-                (q.isEmpty() || a.label.contains(q, true) || pkg.contains(q, true))
-        }.sortedWith(compareByDescending<Apps.Info> { Rules.flags(it.pkg!!) != 0 }.thenBy(String.CASE_INSENSITIVE_ORDER) { it.label })
+            val key = key(a)
+            val blocked = Rules.flags(key) != 0
+            (showSys || !a.system || blocked || a.uid == Rules.UNKNOWN_UID) &&
+                (q.isEmpty() || a.label.contains(q, true) || key.contains(q, true))
+        }.sortedWith(compareByDescending<Apps.Info> { Rules.flags(key(it)) != 0 }
+            .thenByDescending { it.pkg == null }
+            .thenBy(String.CASE_INSENSITIVE_ORDER) { it.label })
     }
 
     private fun toggle(a: Apps.Info) {
-        val pkg = a.pkg ?: return
-        val f = Rules.flags(pkg)
+        val key = key(a)
+        val f = Rules.flags(key)
         val apply = {
-            Rules.set(pkg, if (f and Rules.BLOCK_ALL != 0) f and Rules.BLOCK_ALL.inv() else (f and Rules.EXCLUDE.inv()) or Rules.BLOCK_ALL)
+            Rules.set(key, if (f and Rules.BLOCK_ALL != 0) f and Rules.BLOCK_ALL.inv() else (f and Rules.EXCLUDE.inv()) or Rules.BLOCK_ALL)
             adapter.notifyDataSetChanged()
         }
         // A package on a shared system UID (e.g. 1000) blocks every service on that UID.
         if (f and Rules.BLOCK_ALL == 0 && a.uid % 100000 < 10000) {
-            AppActivity.confirmSystemBlock(this, a.label, a.uid, Apps.packagesForUid(a.uid), apply)
+            AppActivity.confirmSystemBlock(this, a.label, a.uid, if (a.pkg == null) emptyList() else Apps.packagesForUid(a.uid), apply)
         } else apply()
     }
 
     private fun bind(v: RowView, a: Apps.Info) {
         v.title.text = a.label
         v.icon.setImageDrawable(Apps.icon(a.pkg) ?: getDrawable(android.R.drawable.sym_def_app_icon))
-        v.line2.text = a.pkg + when {
-            a.uid % 100000 < 10000 -> " · системный UID ${a.uid % 100000}"
-            a.system -> " · системное"
-            else -> ""
+        v.line2.text = when {
+            a.uid == Rules.UNKNOWN_UID -> "соединения, для которых Android не назвал приложение"
+            a.pkg == null -> "служба без пакета · UID ${a.uid}"
+            a.uid % 100000 < 10000 -> a.pkg + " · системный UID ${a.uid % 100000}"
+            a.system -> a.pkg + " · системное"
+            else -> a.pkg
         }
-        val f = Rules.flags(a.pkg!!)
+        val f = Rules.flags(key(a))
         when {
             f and Rules.BLOCK_ALL != 0 -> {
                 v.setLine3(null)

@@ -97,6 +97,8 @@ class FirewallService : VpnService(), EngineHost {
 
     override fun onDestroy() {
         shutdown()
+        // A probe still waiting belongs to this instance only: end it with the service.
+        checker.shutdownNow()
         Rules.removeListener(rulesListener)
         if (instance === this) instance = null
         super.onDestroy()
@@ -141,32 +143,37 @@ class FirewallService : VpnService(), EngineHost {
 
     private fun checkCapture() {
         val e = engine ?: return
+        // Right after a start a lost capture is likeliest, and every second of it lets apps around us.
+        val windowMs = if (captureVerifiedAt < Live.startedAt) CAPTURE_FIRST_WINDOW_MS else CAPTURE_WINDOW_MS
         try {
             checker.execute {
-                val ok = probe(e)
+                val ok = try { probe(e, windowMs) } catch (_: InterruptedException) { return@execute }
                 main.post { onCaptureChecked(e, ok) }
             }
         } catch (_: java.util.concurrent.RejectedExecutionException) {
         }
     }
 
-    /** Sends probes into the interface from this process; true once one arrived. */
-    private fun probe(e: Engine): Boolean {
+    /** Sends a probe into the interface from this process every 200 ms; true once one arrived. */
+    private fun probe(e: Engine, windowMs: Long): Boolean {
         val nonce = java.util.Random().nextLong().let { if (it == 0L) 1L else it }
         val payload = java.nio.ByteBuffer.allocate(Engine.PROBE_MAGIC.size + 8).put(Engine.PROBE_MAGIC).putLong(nonce).array()
         val dst = InetSocketAddress(InetAddress.getByName(TunConfig.DNS4), Engine.PROBE_PORT)
-        repeat(3) {
-            try {
-                DatagramSocket().use { s -> s.send(DatagramPacket(payload, payload.size, dst)) }
-            } catch (_: Exception) {
+        val end = android.os.SystemClock.elapsedRealtime() + windowMs
+        var nextSend = 0L
+        while (true) {
+            val now = android.os.SystemClock.elapsedRealtime()
+            if (e.lastProbe == nonce) return true
+            if (now >= end) return false
+            if (now >= nextSend) {
+                nextSend = now + PROBE_EVERY_MS
+                try {
+                    DatagramSocket().use { s -> s.send(DatagramPacket(payload, payload.size, dst)) }
+                } catch (_: Exception) {
+                }
             }
-            val end = android.os.SystemClock.elapsedRealtime() + 700
-            while (android.os.SystemClock.elapsedRealtime() < end) {
-                if (e.lastProbe == nonce) return true
-                Thread.sleep(25)
-            }
+            Thread.sleep(20)
         }
-        return false
     }
 
     private fun onCaptureChecked(e: Engine, ok: Boolean) {
@@ -395,8 +402,12 @@ class FirewallService : VpnService(), EngineHost {
         const val ACTION_START = "lab.netstrazh.START"
         const val ACTION_STOP = "lab.netstrazh.STOP"
         private const val PRUNE_EVERY_MS = 6 * 3_600_000L
-        private const val CAPTURE_FIRST_MS = 800L
+        private const val CAPTURE_FIRST_MS = 200L
         private const val CAPTURE_EVERY_MS = 60_000L
+        /** How long probes may go unanswered before the capture counts as lost. */
+        private const val CAPTURE_FIRST_WINDOW_MS = 1_500L
+        private const val CAPTURE_WINDOW_MS = 2_500L
+        private const val PROBE_EVERY_MS = 200L
         private const val MAX_CAPTURE_RESTARTS = 3
         private val V6_ROUTES = listOf(
             "::" to 1, "8000::" to 2, "c000::" to 3, "e000::" to 4, "f000::" to 5,

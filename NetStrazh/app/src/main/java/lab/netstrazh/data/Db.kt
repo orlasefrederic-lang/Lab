@@ -8,7 +8,6 @@ import android.database.sqlite.SQLiteOpenHelper
 import android.util.Log
 import lab.netstrazh.Prefs
 import lab.netstrazh.vpn.Conn
-import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 
@@ -62,9 +61,9 @@ class Db private constructor(ctx: Context) : SQLiteOpenHelper(ctx, "netstrazh.db
 
     companion object {
         private lateinit var helper: Db
-        private val queue = ConcurrentLinkedQueue<Conn>()
-        /** Rows waiting in [queue] (its size() walks the whole queue). */
-        private val queued = java.util.concurrent.atomic.AtomicInteger()
+        // Bounded: if the database falls far behind (a flood of connections), rows are dropped rather
+        // than piling up in memory. The queue keeps its own count, so clearing cannot upset the bound.
+        private val queue = java.util.concurrent.LinkedBlockingQueue<Conn>(MAX_QUEUED)
         private val exec = Executors.newSingleThreadScheduledExecutor { r -> Thread(r, "ns-db").apply { isDaemon = true } }
 
         fun init(ctx: Context) {
@@ -73,13 +72,7 @@ class Db private constructor(ctx: Context) : SQLiteOpenHelper(ctx, "netstrazh.db
         }
 
         fun log(c: Conn) {
-            // Bounded: if the database falls far behind (a flood of connections), rows are dropped
-            // rather than piling up in memory.
-            if (queued.incrementAndGet() > MAX_QUEUED) {
-                queued.decrementAndGet()
-                return
-            }
-            queue.add(c)
+            queue.offer(c)
         }
 
         private fun flush() {
@@ -90,7 +83,6 @@ class Db private constructor(ctx: Context) : SQLiteOpenHelper(ctx, "netstrazh.db
                 try {
                     while (true) {
                         val c = queue.poll() ?: break
-                        queued.decrementAndGet()
                         val v = ContentValues(13)
                         v.put("ts", c.start)
                         v.put("te", if (c.end == 0L) System.currentTimeMillis() else c.end)
@@ -132,7 +124,6 @@ class Db private constructor(ctx: Context) : SQLiteOpenHelper(ctx, "netstrazh.db
         fun clear() {
             exec.submit {
                 queue.clear()
-                queued.set(0)
                 helper.writableDatabase.delete("conn", null, null)
             }.get()
         }

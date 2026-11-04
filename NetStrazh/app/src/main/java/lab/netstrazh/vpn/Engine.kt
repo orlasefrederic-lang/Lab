@@ -310,11 +310,13 @@ class Engine(val host: EngineHost, private val pfd: ParcelFileDescriptor, val cf
                 Thread.sleep(50)
                 continue
             }
-            // Only connections rewritten by tcpFromTun come from the fake peer; any other local
-            // socket reaching the server address is not an app flow.
-            val from = ch.socket().inetAddress?.address
+            // Only connections rewritten by tcpFromTun come from the fake peer to the interface address;
+            // anything else reaching the (wildcard) listener, e.g. from the LAN, is not an app flow.
+            val from = unmapped(ch.socket().inetAddress?.address)
+            val to = unmapped(ch.socket().localAddress?.address)
             val peer = if (from?.size == 16) cfg.p6 else cfg.p4
-            val e = if (from != null && from.contentEquals(peer)) nat.claim(ch.socket().port) else null
+            val self = if (from?.size == 16) cfg.t6 else cfg.t4
+            val e = if (from != null && from.contentEquals(peer) && to != null && to.contentEquals(self)) nat.claim(ch.socket().port) else null
             if (e == null) {
                 closeQuietly(ch)
                 continue
@@ -350,11 +352,13 @@ class Engine(val host: EngineHost, private val pfd: ParcelFileDescriptor, val cf
         val local = InetAddress.getByAddress(if (e.v6) cfg.t6 else cfg.t4)
         val uid = run {
             // An owner Android cannot name yet (e.g. a lookup racing with the socket's setup) is asked
-            // again a few times before the connection counts as nobody's.
+            // again a few times before the connection counts as nobody's; longer when "Неизвестно" is
+            // blocked, so a real app is not cut off by a slow answer.
             fun lookup() = host.ownerUid(OsConstants.IPPROTO_TCP, InetSocketAddress(local, e.srcPort), InetSocketAddress(dst, e.dstPort))
             var u = lookup()
             var tries = 0
-            while (u < 0 && tries++ < 3) {
+            val maxTries = if (u < 0 && isBlocked(Rules.UNKNOWN_UID)) UNKNOWN_BLOCKED_LOOKUPS else 3
+            while (u < 0 && tries++ < maxTries) {
                 Thread.sleep(20)
                 u = lookup()
             }
@@ -498,7 +502,8 @@ class Engine(val host: EngineHost, private val pfd: ParcelFileDescriptor, val cf
             }
             val frame = ByteBuffer.allocate(2 + r.size)
             frame.put((r.size ushr 8).toByte()).put(r.size.toByte()).put(r).flip()
-            while (frame.hasRemaining()) client.write(frame)
+            // An app that stopped reading does not hold the connection for ever either.
+            lab.netstrazh.net.withDeadline(client, DNS_TCP_IDLE_MS) { while (frame.hasRemaining()) client.write(frame) }
             conn.addRx(r.size + 2L)
         }
     }
@@ -691,6 +696,8 @@ class Engine(val host: EngineHost, private val pfd: ParcelFileDescriptor, val cf
         const val CONNECT_TIMEOUT_MS = 15_000
         const val PREREAD_MS = 400L
         const val MAX_TCP_RELAYS = 1024
+        /** Owner lookups (20 ms apart) for a TCP flow while unknown owners are blocked. */
+        const val UNKNOWN_BLOCKED_LOOKUPS = 10
         /** UDP port on our resolver address that receives capture probes. */
         const val PROBE_PORT = 7
         val PROBE_MAGIC = "NSPROBE1".toByteArray()
@@ -704,6 +711,11 @@ class Engine(val host: EngineHost, private val pfd: ParcelFileDescriptor, val cf
         fun closeQuietly(c: Closeable?) {
             try { c?.close() } catch (_: Exception) {}
         }
+
+        /** The IPv4 address inside an IPv4-mapped IPv6 one (::ffff:a.b.c.d), otherwise [a] as it is. */
+        fun unmapped(a: ByteArray?): ByteArray? =
+            if (a != null && a.size == 16 && (0..9).all { a[it] == 0.toByte() } && a[10] == (-1).toByte() && a[11] == (-1).toByte())
+                a.copyOfRange(12, 16) else a
 
         fun isIpLiteral(h: String): Boolean = h.contains(':') || h.all { it.isDigit() || it == '.' }
 

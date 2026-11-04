@@ -56,7 +56,7 @@ class MainActivity : Activity() {
 
         val header = hbox().apply { setPadding(dp(20), dp(14), dp(12), dp(10)) }
         val titles = vbox()
-        titles.addView(text("Сетевой страж", 22f, bold = true))
+        titles.addView(text("Сетевой страж" + appVersion(), 22f, bold = true))
         status = text("", 13f, Pal.sub)
         status.setOnClickListener { headerAction?.invoke() }
         titles.addView(status)
@@ -155,6 +155,8 @@ class MainActivity : Activity() {
                 if (direct) "⚠ Прокси недоступен — трафик идёт напрямую, без прокси. Нажмите, чтобы проверить"
                 else "⚠ Прокси недоступен — интернета нет. Нажмите, чтобы проверить"
             }
+            // Until the first probe of this engine arrives Android may still route apps around us.
+            on && FirewallService.captureVerifiedAt < Live.startedAt -> "Проверяю, что трафик идёт через Стража…"
             on -> "Защита включена" + (if (proxy) " · через прокси" else "") + " · соединений: ${Live.active.size}"
             pendingStart -> "Включаю…"
             now - Prefs.revokedAt < 15 * 60_000L && otherVpnActive() -> {
@@ -170,6 +172,7 @@ class MainActivity : Activity() {
         status.setTextColor(when {
             on && FirewallService.captureBroken -> Pal.danger
             proxyDown -> if (direct) Pal.warn else Pal.danger
+            on && FirewallService.captureVerifiedAt < Live.startedAt -> Pal.warn
             on -> Pal.ok
             headerAction != null -> Pal.warn
             else -> Pal.sub

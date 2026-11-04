@@ -3,8 +3,10 @@ plugins {
     id("org.jetbrains.kotlin.android")
 }
 
-// CI passes the run number so every build can be installed over the previous one.
+// CI passes the run number so every build can be installed over the previous one; the version the
+// user sees ("Сетевой страж v.2.0") is in the VERSION file.
 val buildNumber = (System.getenv("BUILD_NUMBER") ?: "0").toInt()
+val appVersion = rootProject.file("VERSION").readText().trim()
 
 android {
     namespace = "lab.netstrazh"
@@ -15,7 +17,7 @@ android {
         minSdk = 29
         targetSdk = 34
         versionCode = 100 + buildNumber
-        versionName = "1.1.$buildNumber"
+        versionName = appVersion
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
@@ -47,6 +49,11 @@ android {
 
     kotlinOptions {
         jvmTarget = "17"
+    }
+
+    testOptions {
+        // JVM tests of engine code (Upstream) touch Android classes only for constants and logging.
+        unitTests.isReturnDefaultValues = true
     }
 
     lint {
