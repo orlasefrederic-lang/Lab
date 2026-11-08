@@ -498,6 +498,84 @@ class LifecycleTest(unittest.TestCase):
         new = proc_by_pid(self.m, 100)
         self.assertEqual((old.ended, old.sent, new.started, new.sent), (9.0, 0, 9.0, 9))
 
+    def test_start_right_after_explicit_stop(self):
+        # отчёт 1.3, V13-1: остановка, а через доли секунды (меньше CLOCK_EPS) — запуск
+        # с тем же PID, другого или того же exe; трафик после запуска — уже нового процесса
+        for new_path in ('C:\\new.exe', 'C:\\old.exe'):
+            m = self._fresh()
+            m.on_process_start(100, 100.0, 'C:\\old.exe')
+            traffic(m, 100, '1.1.1.1', 443, 50000, sent=10, ts=100.005)
+            m.on_process_stop(100, 100.01)
+            m.on_process_start(100, 100.02, new_path)
+            traffic(m, 100, '1.1.1.1', 443, 50000, sent=9, ts=100.03)
+            m.process_pending()
+            old, new = sorted(m.procs.values(), key=lambda p: p.uid)
+            self.assertEqual((old.started, old.ended, old.sent), (100.0, 100.01, 10), new_path)
+            self.assertEqual((new.path, new.started, new.ended, new.sent),
+                             (new_path, 100.02, None, 9), new_path)
+            self.assertIs(proc_by_pid(m, 100), new, new_path)
+
+    def test_start_right_after_stop_of_record_from_traffic(self):
+        # о запуске прежнего процесса не знали (запись по трафику), но остановка дошла
+        traffic(self.m, 100, '1.1.1.1', 443, 50000, sent=10, ts=100.0)
+        self.m.on_process_stop(100, 100.01)
+        self.m.on_process_start(100, 100.02, 'C:\\new.exe')
+        traffic(self.m, 100, '1.1.1.1', 443, 50000, sent=9, ts=100.03)
+        self.m.process_pending()
+        old, new = sorted(self.m.procs.values(), key=lambda p: p.uid)
+        self.assertEqual((old.ended, old.sent), (100.01, 10))
+        self.assertEqual((new.name, new.started, new.ended, new.sent), ('new.exe', 100.02, None, 9))
+
+    def test_start_right_after_traffic_of_previous_owner(self):
+        # пакет в 100.0 — процесс уже жил; запуск в 100.02 (меньше CLOCK_EPS) не может быть
+        # его собственным: PID уже у нового процесса, а остановка прежнего дошла последней
+        traffic(self.m, 100, '1.1.1.1', 443, 50000, sent=10, ts=100.0)
+        self.m.on_process_start(100, 100.02, 'C:\\new.exe')
+        traffic(self.m, 100, '1.1.1.1', 443, 50000, sent=9, ts=100.03)
+        self.m.on_process_stop(100, 100.01)
+        self.m.process_pending()
+        old, new = sorted(self.m.procs.values(), key=lambda p: p.uid)
+        self.assertEqual((old.ended, old.sent), (100.01, 10))
+        self.assertEqual((new.name, new.started, new.ended, new.sent), ('new.exe', 100.02, None, 9))
+
+    def test_late_start_of_record_from_traffic_is_merged(self):
+        # запуск дошёл позже пакетов и даже позже остановки — лишней записи нет
+        traffic(self.m, 100, '1.1.1.1', 443, 50000, sent=10, ts=5.0)
+        self.m.on_process_stop(100, 5.5)
+        self.m.on_process_start(100, 4.9, 'C:\\app.exe')
+        self.m.process_pending()
+        (p,) = self.m.procs.values()
+        self.assertEqual((p.name, p.started, p.ended, p.sent), ('app.exe', 4.9, 5.5, 10))
+
+    def test_late_start_of_older_instance_is_merged_into_it(self):
+        # запуск прежнего владельца PID дошёл уже после запуска нового
+        traffic(self.m, 100, '1.1.1.1', 443, 50000, sent=10, ts=1.0)
+        self.m.on_process_stop(100, 3.0)
+        self.m.on_process_start(100, 3.1, 'C:\\new.exe')
+        self.m.on_process_start(100, 0.9, 'C:\\old.exe')
+        self.m.process_pending()
+        self.assertEqual(sorted((p.name, p.started, p.ended, p.sent) for p in self.m.procs.values()),
+                         [('new.exe', 3.1, None, 0), ('old.exe', 0.9, 3.0, 10)])
+
+    def test_start_is_checked_against_known_creation_time(self):
+        # запись по снимку в 10.0; GetProcessTimes уже сообщил время создания.
+        # Запуск в 10.02 — свой, только если время создания с ним сходится
+        for created, same in ((9.6, True), (5.0, False)):
+            m = self._fresh()
+            m.sync_processes({100: ('app.exe', 1)}, now=10.0)
+            uid = proc_by_pid(m, 100).uid
+            m.fill_details(uid, {'path': 'C:\\app.exe', 'started': created}, now=10.0)
+            m.on_process_start(100, 9.61 if same else 10.02, 'C:\\app.exe')
+            traffic(m, 100, '1.1.1.1', 443, 50000, sent=9, ts=10.03)
+            m.process_pending()
+            procs = sorted(m.procs.values(), key=lambda p: p.uid)
+            if same:
+                self.assertEqual([(p.started, p.ended, p.sent) for p in procs],
+                                 [(9.6, None, 9)])
+            else:
+                self.assertEqual([(p.started, p.ended, p.sent) for p in procs],
+                                 [(5.0, 10.02, 0), (10.02, None, 9)])
+
     def test_group_views(self):
         for pid in (10, 11):
             traffic(self.m, pid, '8.8.8.8', 443, 50000 + pid, sent=100)
