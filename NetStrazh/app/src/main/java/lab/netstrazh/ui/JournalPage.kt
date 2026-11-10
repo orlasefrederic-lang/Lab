@@ -22,6 +22,7 @@ class JournalPage(act: MainActivity) : Page(act) {
     private val chips = ArrayList<TextView>()
     private val search = EditText(act)
     private val list = ListView(act)
+    private val lost = act.text("", 12.5f, Pal.warn)
     private val empty = act.placeholder("Журнал пуст.\n\nЗдесь появятся все соединения приложений, когда защита включена.")
     private val adapter = ListAdapter<LogRow>({ RowView(act) }) { v, r, _ -> bind(v as RowView, r) }
     private var ticks = 0
@@ -59,6 +60,8 @@ class JournalPage(act: MainActivity) : Page(act) {
             }
         })
         addView(search, lp().apply { setMargins(act.dp(16), act.dp(2), act.dp(16), act.dp(6)) })
+        lost.visibility = View.GONE
+        addView(lost, lp().apply { setMargins(act.dp(18), 0, act.dp(16), act.dp(6)) })
         list.divider = null
         list.adapter = adapter
         list.setOnItemClickListener { _, _, pos, _ -> AppActivity.open(act, adapter.items[pos].uid) }
@@ -101,6 +104,11 @@ class JournalPage(act: MainActivity) : Page(act) {
             loading = false
             adapter.items = rows
             empty.visibility = if (rows.isEmpty()) View.VISIBLE else View.GONE
+            // The journal must not look complete when it is not.
+            val n = Db.dropped
+            lost.visibility = if (n > 0) View.VISIBLE else View.GONE
+            if (n > 0) lost.text = "⚠ В журнал не попало записей: $n — соединений было слишком много сразу. " +
+                "Правила файрвола на них действовали."
             if (dirty) load()
         }, { loading = false })
     }

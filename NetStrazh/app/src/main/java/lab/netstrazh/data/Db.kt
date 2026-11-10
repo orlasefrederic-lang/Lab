@@ -71,18 +71,26 @@ class Db private constructor(ctx: Context) : SQLiteOpenHelper(ctx, "netstrazh.db
             exec.scheduleWithFixedDelay({ flush() }, 2, 2, TimeUnit.SECONDS)
         }
 
+        /** Rows lost since the app started: the queue was full, or the database refused them. */
+        private val lost = java.util.concurrent.atomic.AtomicLong()
+        val dropped: Long get() = lost.get()
+
         fun log(c: Conn) {
-            queue.offer(c)
+            // A journal that silently misses connections would mislead: count what does not fit.
+            if (!queue.offer(c)) lost.incrementAndGet()
         }
 
         private fun flush() {
             if (queue.isEmpty()) return
+            var taken = 0L
+            var refused = 0L
             try {
                 val db = helper.writableDatabase
                 db.beginTransaction()
                 try {
                     while (true) {
                         val c = queue.poll() ?: break
+                        taken++
                         val v = ContentValues(13)
                         v.put("ts", c.start)
                         v.put("te", if (c.end == 0L) System.currentTimeMillis() else c.end)
@@ -97,13 +105,16 @@ class Db private constructor(ctx: Context) : SQLiteOpenHelper(ctx, "netstrazh.db
                         v.put("net", c.net)
                         v.put("via", c.via)
                         v.put("note", c.note)
-                        db.insert("conn", null, v)
+                        if (db.insert("conn", null, v) < 0) refused++
                     }
                     db.setTransactionSuccessful()
                 } finally {
                     db.endTransaction()
                 }
+                lost.addAndGet(refused)
             } catch (e: Exception) {
+                // The transaction is rolled back: every row taken for it is gone.
+                lost.addAndGet(taken)
                 Log.w("NetStrazh", "db flush", e)
             }
         }
@@ -124,6 +135,7 @@ class Db private constructor(ctx: Context) : SQLiteOpenHelper(ctx, "netstrazh.db
         fun clear() {
             exec.submit {
                 queue.clear()
+                lost.set(0)
                 helper.writableDatabase.delete("conn", null, null)
             }.get()
         }

@@ -84,6 +84,9 @@ class FirewallService : VpnService(), EngineHost {
         }
         Prefs.enabled = true
         if (engine == null) startEngine()
+        // Android starts us again when "always-on VPN" or "block connections without VPN" is
+        // switched: under the block the proxy app has to move inside the VPN (see excludedNow).
+        else if (excludedNow() != appliedExcluded) restartEngine()
         return START_STICKY
     }
 
@@ -182,12 +185,17 @@ class FirewallService : VpnService(), EngineHost {
         if (engine !== e) return // restarted meanwhile; the new engine has its own check
         if (ok) {
             captureFailures = 0
+            // The notification says "checking" until this engine's first probe arrived.
+            val first = captureVerifiedAt < Live.startedAt
             captureVerifiedAt = System.currentTimeMillis()
-            if (captureBroken) {
+            if (captureBroken || first) {
                 captureBroken = false
                 updateNotification()
             }
             main.postDelayed(captureCheck, CAPTURE_EVERY_MS)
+            // The system's "block connections without VPN" may have been switched meanwhile (nothing
+            // tells us): the proxy app then has to move into the VPN or out of it.
+            if (!first && excludedNow() != appliedExcluded) restartEngine()
             return
         }
         captureFailures++
@@ -294,6 +302,7 @@ class FirewallService : VpnService(), EngineHost {
     private fun excludedNow(): Set<String> {
         val p = Prefs.proxy
         lockdown = try { isLockdownEnabled } catch (_: Exception) { false }
+        alwaysOn = try { isAlwaysOn } catch (_: Exception) { false }
         val proxyApp = if (p.enabled && p.bypassApp && !lockdown && p.appPkg.isNotEmpty() && p.appPkg != packageName) setOf(p.appPkg) else emptySet()
         return Rules.excludedPackages() + proxyApp
     }
@@ -371,7 +380,12 @@ class FirewallService : VpnService(), EngineHost {
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
         return Notification.Builder(this, CHANNEL)
             .setSmallIcon(R.drawable.ic_stat_shield)
-            .setContentTitle(if (captureBroken) getString(R.string.notif_bypassed) else getString(R.string.notif_on))
+            .setContentTitle(getString(when {
+                captureBroken -> R.string.notif_bypassed
+                // Not "on" before a probe showed that traffic really enters this engine's interface.
+                engine == null || captureVerifiedAt < Live.startedAt -> R.string.notif_checking
+                else -> R.string.notif_on
+            }))
             .setContentText(
                 (if (blocked == 0) getString(R.string.notif_no_rules) else getString(R.string.notif_blocked, blocked)) +
                     if (Prefs.proxy.enabled) " · " + getString(R.string.notif_via_proxy) else ""
@@ -424,6 +438,9 @@ class FirewallService : VpnService(), EngineHost {
             private set
         /** Android's "Block connections without VPN" is on for us. */
         @Volatile var lockdown = false
+            private set
+        /** Android's "Always-on VPN" is on for us (as of the last start or check). */
+        @Volatile var alwaysOn = false
             private set
         /** An app (not a known proxy client) that serves the proxy port, for the user to confirm. */
         @Volatile var suggestedProxyPkg: String? = null

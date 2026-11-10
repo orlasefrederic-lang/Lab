@@ -345,11 +345,15 @@ class SettingsActivity : Activity() {
         val suggested = FirewallService.suggestedProxyPkg
         // The status refreshes every few seconds: rebuild the buttons only when they change, so a tap
         // in progress is not lost.
-        val key = "${cfg.enabled}|$pkg|$suggested|${cfg.appPkg}|${cfg.bypassApp}"
+        val locked = FirewallService.running && FirewallService.lockdown
+        val key = "${cfg.enabled}|$pkg|$suggested|${cfg.appPkg}|${cfg.bypassApp}|$locked"
         if (key == actionsKey) return
         actionsKey = key
         statusActions.removeAllViews()
         if (!cfg.enabled) return
+        // With a proxy the point is that nothing leaves around the VPN server: say what still can.
+        statusActions.addView(pill(if (locked) "✓ Без Стража сеть закрыта системой ›" else "Чтобы ничего не шло мимо VPN-сервера ›",
+            if (locked) 3 else 1) { FirewallPage.showLeakHelp(this) }, lp(WRAP, WRAP).apply { topMargin = dp(6) })
         if (pkg.isNotEmpty()) {
             statusActions.addView(pill("Настройки «${Apps.labelForPackage(pkg)}» (батарея, автозапуск) ›", 1) {
                 try {

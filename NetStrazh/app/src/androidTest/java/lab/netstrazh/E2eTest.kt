@@ -639,6 +639,171 @@ class E2eTest {
         Log.i(TAG, "app list changes: capture losses detected and repaired by the probe: ${FirewallService.captureRecoveries - recoveriesBefore}")
     }
 
+    /** Title of the service's notification as the system holds it now, or null. */
+    private fun notificationTitle(): String? =
+        ctx.getSystemService(android.app.NotificationManager::class.java).activeNotifications
+            .firstOrNull { it.packageName == ctx.packageName }?.notification?.extras
+            ?.getCharSequence(android.app.Notification.EXTRA_TITLE)?.toString()
+
+    /** The SOCKS proxy in the test APK's own process ([OtherAppProxy]): a proxy app under another UID. */
+    private class OtherApp(val pkg: String, val conn: android.content.ServiceConnection, private val binder: android.os.IBinder) {
+        val port: Int get() = ask(OtherAppProxy.GET_PORT) { it.readInt() }
+        val uid: Int get() = ask(OtherAppProxy.GET_UID) { it.readInt() }
+        /** What it was asked to carry: "CONNECT host:port" and "UDP ip:port". */
+        val log: List<String> get() = ask(OtherAppProxy.GET_LOG) { it.createStringArrayList() ?: ArrayList() }
+
+        private fun <T> ask(code: Int, read: (android.os.Parcel) -> T): T {
+            val data = android.os.Parcel.obtain()
+            val reply = android.os.Parcel.obtain()
+            try {
+                assertTrue("the proxy app answers", binder.transact(code, data, reply, 0))
+                return read(reply)
+            } finally {
+                data.recycle()
+                reply.recycle()
+            }
+        }
+    }
+
+    private fun startOtherApp(): OtherApp {
+        val pkg = InstrumentationRegistry.getInstrumentation().context.packageName
+        val got = java.util.concurrent.LinkedBlockingQueue<android.os.IBinder>()
+        val conn = object : android.content.ServiceConnection {
+            override fun onServiceConnected(name: android.content.ComponentName, service: android.os.IBinder) { got.offer(service) }
+            override fun onServiceDisconnected(name: android.content.ComponentName) {}
+        }
+        assertTrue("bind the proxy app", ctx.bindService(Intent().setClassName(pkg, OtherAppProxy::class.java.name), conn, Context.BIND_AUTO_CREATE))
+        val binder = got.poll(30, java.util.concurrent.TimeUnit.SECONDS) ?: throw AssertionError("the proxy app did not start")
+        val app = OtherApp(pkg, conn, binder)
+        assertTrue("the proxy app has a UID of its own: ${app.uid}", app.uid != myUid && app.uid >= 10000)
+        return app
+    }
+
+    /** Every way the proxy app may have been asked for [host]:80 (by name, or by one of its addresses). */
+    private fun connectsTo(app: OtherApp, host: String): List<String> {
+        val wanted = HashSet<String>()
+        wanted += "CONNECT $host:80"
+        try { for (a in InetAddress.getAllByName(host)) wanted += "CONNECT ${a.hostAddress}:80" } catch (_: IOException) {}
+        return app.log.filter { it in wanted }
+    }
+
+    private fun proxyDiag(app: OtherApp, svc: FirewallService): String =
+        "\nproxy app uid=${app.uid} log=${app.log}" +
+            "\nupstream: proxyUid=${svc.upstream?.proxyUid} err=${svc.upstream?.lastError} udpUnsupported=${svc.upstream?.udpUnsupported}" +
+            "\nrecent: " + seen().take(14).joinToString("\n  ") +
+            "\nlogcat:\n" + shell("logcat -d -t 80 -s NetStrazh:V AndroidRuntime:E")
+
+    /**
+     * The usual way to work with another VPN app: it serves a proxy from its own process and is kept
+     * out of the VPN, so its own connections leave directly, while apps' traffic goes through it.
+     * Switching this on and off changes the VPN's app list both times.
+     */
+    @Test fun t21_proxyAppOutsideTheVpn() {
+        val svc = FirewallService.instance!!
+        val app = startOtherApp()
+        try {
+            val t0 = System.currentTimeMillis()
+            val watch = RouteWatch()
+            try {
+                watch.mark("proxy on, its app excluded")
+                Prefs.proxy = ProxyConfig(ProxyType.SOCKS5, "127.0.0.1", app.port, dnsServer = "1.1.1.1", bypassApp = true, appPkg = app.pkg)
+                FirewallService.applyProxy()
+                waitFor(30_000, "capture verified with the proxy app excluded") {
+                    Live.startedAt >= t0 && FirewallService.captureVerifiedAt >= Live.startedAt
+                }
+            } finally {
+                Log.i(TAG, "route timeline, proxy app excluded: " + watch.finish())
+            }
+            assertEquals("proxy applied", app.port, svc.upstream?.cfg?.port)
+
+            val t1 = System.currentTimeMillis()
+            // A name nobody asked before, so the lookup cannot come from a cache.
+            val name = "t21-${SystemClock.uptimeMillis()}.example.com"
+            try { InetAddress.getAllByName(name) } catch (_: IOException) {} // NXDOMAIN is fine
+            val dns = waitSeen("DNS through the proxy app") { it.proto == "DNS" && it.host == name }
+            assertEquals("DNS went through the proxy", VIA_PROXY, dns.via)
+            assertTrue("the proxy app carried the DNS: ${app.log}", app.log.contains("CONNECT 1.1.1.1:53"))
+
+            val r = httpGet("example.net")
+            assertTrue(r.take(100), r.startsWith("HTTP/1."))
+            val tcp = waitSeen("own TCP through the proxy app") { it.proto == "TCP" && it.port == 80 && it.uid == myUid && it.ts >= t1 }
+            assertEquals("TCP went through the proxy", VIA_PROXY, tcp.via)
+            assertEquals("the proxy app carried it once: ${app.log}", 1, connectsTo(app, "example.net").size)
+
+            assertTrue("UDP answer through the proxy app", dnsQueryUdp("8.8.8.8", "example.com") != null)
+            val udp = waitSeen("own UDP through the proxy app") { it.proto == "UDP" && it.ip == "8.8.8.8" && it.uid == myUid && it.ts >= t1 }
+            assertEquals("UDP went through the proxy", VIA_PROXY, udp.via)
+            assertTrue("the proxy app carried the UDP: ${app.log}", app.log.contains("UDP 8.8.8.8:53"))
+
+            // Outside the VPN: none of the proxy app's own connections comes through the engine.
+            Db.sync()
+            assertTrue("the proxy app's own traffic must not enter the VPN", seen().none { it.uid == app.uid && it.ts >= t1 })
+        } catch (e: Throwable) {
+            throw AssertionError("proxy app outside the VPN failed: $e" + proxyDiag(app, svc), e)
+        } finally {
+            val watch = RouteWatch()
+            try {
+                watch.mark("proxy off, its app included")
+                Prefs.proxy = ProxyConfig.OFF
+                FirewallService.applyProxy()
+                waitFor(30_000, "proxy off and capture verified") {
+                    svc.upstream?.cfg?.enabled == false && FirewallService.captureVerifiedAt >= Live.startedAt
+                }
+            } finally {
+                Log.i(TAG, "route timeline, proxy app included again: " + watch.finish())
+                ctx.unbindService(app.conn)
+            }
+        }
+        assertTrue(httpGet("example.com").startsWith("HTTP/1."))
+    }
+
+    /**
+     * Under Android's "block connections without VPN" the proxy app cannot be kept out of the VPN
+     * (Android would cut it off), so it stays inside. Its connections then come through the engine
+     * like any app's; they must be recognised by its UID and sent directly, not back into its own
+     * proxy, while apps' traffic still goes through it.
+     */
+    @Test fun t22_proxyAppInsideTheVpn() {
+        val svc = FirewallService.instance!!
+        val app = startOtherApp()
+        try {
+            Prefs.proxy = ProxyConfig(ProxyType.SOCKS5, "127.0.0.1", app.port, dnsServer = "1.1.1.1", bypassApp = false)
+            FirewallService.applyProxy()
+            waitFor(5_000, "proxy applied") { svc.upstream?.cfg?.port == app.port }
+
+            val t1 = System.currentTimeMillis()
+            val r = httpGet("example.net")
+            assertTrue(r.take(100), r.startsWith("HTTP/1."))
+            val mine = waitSeen("own TCP through the proxy app") { it.proto == "TCP" && it.port == 80 && it.uid == myUid && it.ts >= t1 }
+            assertEquals("TCP went through the proxy", VIA_PROXY, mine.via)
+            assertEquals("proxy app recognised by its UID", app.uid, svc.upstream?.proxyUid)
+            // Its own connection to the site came through the engine and left directly.
+            val its = waitSeen("the proxy app's own TCP") { it.proto == "TCP" && it.port == 80 && it.uid == app.uid && it.ts >= t1 }
+            assertEquals("the proxy app's traffic must leave directly, not through its own proxy", "", its.via)
+            assertFalse("the proxy app's traffic is not blocked", its.blocked)
+            assertEquals("no loop, one CONNECT for one request: ${app.log}", 1, connectsTo(app, "example.net").size)
+
+            assertTrue("UDP answer through the proxy app", dnsQueryUdp("8.8.8.8", "example.com") != null)
+            val udp = waitSeen("own UDP through the proxy app") { it.proto == "UDP" && it.ip == "8.8.8.8" && it.uid == myUid && it.ts >= t1 }
+            assertEquals("UDP went through the proxy", VIA_PROXY, udp.via)
+            val itsUdp = waitSeen("the proxy app's own UDP") { it.proto == "UDP" && it.ip == "8.8.8.8" && it.uid == app.uid && it.ts >= t1 }
+            assertEquals("the proxy app's UDP must leave directly", "", itsUdp.via)
+            // A query is repeated when its answer is slow; a loop would show as far more than that.
+            assertTrue("no UDP loop: ${app.log}", app.log.count { it == "UDP 8.8.8.8:53" } in 1..3)
+        } catch (e: Throwable) {
+            throw AssertionError("proxy app inside the VPN failed: $e" + proxyDiag(app, svc), e)
+        } finally {
+            Prefs.proxy = ProxyConfig.OFF
+            FirewallService.applyProxy()
+            try {
+                waitFor(5_000, "proxy off") { svc.upstream?.cfg?.enabled == false }
+            } finally {
+                ctx.unbindService(app.conn)
+            }
+        }
+        assertTrue(httpGet("example.com").startsWith("HTTP/1."))
+    }
+
     /**
      * Connections Android cannot attribute ("Неизвестно") can be blocked like an app, by their UID.
      * Known apps are not affected, and such a rule never becomes a VPN exclusion.
@@ -667,7 +832,7 @@ class E2eTest {
      * TCP and UDP, and another app's TCP (the shell, uid 2000) are all checked, and every failure is
      * reported, not just the first.
      */
-    @Test fun t20_powerSwitchOffAndOn() {
+    @Test fun t30_powerSwitchOffAndOn() {
         val problems = ArrayList<String>()
         fun diag() = "\nip rule:\n" + shell("ip rule") + "\nrecent: " + seen().take(10).joinToString("\n  ")
         fun check(what: String, block: () -> Unit) {
@@ -703,6 +868,10 @@ class E2eTest {
                 } finally {
                     Log.i(TAG, "route timeline, switch on (cycle $cycle): " + watch.finish())
                 }
+            }
+            check("cycle $cycle: notification") {
+                // "Защита включена" only once the probe proved it; "checking" until then.
+                waitFor(5_000, "notification says the protection is on") { notificationTitle() == ctx.getString(R.string.notif_on) }
             }
             val t0 = System.currentTimeMillis()
             check("cycle $cycle: own TCP") {

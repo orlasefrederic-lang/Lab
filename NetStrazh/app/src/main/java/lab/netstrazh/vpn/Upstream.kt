@@ -82,7 +82,48 @@ class Upstream(private val host: EngineHost) {
         private set
     private val lock = Any()
     private val dnsPipe = DnsPipe {
-        openTcp(InetSocketAddress(host.resolve(cfg.dnsServer), 53), UID_DNS, PROXY_CONNECT_MS) {}.ch
+        openTcp(InetSocketAddress(resolveWithin(cfg.dnsServer, 0L), 53), UID_DNS, PROXY_CONNECT_MS) {}.ch
+    }
+
+    /** A name being looked up, or looked up at [at]; shared by everyone asking for it meanwhile. */
+    private class Lookup(val result: java.util.concurrent.CompletableFuture<InetAddress>, val at: Long)
+
+    private val lookups = HashMap<String, Lookup>()
+
+    /**
+     * [name] as an address. An IP literal never waits. A host name is looked up on a thread of its
+     * own, and the caller waits for it only until [deadline] (System.nanoTime(); 0: [RESOLVE_MS]): a
+     * slow resolver cannot hold a caller past its time, and the answer, when it comes, serves the next
+     * one. A failed lookup is not repeated for [RESOLVE_RETRY_MS].
+     */
+    private fun resolveWithin(name: String, deadline: Long): InetAddress {
+        ipOrNull(name)?.let { return it }
+        if (name.equals("localhost", true)) return InetAddress.getByAddress(byteArrayOf(127, 0, 0, 1))
+        val waitMs = if (deadline == 0L) RESOLVE_MS else minOf(RESOLVE_MS, remainingMs(deadline))
+        if (waitMs <= 0) throw DeadlineException(RESOLVE_MS, null)
+        val f = synchronized(lookups) {
+            val now = System.currentTimeMillis()
+            val old = lookups[name]
+            val usable = old != null && (!old.result.isDone ||
+                now - old.at < (if (old.result.isCompletedExceptionally) RESOLVE_RETRY_MS else RESOLVE_TTL_MS))
+            if (usable) old!!.result else {
+                val fresh = java.util.concurrent.CompletableFuture<InetAddress>()
+                lookups[name] = Lookup(fresh, now)
+                kotlin.concurrent.thread(name = "ns-resolve", isDaemon = true) {
+                    try { fresh.complete(host.resolve(name)) } catch (e: Throwable) { fresh.completeExceptionally(e) }
+                }
+                fresh
+            }
+        }
+        try {
+            return f.get(waitMs, java.util.concurrent.TimeUnit.MILLISECONDS)
+        } catch (e: java.util.concurrent.TimeoutException) {
+            // Cut short by the caller's deadline, or the resolver itself is too slow.
+            if (waitMs < RESOLVE_MS) throw DeadlineException(waitMs, e)
+            throw IOException("адрес $name не найден за ${RESOLVE_MS / 1000} с", e)
+        } catch (e: java.util.concurrent.ExecutionException) {
+            throw e.cause as? IOException ?: IOException("адрес $name не найден", e.cause)
+        }
     }
 
     val enabled: Boolean get() = cfg.enabled
@@ -101,20 +142,25 @@ class Upstream(private val host: EngineHost) {
             downAt = 0L
             lastOkAt = 0L
         }
+        synchronized(lookups) { lookups.clear() }
         dnsPipe.close()
     }
 
     /** A connection to the proxy itself (e.g. a LAN proxy) is never sent through that proxy. */
-    private fun isProxyEndpoint(dst: InetSocketAddress): Boolean =
-        try { proxyEndpoint() == dst } catch (_: Exception) { false }
+    private fun isProxyEndpoint(dst: InetSocketAddress, deadline: Long = 0L): Boolean =
+        try { proxyEndpoint(deadline) == dst } catch (_: Exception) { false }
 
-    private fun proxyEndpoint(): InetSocketAddress {
+    /** The proxy's address; a host name is resolved once, within [deadline] (see [resolveWithin]). */
+    private fun proxyEndpoint(deadline: Long = 0L): InetSocketAddress {
         proxyAddr?.let { return it }
         val c = cfg
-        val e = InetSocketAddress(host.resolve(c.host), c.port)
+        val e = InetSocketAddress(resolveWithin(c.host, deadline), c.port)
         if (cfg === c) proxyAddr = e
         return e
     }
+
+    /** True when the proxy is on this phone. Never waits: false while its address is not known yet. */
+    private fun proxyIsLocal(): Boolean = proxyAddr?.let { isLoopback(it.address) } ?: false
 
     /**
      * True when traffic of [uid] goes through the proxy. Never blocks: the proxy app's UID is learned on
@@ -201,10 +247,12 @@ class Upstream(private val host: EngineHost) {
 
     private fun newChannel(track: (SocketChannel) -> Unit): SocketChannel {
         val ch = SocketChannel.open()
-        track(ch)
-        if (!host.protect(ch.socket())) {
+        try {
+            track(ch)
+            if (!host.protect(ch.socket())) throw IOException("protect failed")
+        } catch (e: Throwable) {
             Engine.closeQuietly(ch)
-            throw IOException("protect failed")
+            throw e
         }
         return ch
     }
@@ -218,7 +266,14 @@ class Upstream(private val host: EngineHost) {
      * traffic is never sent into its proxy.
      */
     private fun proxyChannel(uid: Int, deadline: Long, track: (SocketChannel) -> Unit): SocketChannel {
-        val ep = proxyEndpoint()
+        val ep = try {
+            proxyEndpoint(deadline)
+        } catch (e: DeadlineException) {
+            throw e
+        } catch (e: IOException) {
+            // A proxy whose name does not resolve is a proxy that cannot be reached.
+            throw ProxyDown(e)
+        }
         // A local proxy app restarts its core on every network change (v2rayNG: about a second with
         // the port closed): keep trying a refused connection for a moment instead of failing the app.
         // Not when the proxy has just been found down, so a stopped proxy app fails quickly.
@@ -226,31 +281,34 @@ class Upstream(private val host: EngineHost) {
         val justDown = downAt > lastOkAt && now - downAt < 10_000
         var end = if (isLoopback(ep.address) && !justDown) now + RELOAD_GRACE_MS else now
         if (deadline != 0L) end = minOf(end, now + remainingMs(deadline))
-        var ch: SocketChannel
         while (true) {
-            ch = newChannel(track)
+            // The caller's time is checked before a channel exists, and whatever fails after that
+            // closes it: running out of time must never leave a channel open.
             val limit = limitMs(deadline, PROXY_CONNECT_MS.toLong())
+            val ch = newChannel(track)
+            var keep = false
             try {
-                ch.socket().connect(ep, limit.toInt())
-                break
-            } catch (e: IOException) {
-                Engine.closeQuietly(ch)
-                if (e is java.net.ConnectException && System.currentTimeMillis() + RELOAD_RETRY_MS < end) {
-                    Thread.sleep(RELOAD_RETRY_MS)
-                    continue
+                try {
+                    ch.socket().connect(ep, limit.toInt())
+                } catch (e: IOException) {
+                    if (e is java.net.ConnectException && System.currentTimeMillis() + RELOAD_RETRY_MS < end) {
+                        Engine.closeQuietly(ch)
+                        Thread.sleep(RELOAD_RETRY_MS)
+                        continue
+                    }
+                    // Out of the caller's time rather than a dead proxy: do not mark it down for that.
+                    if (e is java.net.SocketTimeoutException && limit < PROXY_CONNECT_MS) throw DeadlineException(limit, e)
+                    throw ProxyDown(e)
                 }
-                // Out of the caller's time rather than a dead proxy: do not mark it down for that.
-                if (e is java.net.SocketTimeoutException && limit < PROXY_CONNECT_MS) throw DeadlineException(limit, e)
-                throw ProxyDown(e)
+                // Compare with what this very connection found, not the shared field another thread may be writing.
+                val owner = try { learnProxyUid(ch) } catch (_: Exception) { null } ?: proxyUid
+                if (uid == owner) throw IsProxyApp()
+                keep = true
+                return ch
+            } finally {
+                if (!keep) Engine.closeQuietly(ch)
             }
         }
-        // Compare with what this very connection found, not the shared field another thread may be writing.
-        val owner = try { learnProxyUid(ch) } catch (_: Exception) { null } ?: proxyUid
-        if (uid == owner) {
-            Engine.closeQuietly(ch)
-            throw IsProxyApp()
-        }
-        return ch
     }
 
     /**
@@ -261,7 +319,7 @@ class Upstream(private val host: EngineHost) {
      */
     fun openTcp(dst: InetSocketAddress, uid: Int, timeoutMs: Int, name: String? = null, handshakeMs: Long = 0,
                 deadline: Long = 0L, track: (SocketChannel) -> Unit): Opened {
-        if (proxiedTo(uid, dst.address) && !isProxyEndpoint(dst)) {
+        if (proxiedTo(uid, dst.address) && !isProxyEndpoint(dst, deadline)) {
             val c = cfg
             try {
                 val ch = proxyChannel(uid, deadline, track)
@@ -401,7 +459,11 @@ class Upstream(private val host: EngineHost) {
             // A fresh connection is only worth starting with time for a full round trip left; the
             // system resolver asks again anyway.
             if (remainingMs(deadline) < DNS_MIN_ONCE_MS) throw e
-            val server = InetSocketAddress(host.resolve(cfg.dnsServer), 53)
+            val server = try {
+                InetSocketAddress(resolveWithin(cfg.dnsServer, deadline), 53)
+            } catch (_: DeadlineException) {
+                throw e
+            }
             if (remainingMs(deadline) < DNS_MIN_ONCE_MS) throw e
             queryOnce(server, q, off, len, deadline)
         }
@@ -433,8 +495,7 @@ class Upstream(private val host: EngineHost) {
      * it is given up on sooner than one across the network, and said so.
      */
     private fun greet(ch: SocketChannel, c: ProxyConfig, limitMs: Long) {
-        val local = try { isLoopback(proxyEndpoint().address) } catch (_: Exception) { false }
-        val full = if (local) LOCAL_HANDSHAKE_MS else HANDSHAKE_MS
+        val full = if (proxyIsLocal()) LOCAL_HANDSHAKE_MS else HANDSHAKE_MS
         try {
             withDeadline(ch, minOf(limitMs, full)) { Socks5.handshake(ch, c.user, c.pass) }
         } catch (e: DeadlineException) {
@@ -446,8 +507,7 @@ class Upstream(private val host: EngineHost) {
 
     /** The proxy accepted the connection but did not answer the greeting. */
     private fun noteSilentProxy() {
-        val local = try { isLoopback(proxyEndpoint().address) } catch (_: Exception) { false }
-        noteError(if (local) "${host.proxyAppLabel() ?: "приложение прокси"} принимает соединения, но не отвечает: " +
+        noteError(if (proxyIsLocal()) "${host.proxyAppLabel() ?: "приложение прокси"} принимает соединения, но не отвечает: " +
             "похоже, система его усыпила или оно зависло"
         else "прокси не ответил за ${HANDSHAKE_MS / 1000} с", down = true)
     }
@@ -510,6 +570,10 @@ class Upstream(private val host: EngineHost) {
         const val PROXY_UID_TTL_MS = 60_000L
         const val PROXY_UID_RETRY_MS = 3_000L
         const val UDP_RECHECK_MS = 300_000L
+        /** Longest wait for a host name's address, when the caller has no deadline of its own. */
+        const val RESOLVE_MS = 4_000L
+        const val RESOLVE_TTL_MS = 600_000L
+        const val RESOLVE_RETRY_MS = 3_000L
 
         fun ipOrNull(s: String): InetAddress? {
             val t = s.trim().removePrefix("[").removeSuffix("]")

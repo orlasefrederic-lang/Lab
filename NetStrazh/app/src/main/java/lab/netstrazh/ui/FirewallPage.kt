@@ -21,6 +21,7 @@ class FirewallPage(act: MainActivity) : Page(act) {
     }
 
     private val warn = act.text("", 13.5f, Pal.danger)
+    private val leak = act.pill("", 1) { showLeakHelp(act) }
     private val list = ListView(act)
     private val adapter = ListAdapter<Item>({ RuleRow(act) }) { v, it, _ -> (v as RuleRow).bind(it) }
     private val emptyText = act.text(
@@ -45,6 +46,7 @@ class FirewallPage(act: MainActivity) : Page(act) {
         }, lp(WRAP, WRAP).apply { topMargin = act.dp(8) })
         top.addView(act.pill("Адреса, заблокированные для всех ›", 3) { showGlobalHosts() },
             lp(WRAP, WRAP).apply { topMargin = act.dp(8) })
+        top.addView(leak, lp(WRAP, WRAP).apply { topMargin = act.dp(8) })
         addView(top)
         list.divider = null
         list.adapter = adapter
@@ -95,6 +97,13 @@ class FirewallPage(act: MainActivity) : Page(act) {
 
     override fun tick() {
         warn.visibility = if (FirewallService.running) View.GONE else View.VISIBLE
+        // Only Android itself can keep apps off the network while the VPN is not (yet) working.
+        val locked = FirewallService.running && FirewallService.lockdown
+        val label = if (locked) "✓ Без Стража сеть закрыта системой ›" else "Чтобы ничего не шло мимо Стража ›"
+        if (leak.text.toString() != label) {
+            leak.text = label
+            act.stylePill(leak, if (locked) 3 else 1)
+        }
     }
 
     private fun load() {
@@ -105,6 +114,46 @@ class FirewallPage(act: MainActivity) : Page(act) {
         }
             .sortedWith(compareBy(String.CASE_INSENSITIVE_ORDER) { it.label })
         adapter.items = items
+    }
+
+    companion object {
+        /**
+         * Explains the moments when apps reach the network around the VPN, and the one thing that
+         * closes them: Android's own "block connections without VPN".
+         */
+        fun showLeakHelp(ctx: android.content.Context) {
+            val state = when {
+                !FirewallService.running -> "Включена ли блокировка, видно, когда Страж работает."
+                FirewallService.lockdown -> "Сейчас: блокировка включена ✓"
+                FirewallService.alwaysOn -> "Сейчас: «Постоянная VPN» включена, а «Блокировать соединения без VPN» — нет."
+                else -> "Сейчас: блокировка выключена."
+            }
+            android.app.AlertDialog.Builder(ctx)
+                .setTitle("Чтобы ничего не шло мимо Стража")
+                .setMessage(
+                    "Страж — это VPN, а VPN в Android начинает работать не мгновенно. В такие моменты приложения " +
+                        "выходят в сеть напрямую — мимо Стража и мимо вашего VPN-сервера:\n\n" +
+                        "• при каждом включении Стража: обычно доли секунды, пока Android прокладывает маршруты " +
+                        "(на занятом телефоне и после перезагрузки дольше);\n" +
+                        "• когда вы меняете, кого пускать «мимо Стража», или настройки прокси: обычно до полсекунды;\n" +
+                        "• всё время, пока Страж выключен или его закрыла система.\n\n" +
+                        "Закрыть это умеет только сам Android. Откройте настройки VPN, нажмите на шестерёнку у " +
+                        "«Сетевого стража» и включите оба переключателя: «Постоянная VPN» и " +
+                        "«Блокировать соединения без VPN».\n\n" +
+                        "После этого без работающего Стража интернета нет ни у одного приложения. " +
+                        "Прокси-приложение (v2rayNG и т. п.) Страж в этом режиме оставляет у себя и сам пускает " +
+                        "его трафик напрямую — иначе Android отрезал бы его от сервера.\n\n" + state
+                )
+                .setPositiveButton("Настройки VPN") { _, _ ->
+                    try {
+                        ctx.startActivity(Intent(Settings.ACTION_VPN_SETTINGS))
+                    } catch (_: Exception) {
+                        Toast.makeText(ctx, "Откройте: Настройки → Подключения → VPN", Toast.LENGTH_LONG).show()
+                    }
+                }
+                .setNegativeButton("Закрыть", null)
+                .show()
+        }
     }
 
     private fun showBatteryHelp() {
