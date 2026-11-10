@@ -76,6 +76,30 @@ class E2eTest {
             fail("timeout waiting for: $what")
         }
 
+        /**
+         * Which way a fresh socket of this app would leave right now: "vpn", "direct" (the physical
+         * network) or "none". Connecting a UDP socket sends nothing, it only makes the system choose
+         * the route, and with it the source address.
+         */
+        fun routeNow(): String = try {
+            DatagramSocket().use { s ->
+                s.connect(InetSocketAddress(InetAddress.getByAddress(byteArrayOf(1, 1, 1, 1)), 53))
+                val a = s.localAddress
+                when {
+                    a == null || a.isAnyLocalAddress -> "none"
+                    a.hostAddress == TunConfig.T4 -> "vpn"
+                    else -> "direct"
+                }
+            }
+        } catch (_: Exception) {
+            "none"
+        }
+
+        /** The service flags as one word, for [RouteWatch]. */
+        fun serviceState(): String =
+            (if (FirewallService.running) "on" else "off") +
+                (if (FirewallService.running && FirewallService.captureVerifiedAt >= Live.startedAt) "+verified" else "")
+
         @BeforeClass @JvmStatic
         fun startVpn() {
             ctx = InstrumentationRegistry.getInstrumentation().targetContext
@@ -88,9 +112,11 @@ class E2eTest {
             Prefs.proxy = ProxyConfig.OFF
             val prepared = android.net.VpnService.prepare(ctx) == null
             val tStart = System.currentTimeMillis()
+            val watch = RouteWatch()
             // Start like the app's own switch does: from a visible activity (FGS start from the
             // background is restricted, and the service needs BIND_VPN_SERVICE, which the shell lacks).
             ActivityScenario.launch(MainActivity::class.java).use { sc ->
+                watch.mark("start")
                 sc.onActivity { FirewallService.start(it) }
                 try {
                     waitFor(25_000, "VPN running") { FirewallService.running }
@@ -105,7 +131,11 @@ class E2eTest {
             }
             // Android reports the VPN as the default network before its routes exist (a loaded system
             // takes seconds): only the capture probe shows traffic really enters the interface.
-            waitFor(25_000, "capture verified") { FirewallService.captureVerifiedAt >= tStart }
+            try {
+                waitFor(25_000, "capture verified") { FirewallService.captureVerifiedAt >= tStart }
+            } finally {
+                Log.i(TAG, "route timeline, first start: " + watch.finish())
+            }
         }
 
         @AfterClass @JvmStatic
@@ -113,6 +143,47 @@ class E2eTest {
             Rules.set(ctx.packageName, 0)
             Prefs.proxy = ProxyConfig.OFF
             InstrumentationRegistry.getInstrumentation().runOnMainSync { FirewallService.stop(ctx) }
+        }
+    }
+
+    /**
+     * Records, every few milliseconds, where fresh sockets would go and what the service says, so a
+     * test can log how long Android keeps routing apps around the VPN after a start or a rebuild
+     * (e.g. "0:direct/off 310:[switch on] 420:direct/on 1890:vpn/on 2010:vpn/on+verified").
+     */
+    class RouteWatch {
+        private val t0 = SystemClock.elapsedRealtime()
+        private val log = ArrayList<Pair<Long, String>>()
+        @Volatile private var stop = false
+        private val thread = kotlin.concurrent.thread(name = "route-watch", isDaemon = true) {
+            var last = ""
+            while (!stop) {
+                val s = routeNow() + "/" + serviceState()
+                if (s != last) {
+                    synchronized(log) { log += (SystemClock.elapsedRealtime() - t0) to s }
+                    last = s
+                }
+                Thread.sleep(5)
+            }
+        }
+
+        fun mark(what: String) {
+            synchronized(log) { log += (SystemClock.elapsedRealtime() - t0) to "[$what]" }
+        }
+
+        /** Stops watching. Returns the timeline, and how long sockets went around a running service. */
+        fun finish(): String {
+            stop = true
+            thread.join(2_000)
+            val end = SystemClock.elapsedRealtime() - t0
+            val all = synchronized(log) { ArrayList(log) }
+            val changes = all.filter { !it.second.startsWith("[") }
+            var outside = 0L
+            for ((i, c) in changes.withIndex()) {
+                val until = changes.getOrNull(i + 1)?.first ?: end
+                if (!c.second.startsWith("vpn/") && c.second.contains("/on")) outside += until - c.first
+            }
+            return all.sortedBy { it.first }.joinToString(" ") { "${it.first}:${it.second}" } + " | around a running VPN: $outside ms"
         }
     }
 
@@ -511,12 +582,61 @@ class E2eTest {
     @Test fun t17_rebuildingTheInterfaceKeepsTrafficFlowing() {
         for (round in 1..3) {
             val t0 = System.currentTimeMillis()
-            FirewallService.reconfigure()
-            waitFor(15_000, "rebuilt interface verified (round $round)") { FirewallService.captureVerifiedAt >= t0 }
+            val watch = RouteWatch()
+            try {
+                watch.mark("rebuild")
+                FirewallService.reconfigure()
+                waitFor(15_000, "rebuilt interface verified (round $round)") { Live.startedAt >= t0 && FirewallService.captureVerifiedAt >= Live.startedAt }
+            } finally {
+                Log.i(TAG, "route timeline, rebuild in place (round $round): " + watch.finish())
+            }
             val t1 = System.currentTimeMillis()
             assertTrue("TCP after rebuilding (round $round)", httpGet("example.com").startsWith("HTTP/1."))
             waitSeen("TCP captured after rebuilding (round $round)") { it.proto == "TCP" && it.port == 80 && it.uid == myUid && it.ts >= t1 }
         }
+    }
+
+    /**
+     * Excluding an app from the VPN (the user's "мимо Стража", or the proxy app) changes the
+     * interface's app list, and Android then replaces the whole VPN network instead of updating it in
+     * place. Capture must come back by itself after every such change, in both directions, and the
+     * log shows for how long fresh sockets went around the VPN meanwhile.
+     */
+    @Test fun t19_changingTheAppListKeepsCapture() {
+        // Any installed package but ours: the test APK is one, and nothing runs under its UID.
+        val other = InstrumentationRegistry.getInstrumentation().context.packageName
+        assertTrue("need another package to exclude", other != ctx.packageName)
+        val recoveriesBefore = FirewallService.captureRecoveries
+        try {
+            for (round in 1..2) for (exclude in listOf(true, false)) {
+                val what = "round $round, " + if (exclude) "excluding an app" else "including it again"
+                val t0 = System.currentTimeMillis()
+                val watch = RouteWatch()
+                var dumped = false
+                try {
+                    watch.mark(if (exclude) "exclude" else "include")
+                    Rules.set(other, if (exclude) Rules.EXCLUDE else 0)
+                    waitFor(30_000, "capture verified again ($what)") {
+                        val ok = Live.startedAt >= t0 && FirewallService.captureVerifiedAt >= Live.startedAt
+                        if (!ok && !dumped && System.currentTimeMillis() - t0 > 3_000) {
+                            // Not back after three seconds: record what the system routes by right now.
+                            dumped = true
+                            Log.i(TAG, "still not captured ($what); ip rule:\n" + shell("ip rule") +
+                                "\nroutes:\n" + shell("ip route show table all").lines().filter { "tun" in it }.joinToString("\n"))
+                        }
+                        ok
+                    }
+                } finally {
+                    Log.i(TAG, "route timeline, app list changed ($what): " + watch.finish())
+                }
+                val t1 = System.currentTimeMillis()
+                assertTrue("TCP after the app list changed ($what)", httpGet("example.com").startsWith("HTTP/1."))
+                waitSeen("TCP captured after the app list changed ($what)") { it.proto == "TCP" && it.port == 80 && it.uid == myUid && it.ts >= t1 }
+            }
+        } finally {
+            Rules.set(other, 0)
+        }
+        Log.i(TAG, "app list changes: capture losses detected and repaired by the probe: ${FirewallService.captureRecoveries - recoveriesBefore}")
     }
 
     /**
@@ -570,13 +690,19 @@ class E2eTest {
             }
             if (cycle == 1) ActivityScenario.launch(SettingsActivity::class.java).use { Thread.sleep(1500) }
             val tOn = System.currentTimeMillis()
+            val watch = RouteWatch()
             ActivityScenario.launch(MainActivity::class.java).use { sc ->
+                watch.mark("switch on")
                 sc.onActivity { it.onPowerToggle(true) }
                 waitFor(25_000, "VPN running again") { FirewallService.running }
                 Thread.sleep(500)
             }
             check("cycle $cycle: capture probe") {
-                waitFor(15_000, "capture probe verified after switching on") { FirewallService.captureVerifiedAt >= tOn }
+                try {
+                    waitFor(15_000, "capture probe verified after switching on") { FirewallService.captureVerifiedAt >= tOn }
+                } finally {
+                    Log.i(TAG, "route timeline, switch on (cycle $cycle): " + watch.finish())
+                }
             }
             val t0 = System.currentTimeMillis()
             check("cycle $cycle: own TCP") {
