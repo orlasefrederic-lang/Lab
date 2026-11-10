@@ -107,6 +107,8 @@ class MainActivity : Activity() {
     override fun onResume() {
         super.onResume()
         resumed = true
+        // Back from the system's VPN settings, perhaps: "block connections without VPN" may have changed.
+        FirewallService.recheck()
         updateHeader()
         if (current >= 0) pages[current].onShow()
         handler.removeCallbacks(ticker)

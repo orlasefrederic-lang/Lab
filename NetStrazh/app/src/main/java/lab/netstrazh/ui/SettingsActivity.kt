@@ -145,6 +145,8 @@ class SettingsActivity : Activity() {
 
     override fun onResume() {
         super.onResume()
+        // Back from the system's VPN settings, perhaps: "block connections without VPN" may have changed.
+        FirewallService.recheck()
         handler.post(ticker)
     }
 

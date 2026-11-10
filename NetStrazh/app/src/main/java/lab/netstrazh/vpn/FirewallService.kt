@@ -474,6 +474,15 @@ class FirewallService : VpnService(), EngineHost {
             }
         }
 
+        /**
+         * Looks whether the system's always-on VPN / "block connections without VPN" changed (nothing
+         * announces it), and moves the proxy app into the VPN or out of it accordingly.
+         */
+        fun recheck() {
+            val s = instance ?: return
+            s.main.post { if (s.engine != null && s.excludedNow() != s.appliedExcluded) s.restartEngine() }
+        }
+
         /** Re-establishes the interface after a settings change (e.g. IPv6). */
         fun reconfigure() {
             val s = instance ?: return
