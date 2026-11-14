@@ -85,6 +85,21 @@ object Fmt {
         return SimpleDateFormat(if (same) "HH:mm:ss" else "d MMM HH:mm", ru).format(Date(ts))
     }
 
+    /** A day and a time for "since when": "сегодня в 14:05", "вчера в 9:30", "13 нояб. в 14:05" (with the year if not this one). */
+    fun since(ts: Long): String {
+        val now = Calendar.getInstance()
+        val c = Calendar.getInstance().apply { timeInMillis = ts }
+        val hm = SimpleDateFormat("H:mm", ru).format(Date(ts))
+        fun sameDay(a: Calendar, b: Calendar) = a.get(Calendar.YEAR) == b.get(Calendar.YEAR) && a.get(Calendar.DAY_OF_YEAR) == b.get(Calendar.DAY_OF_YEAR)
+        val yesterday = (now.clone() as Calendar).apply { add(Calendar.DAY_OF_YEAR, -1) }
+        return when {
+            sameDay(c, now) -> "сегодня в $hm"
+            sameDay(c, yesterday) -> "вчера в $hm"
+            c.get(Calendar.YEAR) == now.get(Calendar.YEAR) -> SimpleDateFormat("d MMM", ru).format(Date(ts)) + " в $hm"
+            else -> SimpleDateFormat("d MMM yyyy", ru).format(Date(ts)) + " в $hm"
+        }
+    }
+
     fun duration(ms: Long): String = when {
         ms < 1000 -> String.format(ru, "%.1f с", ms / 1000.0)
         ms < 60_000 -> "${ms / 1000} с"

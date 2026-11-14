@@ -22,6 +22,8 @@ class FirewallPage(act: MainActivity) : Page(act) {
 
     private val warn = act.text("", 13.5f, Pal.danger)
     private val leak = act.pill("", 1) { showLeakHelp(act) }
+    /** Every blocked address, of single apps and for all: whom, since when, and how to unblock. */
+    private val hosts = act.pill("Заблокированные адреса ›", 3) { act.startActivity(Intent(act, HostsActivity::class.java)) }
     private val list = ListView(act)
     private val adapter = ListAdapter<Item>({ RuleRow(act) }) { v, it, _ -> (v as RuleRow).bind(it) }
     private val emptyText = act.text(
@@ -44,8 +46,7 @@ class FirewallPage(act: MainActivity) : Page(act) {
         top.addView(act.pill("Вместе с другим VPN (прокси) ›", 1) {
             act.startActivity(Intent(act, SettingsActivity::class.java))
         }, lp(WRAP, WRAP).apply { topMargin = act.dp(8) })
-        top.addView(act.pill("Адреса, заблокированные для всех ›", 3) { showGlobalHosts() },
-            lp(WRAP, WRAP).apply { topMargin = act.dp(8) })
+        top.addView(hosts, lp(WRAP, WRAP).apply { topMargin = act.dp(8) })
         top.addView(leak, lp(WRAP, WRAP).apply { topMargin = act.dp(8) })
         addView(top)
         list.divider = null
@@ -77,22 +78,6 @@ class FirewallPage(act: MainActivity) : Page(act) {
         }, lp().apply { setMargins(act.dp(12), 0, act.dp(16), act.dp(8)) })
     }
 
-    private fun showGlobalHosts() {
-        val hosts = Rules.blockedHosts(Rules.ALL).sorted()
-        if (hosts.isEmpty()) {
-            Toast.makeText(act, "Пока нет. Откройте приложение и нажмите на адрес в списке «Куда подключалось».", Toast.LENGTH_LONG).show()
-            return
-        }
-        android.app.AlertDialog.Builder(act)
-            .setTitle("Заблокировано для всех · нажмите, чтобы разблокировать")
-            .setItems(hosts.map { "⛔ $it" }.toTypedArray()) { _, i ->
-                Rules.setHostBlocked(Rules.ALL, hosts[i], false)
-                Toast.makeText(act, "${hosts[i]} разблокирован", Toast.LENGTH_SHORT).show()
-            }
-            .setNegativeButton("Закрыть", null)
-            .show()
-    }
-
     override fun onShow() = load()
 
     override fun tick() {
@@ -104,6 +89,9 @@ class FirewallPage(act: MainActivity) : Page(act) {
             leak.text = label
             act.stylePill(leak, if (locked) 3 else 1)
         }
+        val n = Rules.hostRules().size
+        val hostsLabel = if (n > 0) "Заблокированные адреса: $n ›" else "Заблокированные адреса ›"
+        if (hosts.text.toString() != hostsLabel) hosts.text = hostsLabel
     }
 
     private fun load() {

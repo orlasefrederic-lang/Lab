@@ -35,7 +35,18 @@ object Rules {
     @Volatile private var hostsByPkg: Map<String, Set<String>> = emptyMap()
     @Volatile private var hostsByAppId: Map<Int, Set<String>> = emptyMap()
     @Volatile private var globalHosts: Set<String> = emptySet()
+    @Volatile private var hostRuleList: List<HostRule> = emptyList()
     private val listeners = CopyOnWriteArrayList<() -> Unit>()
+
+    /**
+     * One host rule: [host] and its subdomains are blocked for [key] (a package, a [keyForUid] key, or
+     * [ALL]). [since] is when the rule was made, 0 when that was not recorded yet (rules made before
+     * version 3.5). [appId] is the app it applies to: null for [ALL] and for a package that is gone.
+     */
+    class HostRule(val key: String, val host: String, val since: Long, val appId: Int?) {
+        /** True when the rule blocks [name]: the host itself or a subdomain of it. */
+        fun covers(name: String): Boolean = name == host || name.endsWith(".$host")
+    }
 
     /** DNS queries of a blocked app are answered "refused" instead of being resolved. */
     @Volatile var blockDns = false
@@ -61,26 +72,40 @@ object Rules {
         byAppId = ids
     }
 
-    /** Host rules: keys "<package>|<host>" (or "*|<host>" for all apps), value true. */
+    /**
+     * Host rules: keys "<package>|<host>" (or "*|<host>" for all apps). The value is the time the rule
+     * was made (a Long); rules made before that was recorded have the value true.
+     */
     @Synchronized private fun reloadHosts() {
         blockDns = hsp.getBoolean(KEY_BLOCK_DNS, false)
         val pkgs = HashMap<String, MutableSet<String>>()
         val ids = HashMap<Int, MutableSet<String>>()
         val all = HashSet<String>()
+        val list = ArrayList<HostRule>()
         for ((k, v) in hsp.all) {
-            if (v != true) continue
+            val since = when (v) {
+                is Long -> v
+                true -> 0L
+                else -> continue
+            }
             val i = k.indexOf('|')
-            if (i <= 0) continue
+            if (i <= 0 || i == k.length - 1) continue
             val pkg = k.substring(0, i)
             val host = k.substring(i + 1)
-            if (pkg == ALL) { all += host; continue }
+            if (pkg == ALL) {
+                all += host
+                list += HostRule(pkg, host, since, null)
+                continue
+            }
             pkgs.getOrPut(pkg) { HashSet() } += host
-            val id = appIdOf(pkg) ?: continue
-            ids.getOrPut(id) { HashSet() } += host
+            val id = appIdOf(pkg)
+            list += HostRule(pkg, host, since, id)
+            if (id != null) ids.getOrPut(id) { HashSet() } += host
         }
         hostsByPkg = pkgs
         hostsByAppId = ids
         globalHosts = all
+        hostRuleList = list
     }
 
     /** Rule key of a UID without a package. */
@@ -105,13 +130,34 @@ object Rules {
 
     /** Blocks [host] and its subdomains for [pkg], or for every app when [pkg] is [ALL]. */
     fun setHostBlocked(pkg: String, host: String, blocked: Boolean) {
-        val k = pkg + "|" + normalizeHost(host)
-        if (blocked) hsp.edit().putBoolean(k, true).apply() else hsp.edit().remove(k).apply()
+        val h = normalizeHost(host)
+        if (h.isEmpty()) return
+        val k = "$pkg|$h"
+        // The time a rule was made stays with it: blocking the same address again does not reset it.
+        if (!blocked) hsp.edit().remove(k).apply()
+        else if (!hsp.contains(k)) hsp.edit().putLong(k, System.currentTimeMillis()).apply()
         reload()
         for (l in listeners) l()
     }
 
     fun blockedHosts(pkg: String): Set<String> = if (pkg == ALL) globalHosts else hostsByPkg[pkg] ?: emptySet()
+
+    /** Every host rule: those of single apps and those for all. */
+    fun hostRules(): List<HostRule> = hostRuleList
+
+    /** The host rules [uid] is under: its own first, then those for all apps. */
+    fun hostRulesFor(uid: Int): List<HostRule> {
+        val id = appId(uid)
+        val list = hostRuleList
+        return list.filter { it.appId == id && it.key != ALL } + list.filter { it.key == ALL }
+    }
+
+    /** The rules that block [host] for [uid] (an address may be covered by more than one). */
+    fun hostRulesCovering(uid: Int, host: String?): List<HostRule> {
+        if (host.isNullOrEmpty()) return emptyList()
+        val h = normalizeHost(host)
+        return hostRulesFor(uid).filter { it.covers(h) }
+    }
 
     /** True when [host] (or a parent domain of it) is blocked for [uid] or for all apps. */
     fun hostBlocked(uid: Int, host: String?): Boolean =

@@ -15,9 +15,11 @@ import lab.netstrazh.data.Db
 import lab.netstrazh.data.Rules
 import lab.netstrazh.data.SysStats
 import lab.netstrazh.ui.AppActivity
+import lab.netstrazh.ui.HostsActivity
 import lab.netstrazh.ui.MainActivity
 import lab.netstrazh.ui.PickerActivity
 import lab.netstrazh.ui.SettingsActivity
+import lab.netstrazh.vpn.Engine
 import lab.netstrazh.vpn.FirewallService
 import lab.netstrazh.vpn.Live
 import lab.netstrazh.vpn.NetType
@@ -373,6 +375,7 @@ class E2eTest {
         ActivityScenario.launch<AppActivity>(Intent(ctx, AppActivity::class.java).putExtra("uid", myUid)).use { Thread.sleep(1500) }
         ActivityScenario.launch(PickerActivity::class.java).use { Thread.sleep(2500) }
         ActivityScenario.launch(SettingsActivity::class.java).use { Thread.sleep(1500) }
+        ActivityScenario.launch(HostsActivity::class.java).use { Thread.sleep(1000) }
     }
 
     private fun rcode(r: ByteArray?): Int = if (r == null || r.size < 12) -1 else r[3].toInt() and 0x0F
@@ -824,6 +827,70 @@ class E2eTest {
             Rules.set(key, 0)
         }
         assertFalse("unblocked again", Rules.isBlocked(Rules.UNKNOWN_UID, NetType.WIFI))
+    }
+
+    /**
+     * A blocked address is listed with the app it is blocked for and the time it was blocked, counts
+     * what it has stopped, and can be unblocked again. Rules made by a version that did not record
+     * the time yet keep working and are listed too.
+     */
+    @Test fun t23_blockedAddressesAreListedAndCanBeUnblocked() {
+        val pkg = ctx.packageName
+        val host = "t23.example.org"
+        val oldHost = "old.t23.example.org"
+        val stored = ctx.getSharedPreferences("hostrules", Context.MODE_PRIVATE)
+        val t0 = System.currentTimeMillis()
+        Rules.setHostBlocked(pkg, host, true)
+        try {
+            val rule = Rules.hostRules().single { it.key == pkg && it.host == host }
+            assertTrue("the time is recorded: ${rule.since}", rule.since in t0..System.currentTimeMillis())
+            assertEquals("the rule is this app's", myUid % 100000, rule.appId)
+            assertEquals("it covers a subdomain", listOf(host), Rules.hostRulesCovering(myUid, "www.$host").map { it.host })
+            assertTrue("but not for another app", Rules.hostRulesCovering(2000, "www.$host").isEmpty())
+            Thread.sleep(30)
+            Rules.setHostBlocked(pkg, host, true)
+            assertEquals("blocking again keeps the first time", rule.since, Rules.hostRules().single { it.key == pkg && it.host == host }.since)
+
+            // A rule as versions before 3.5 stored it: the value "true", no time.
+            assertTrue(stored.edit().putBoolean("${Rules.ALL}|$oldHost", true).commit())
+            Rules.reload()
+            assertEquals("an old rule has no time", 0L, Rules.hostRules().single { it.host == oldHost }.since)
+            assertTrue("an old rule still blocks", Rules.hostBlocked(myUid, "a.$oldHost"))
+
+            // An app naming the blocked host in TLS is cut, and the attempt is counted for the rule.
+            val ip = InetAddress.getByName("www.google.com")
+            val f = javax.net.ssl.SSLSocketFactory.getDefault() as javax.net.ssl.SSLSocketFactory
+            try {
+                (f.createSocket() as javax.net.ssl.SSLSocket).use { t ->
+                    t.sslParameters = t.sslParameters.apply { serverNames = listOf(javax.net.ssl.SNIHostName("www.$host")) }
+                    t.connect(InetSocketAddress(ip, 443), 10_000)
+                    t.soTimeout = 10_000
+                    t.startHandshake()
+                }
+                fail("handshake with a blocked name went through")
+            } catch (_: IOException) {
+            }
+            var item: HostsActivity.Item? = null
+            waitFor(15_000, "the stopped attempt is counted for the rule") {
+                item = HostsActivity.items(Rules.hostRules(), Db.stopped(Engine.NOTE_HOST_BLOCKED))
+                    .firstOrNull { it.rule.key == pkg && it.rule.host == host }
+                (item?.stopped ?: 0) >= 1
+            }
+            Log.i(TAG, "blocked address as listed: ${item!!.rule.host} ${item!!.who}, ${HostsActivity.details(item!!, ", ")}")
+            assertTrue("the last attempt has a time", item!!.last >= t0)
+            assertTrue("the app is named: ${item!!.who}", item!!.who.contains(ctx.getString(R.string.app_name)))
+            assertEquals("the rule opens this app's card", myUid, item!!.uid)
+
+            // The list of all blocked addresses, and the app's card with the same rules on top.
+            ActivityScenario.launch(HostsActivity::class.java).use { Thread.sleep(1500) }
+            ActivityScenario.launch<AppActivity>(Intent(ctx, AppActivity::class.java).putExtra("uid", myUid)).use { Thread.sleep(1500) }
+        } finally {
+            Rules.setHostBlocked(pkg, host, false)
+            Rules.setHostBlocked(Rules.ALL, oldHost, false)
+        }
+        assertTrue("both rules are gone", Rules.hostRules().none { it.host == host || it.host == oldHost })
+        assertFalse("unblocked", Rules.hostBlocked(myUid, "www.$host"))
+        assertFalse("the old rule is unblocked too", Rules.hostBlocked(myUid, "a.$oldHost"))
     }
 
     /**

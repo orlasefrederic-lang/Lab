@@ -40,6 +40,9 @@ class DestRow(
     val blocked: Int,
 )
 
+/** Attempts of one app (by app id) to reach one host that were stopped, with the time of the last one. */
+class StoppedRow(val appId: Int, val host: String, val count: Int, val last: Long)
+
 /** Connection journal stored in SQLite. Writes are batched on a background thread. */
 class Db private constructor(ctx: Context) : SQLiteOpenHelper(ctx, "netstrazh.db", null, 2) {
     override fun onCreate(db: SQLiteDatabase) {
@@ -210,6 +213,17 @@ class Db private constructor(ctx: Context) : SQLiteOpenHelper(ctx, "netstrazh.db
                 DestRow(c.getString(0), c.getString(1) ?: "", c.getInt(2), c.getString(3), c.getInt(4),
                     c.getLong(5), c.getLong(6), c.getLong(7), c.getInt(8))
             }
+        }
+
+        /**
+         * What the journal holds of attempts stopped for the reason [note] (e.g. a blocked address),
+         * per app and host name, so a host rule can show what it has been doing.
+         */
+        fun stopped(note: String): List<StoppedRow> {
+            sync()
+            val sql = "SELECT uid % 100000, host, COUNT(*), MAX(ts) FROM conn " +
+                "WHERE blocked = 1 AND note = ? AND host IS NOT NULL AND host != '' GROUP BY uid % 100000, host"
+            return query(sql, arrayOf(note)) { c -> StoppedRow(c.getInt(0), c.getString(1), c.getInt(2), c.getLong(3)) }
         }
 
         private const val ROW_COLS = "ts, te, uid, proto, ip, port, host, tx, rx, blocked, net, via, note"

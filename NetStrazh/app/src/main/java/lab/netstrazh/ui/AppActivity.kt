@@ -97,10 +97,11 @@ class AppActivity : Activity() {
         fw.addView(exRow)
         col.addView(fw)
 
+        // Right under the switches: these are firewall rules too, and must be easy to find and lift.
+        hostsBox = section(col, "Заблокированные адреса")
         trafficBox = section(col, "Трафик (данные Android)")
         liveBox = section(col, "Сейчас")
         destBox = section(col, "Куда подключалось")
-        hostsBox = section(col, "Заблокированные адреса")
         dnsBox = section(col, "Какие адреса запрашивало (DNS)")
         recentBox = section(col, "Последние соединения")
 
@@ -112,6 +113,7 @@ class AppActivity : Activity() {
     override fun onResume() {
         super.onResume()
         renderRules()
+        renderHosts()
         loadAll()
         handler.post(ticker)
     }
@@ -215,29 +217,57 @@ class AppActivity : Activity() {
 
     // ------------------------------------------------------------ host rules
 
+    /** What the journal says host rules stopped for this app; null until it has been read. */
+    private var stopped: List<lab.netstrazh.data.StoppedRow>? = null
+    private var lastDest: List<DestRow> = emptyList()
+    private var lastDns: List<DestRow> = emptyList()
+
+    /** The addresses blocked for this app: its own rules and those for all apps, each with its time. */
     private fun renderHosts() {
         hostsBox.removeAllViews()
-        val key = if (canRule) ruleKey else null
-        val own = if (key != null) Rules.blockedHosts(key) else emptySet()
-        val all = Rules.blockedHosts(Rules.ALL)
-        if (own.isEmpty() && all.isEmpty()) {
-            line(hostsBox, "Нет", if (key != null) "Нажмите на адрес в списке «Куда подключалось» или «DNS», чтобы заблокировать его." else null)
+        val items = HostsActivity.items(Rules.hostRulesFor(uid), stopped)
+        if (items.isEmpty()) {
+            line(hostsBox, "Нет", "Чтобы закрыть приложению отдельный адрес, нажмите на него ниже: " +
+                "в «Куда подключалось» или в «Какие адреса запрашивало».")
             return
         }
-        for (h in own.sorted()) hostLine(h, "для этого приложения · нажмите, чтобы разблокировать") { Rules.setHostBlocked(key!!, h, false) }
-        for (h in all.sorted()) hostLine(h, "для всех приложений · нажмите, чтобы разблокировать") { Rules.setHostBlocked(Rules.ALL, h, false) }
-    }
-
-    private fun hostLine(host: String, sub: String, unblock: () -> Unit) {
-        line(hostsBox, "⛔ $host", sub, subColor = Pal.danger)
-        hostsBox.getChildAt(hostsBox.childCount - 1).setOnClickListener {
-            unblock()
-            renderHosts()
-            toast("$host разблокирован")
+        for (item in items) {
+            val whom = if (item.rule.key == Rules.ALL) "для всех приложений" else "только для этого приложения"
+            line(hostsBox, "⛔ ${item.rule.host}", "$whom · ${HostsActivity.details(item, " · ")}\n" +
+                "Нажмите, чтобы разблокировать", subColor = Pal.danger)
+            hostsBox.getChildAt(hostsBox.childCount - 1).setOnClickListener {
+                HostsActivity.confirmUnblock(this, item, openApp = false) { afterRuleChange() }
+            }
         }
     }
 
-    /** Offers to block a host this app talked to (the exact name, or its whole domain). */
+    /** A host rule was made or lifted: every list that marks blocked addresses is drawn again. */
+    private fun afterRuleChange() {
+        renderHosts()
+        renderDest(lastDest)
+        renderDns(lastDns)
+    }
+
+    /** [h] is blocked already: offers to lift the rule that covers it (or one of several). */
+    private fun askUnblock(h: String, rules: List<Rules.HostRule>) {
+        val items = HostsActivity.items(rules, stopped)
+        if (items.size == 1) {
+            HostsActivity.confirmUnblock(this, items[0], openApp = false) { afterRuleChange() }
+            return
+        }
+        val labels = items.map { "Разблокировать ${it.rule.host} — " + if (it.rule.key == Rules.ALL) "для всех приложений" else "для «${info.label}»" }
+        android.app.AlertDialog.Builder(this)
+            .setTitle("$h заблокирован")
+            .setItems(labels.toTypedArray()) { _, i ->
+                Rules.setHostBlocked(items[i].rule.key, items[i].rule.host, false)
+                afterRuleChange()
+                toast("${items[i].rule.host} разблокирован")
+            }
+            .setNegativeButton("Отмена", null)
+            .show()
+    }
+
+    /** Offers to block a host this app talked to (the exact name, or its whole domain), or to unblock it. */
     private fun askBlockHost(host: String?) {
         val h = host?.let { Rules.normalizeHost(it) }
         if (h.isNullOrEmpty() || lab.netstrazh.vpn.Engine.isIpLiteral(h)) {
@@ -248,8 +278,9 @@ class AppActivity : Activity() {
         val parent = parentDomain(h)
         val labels = ArrayList<String>()
         val actions = ArrayList<() -> Unit>()
-        if (pkg != null && Rules.hostBlocked(uid, h)) {
-            toast("$h уже заблокирован")
+        val covering = Rules.hostRulesCovering(uid, h)
+        if (covering.isNotEmpty()) {
+            askUnblock(h, covering)
             return
         }
         if (pkg != null) {
@@ -270,8 +301,8 @@ class AppActivity : Activity() {
             .setTitle("Заблокировать адрес")
             .setItems(labels.toTypedArray()) { _, i ->
                 actions[i]()
-                renderHosts()
-                toast("Заблокировано. Работает, пока включена защита.")
+                afterRuleChange()
+                toast("Заблокировано. Снять можно здесь же, вверху карточки.")
             }
             .setNegativeButton("Отмена", null)
             .show()
@@ -310,7 +341,14 @@ class AppActivity : Activity() {
             trafficBox.removeAllViews()
             line(trafficBox, "Нет доступа к истории использования", "Разрешите его на вкладке «Трафик».")
         }
-        Bg.run({ Triple(Db.destinations(uid), Db.dnsNames(uid), Db.recentForUid(uid, 60)) }) { (dest, dns, recent) ->
+        val appId = if (uid < 0) uid else uid % 100000
+        Bg.run({
+            Triple(Db.destinations(uid), Db.dnsNames(uid), Db.recentForUid(uid, 60)) to
+                Db.stopped(lab.netstrazh.vpn.Engine.NOTE_HOST_BLOCKED).filter { it.appId == appId }
+        }) { (lists, st) ->
+            val (dest, dns, recent) = lists
+            stopped = st
+            renderHosts()
             renderDest(dest)
             renderDns(dns)
             renderRecent(recent)
@@ -333,7 +371,8 @@ class AppActivity : Activity() {
         }
         for (c in conns.take(30)) {
             if (c.blocked) {
-                line(liveBox, Fmt.dest(c.host, c.ip, c.port) + " · " + c.proto, "⛔ заблокировано", subColor = Pal.danger)
+                line(liveBox, Fmt.dest(c.host, c.ip, c.port) + " · " + c.proto,
+                    "⛔ заблокировано" + (c.note?.let { ": $it" } ?: ""), subColor = Pal.danger)
             } else {
                 line(liveBox, Fmt.dest(c.host, c.ip, c.port) + " · " + c.proto,
                     "↑ ${Fmt.bytes(c.tx)} ↓ ${Fmt.bytes(c.rx)} · ${Fmt.duration(System.currentTimeMillis() - c.start)}" +
@@ -343,33 +382,43 @@ class AppActivity : Activity() {
     }
 
     private fun renderDest(rows: List<DestRow>) {
+        lastDest = rows
         destBox.removeAllViews()
         if (rows.isEmpty()) {
             line(destBox, "Пока нет записей", "Записи появляются, когда защита включена.")
             return
         }
+        destBox.addView(text("Нажмите на адрес, чтобы заблокировать его или снять блокировку.", 12.5f, Pal.sub))
         for (r in rows.take(100)) {
-            val main = Fmt.dest(r.host, r.ip, r.port) + " · " + r.proto
+            // An address under a host rule says so, and a tap lifts the rule instead of adding one.
+            val closed = Rules.hostBlocked(uid, r.host)
+            val main = (if (closed) "⛔ " else "") + Fmt.dest(r.host, r.ip, r.port) + " · " + r.proto
             val sub = buildString {
                 if (!r.host.isNullOrEmpty() && r.host != r.ip) append(r.ip).append(" · ")
                 append("раз: ").append(r.count)
                 append(" · ↑ ").append(Fmt.bytes(r.tx)).append(" ↓ ").append(Fmt.bytes(r.rx))
                 append(" · ").append(Fmt.ago(r.last))
                 if (r.blocked > 0) append(" · ⛔ ").append(r.blocked)
+                if (closed) append("\nАдрес заблокирован · нажмите, чтобы разблокировать")
             }
-            line(destBox, main, sub, subColor = if (r.blocked > 0 && r.blocked == r.count) Pal.danger else Pal.sub)
+            line(destBox, main, sub, subColor = if (closed || r.blocked > 0 && r.blocked == r.count) Pal.danger else Pal.sub)
             destBox.getChildAt(destBox.childCount - 1).setOnClickListener { askBlockHost(r.host) }
         }
     }
 
     private fun renderDns(rows: List<DestRow>) {
+        lastDns = rows
         dnsBox.removeAllViews()
         if (rows.isEmpty()) {
             line(dnsBox, "Пока нет записей")
             return
         }
         for (r in rows.take(100)) {
-            line(dnsBox, r.host ?: "?", "раз: ${r.count} · ${Fmt.ago(r.last)}" + if (r.ip.isNotEmpty()) " · → ${r.ip}" else "")
+            val closed = Rules.hostBlocked(uid, r.host)
+            line(dnsBox, (if (closed) "⛔ " else "") + (r.host ?: "?"),
+                "раз: ${r.count} · ${Fmt.ago(r.last)}" + (if (r.ip.isNotEmpty()) " · → ${r.ip}" else "") +
+                    if (closed) "\nАдрес заблокирован · нажмите, чтобы разблокировать" else "",
+                subColor = if (closed) Pal.danger else Pal.sub)
             dnsBox.getChildAt(dnsBox.childCount - 1).setOnClickListener { askBlockHost(r.host) }
         }
     }
@@ -383,7 +432,7 @@ class AppActivity : Activity() {
         for (r in rows) {
             val main = if (r.proto == "DNS") "DNS: ${r.host ?: "?"}" else Fmt.dest(r.host, r.ip, r.port) + " · " + r.proto
             val sub = Fmt.time(r.ts) + " · " + Fmt.net(r.net) + when {
-                r.blocked -> " · ⛔ заблокировано"
+                r.blocked -> " · ⛔ заблокировано" + (r.note?.let { ": $it" } ?: "")
                 r.note != null && r.tx == 0L && r.rx == 0L -> " · ✗ ${r.note}"
                 r.proto == "DNS" -> if (r.ip.isNotEmpty()) " · → ${r.ip}" else ""
                 else -> " · ↑ ${Fmt.bytes(r.tx)} ↓ ${Fmt.bytes(r.rx)}"

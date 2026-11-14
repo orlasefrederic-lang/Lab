@@ -149,7 +149,8 @@ class JournalPage(act: MainActivity) : Page(act) {
         }
         val via = if (r.via == VIA_PROXY) " · через прокси" else ""
         when {
-            r.blocked -> v.setLine3("⛔ ЗАБЛОКИРОВАНО · " + Fmt.net(r.net), Pal.danger)
+            // The reason, when there is one (a blocked address rather than the whole app), says where to lift it.
+            r.blocked -> v.setLine3("⛔ ЗАБЛОКИРОВАНО · " + (r.note?.let { "$it · " } ?: "") + Fmt.net(r.net), Pal.danger)
             r.note != null && r.tx == 0L && r.rx == 0L -> v.setLine3("✗ ${r.note} · ${Fmt.net(r.net)}$via", Pal.warn)
             r.active -> v.setLine3("● активно · ↑ ${Fmt.bytes(r.tx)} ↓ ${Fmt.bytes(r.rx)} · ${Fmt.duration(r.te - r.ts)}$via", Pal.ok)
             r.proto == "DNS" -> v.setLine3(Fmt.net(r.net) + via)
