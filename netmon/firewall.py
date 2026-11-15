@@ -5,12 +5,14 @@
 Windows: они действуют, даже когда монитор закрыт, переживают перезагрузку
 и видны в оснастке wf.msc («Монитор брандмауэра Защитника Windows»).
 
-Правила создаются командлетами PowerShell (модуль NetSecurity): данные туда
-и обратно передаются в base64, поэтому кириллица и любые символы в путях
-не ломают команды, а ответ не зависит от языка Windows.
+Правила создаются командлетами PowerShell (модуль NetSecurity). Данные команды
+передаются через стандартный ввод (JSON в ASCII), ответ — в base64: кириллица
+и любые символы в путях не ломают команды, длина командной строки не зависит
+от числа правил, а ответ — от языка Windows.
 """
 
 import base64
+import errno
 import hashlib
 import json
 import logging
@@ -273,7 +275,9 @@ def describe_state(entries, keys):
     for e in found:
         state = {True: 'действует', False: 'выключен'}.get(e.enabled, 'действует частично')
         parts.append('%s — %s, %s' % (_entry_title(e), directions_label(e.directions), state))
-    return 'Сейчас запрет: %s.' % '; '.join(parts)
+    if len(parts) == 1:
+        return 'Сейчас запрет: %s.' % parts[0]
+    return 'Сейчас запрет:\n%s' % '\n'.join('• %s' % part for part in parts)   # по одной в строке
 
 
 def _plan_title(item):
@@ -316,7 +320,12 @@ function Find-NetMonRules([hashtable]$Filter) {
     $found
 }
 try {
-    $data = ConvertFrom-Json ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('%DATA%')))
+    # Данные команды приходят через стандартный ввод (JSON, только ASCII), а не в командной
+    # строке: её длина ограничена, а правил может быть много. PowerShell отдаёт ввод
+    # скрипту, только если $input упомянут прямо здесь, а не внутри функции.
+    $text = (@($input) -join '')
+    if ([string]::IsNullOrWhiteSpace($text)) { throw 'PowerShell не получил данные команды' }
+    $data = ConvertFrom-Json $text
 %BODY%
 } catch {
     [Console]::Out.Write('NETMON-ERR:' + [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes([string]$_.Exception.Message)))
@@ -394,11 +403,29 @@ _ENABLE_BODY = r"""
 """
 
 
-def build_script(body, data=None):
-    data = {} if data is None else data
-    payload = base64.b64encode(json.dumps(data, ensure_ascii=False).encode('utf-8')).decode('ascii')
-    return (_PRELUDE.replace('%BODY%', body.replace('%GROUP%', GROUP))
-            .replace('%DATA%', payload))
+def build_script(body):
+    """Текст скрипта. Данные в него не вставляются: их скрипт читает из стандартного ввода."""
+    return _PRELUDE.replace('%BODY%', body.replace('%GROUP%', GROUP))
+
+
+def encode_data(data=None):
+    """Данные команды для стандартного ввода PowerShell: одна строка JSON в ASCII."""
+    return json.dumps({} if data is None else data, ensure_ascii=True).encode('ascii') + b'\n'
+
+
+# Windows: «имя файла или расширение слишком длинное» — так CreateProcess отвечает и на
+# слишком длинную командную строку (больше 32767 символов); Python превращает это
+# в FileNotFoundError, хотя сам файл на месте.
+ERROR_FILENAME_EXCED_RANGE = 206
+
+
+def launch_error(exc, command_length):
+    """Понятный текст ошибки запуска PowerShell."""
+    if getattr(exc, 'winerror', None) == ERROR_FILENAME_EXCED_RANGE or exc.errno == errno.E2BIG:
+        return 'слишком длинная команда для PowerShell (%d символов)' % command_length
+    if isinstance(exc, FileNotFoundError):
+        return 'не найден PowerShell (powershell.exe)'
+    return 'не удалось запустить PowerShell: %s' % (exc.strerror or exc)
 
 
 def _decode_console(raw):
@@ -464,19 +491,23 @@ class WindowsFirewall:
         path = os.path.join(root, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
         return path if os.path.exists(path) else 'powershell.exe'
 
-    def _run(self, body, data=None):
-        script = self.prelude + build_script(body, data)
+    def command(self, body):
+        """Командная строка PowerShell. Её длина не зависит от данных команды."""
+        script = self.prelude + build_script(body)
         encoded = base64.b64encode(script.encode('utf-16-le')).decode('ascii')
-        args = [self._powershell(), '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+        return [self._powershell(), '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
                 '-EncodedCommand', encoded]
+
+    def _run(self, body, data=None):
+        args = self.command(body)
         try:
-            proc = subprocess.run(args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            proc = subprocess.run(args, input=encode_data(data), stdout=subprocess.PIPE,
                                   stderr=subprocess.PIPE, timeout=self.timeout,
                                   creationflags=CREATE_NO_WINDOW if sys.platform == 'win32' else 0)
-        except FileNotFoundError:
-            raise FirewallError('не найден PowerShell (powershell.exe)')
         except subprocess.TimeoutExpired:
             raise FirewallError('PowerShell не ответил за %d с' % self.timeout)
+        except OSError as exc:
+            raise FirewallError(launch_error(exc, len(subprocess.list2cmdline(args))))
         return parse_output(proc.stdout, proc.stderr, proc.returncode)
 
     def state(self):

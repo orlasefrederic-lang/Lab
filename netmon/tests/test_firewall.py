@@ -12,9 +12,11 @@ import io
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -27,6 +29,27 @@ from firewall import (DemoFirewall, FirewallError, FirewallManager, Rule,  # noq
 
 EXPLORER = r'C:\Windows\explorer.exe'
 SVCHOST = r'C:\Windows\System32\svchost.exe'
+
+# Десять программ из списка пользователя (Windows 10). В версии 1.4 «Снова запретить» сразу
+# для всех давало командную строку в 33 329 символов при пределе Windows 32 767, и запуск
+# PowerShell заканчивался ошибкой «не найден PowerShell»
+MANY = [(r'C:\Program Files (x86)\Intel\Driver and Support Assistant\x86\DSAService.exe', ''),
+        (r'C:\Program Files (x86)\Intel\Driver and Support Assistant\x86\DSAUpdateService.exe', ''),
+        (r'C:\Program Files\ONLYOFFICE\DesktopEditors\editors_helper.exe', ''),
+        (r'C:\Program Files\Intel\SUR\QUEENCREEK\x64\esrv_svc.exe', ''),
+        (EXPLORER, ''),
+        (r'C:\Program Files\NVIDIA Corporation\NvContainer\nvcontainer.exe', ''),
+        (r'C:\Windows\System32\DriverStore\FileRepository\nvmii.inf_amd64_52a4c0ca7914a7b3'
+         r'\Display.NvContainer\NVDisplay.Container.exe', ''),
+        (r'C:\Program Files\Intel\SUR\QUEENCREEK\x64\SurSvc.exe', ''),
+        (SVCHOST, 'NlaSvc'),
+        (r'C:\Program Files\Intel\SUR\QUEENCREEK\Updater\bin\updatesvc.exe', '')]
+WINDOWS_COMMAND_LINE_LIMIT = 32767
+
+
+def plan_for(programs):
+    return [item for path, service in programs
+            for item in block_plan(path, [service] if service else [])]
 
 
 def ok_output(obj):
@@ -99,6 +122,66 @@ class ParseTest(unittest.TestCase):
         self.assertEqual(profiles, [('Public', False)])
         (entry,) = group_rules(rules)
         self.assertEqual((entry.directions, entry.enabled, entry.rule_ids), (('out', 'in'), None, ('a', 'b')))
+
+
+class CommandLineTest(unittest.TestCase):
+    """Запуск PowerShell: данные команды не попадают в командную строку."""
+
+    def setUp(self):
+        self.fw = WindowsFirewall(
+            executable=r'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe')
+
+    def run_with(self, fake, call):
+        with mock.patch('firewall.subprocess.run', fake):
+            return call()
+
+    def test_command_line_does_not_depend_on_data(self):
+        lengths = {}
+        for programs in (MANY[:1], MANY, MANY * 30):
+            calls = []
+
+            def fake(args, **kwargs):
+                calls.append((args, kwargs))
+                return subprocess.CompletedProcess(args, 0, ok_output(True), b'')
+            plan = plan_for(programs)
+            self.run_with(fake, lambda: self.fw.add(plan))
+            (args, kwargs), = calls
+            lengths[len(programs)] = len(subprocess.list2cmdline(args))
+            # всё, что зависит от списка программ, ушло в стандартный ввод одной строкой ASCII
+            self.assertNotIn('stdin', kwargs)
+            self.assertEqual(kwargs['input'].count(b'\n'), 1)
+            self.assertEqual(json.loads(kwargs['input'].decode('ascii')), plan)
+        self.assertEqual(len(set(lengths.values())), 1, lengths)
+        for body in (firewall._LIST_BODY, firewall._ADD_BODY, firewall._REMOVE_BODY,
+                     firewall._ENABLE_BODY):
+            self.assertLess(len(subprocess.list2cmdline(self.fw.command(body))),
+                            WINDOWS_COMMAND_LINE_LIMIT // 2)
+
+    def test_script_reads_its_data_from_input(self):
+        # PowerShell отдаёт стандартный ввод скрипту, только если $input упомянут в самом
+        # скрипте, а не внутри функции; данных в тексте скрипта нет
+        for body in (firewall._LIST_BODY, firewall._ADD_BODY):
+            script = firewall.build_script(body)
+            self.assertIn('@($input)', script)
+            self.assertNotIn('%DATA%', script)
+            self.assertNotIn('%BODY%', script)
+            before = script[:script.index('@($input)')]
+            self.assertEqual(before.count('{') - before.count('}'), 1)   # только блок try
+
+    def test_launch_errors_are_named_correctly(self):
+        def failing(exc):
+            def fake(args, **kwargs):
+                raise exc
+            return fake
+        too_long = FileNotFoundError(2, 'The filename or extension is too long')
+        too_long.winerror = 206
+        cases = ((too_long, 'слишком длинная команда'),
+                 (OSError(7, 'Argument list too long'), 'слишком длинная команда'),
+                 (FileNotFoundError(2, 'No such file or directory'), 'не найден PowerShell'),
+                 (PermissionError(13, 'Access is denied'), 'не удалось запустить PowerShell'))
+        for exc, text in cases:
+            with self.assertRaisesRegex(FirewallError, text):
+                self.run_with(failing(exc), self.fw.state)
 
 
 class ScriptedFirewall(DemoFirewall):
@@ -472,6 +555,30 @@ class PowerShellScriptsTest(unittest.TestCase):
         with self.assertRaisesRegex(FirewallError, 'недопустимое имя службы'):
             self.fw.add(plan)
         self.assertEqual(self.fw.state()[0], [])
+
+    def test_many_programs_in_one_command(self):
+        # случай пользователя: десять программ временно разрешены, «Снова запретить» для всех
+        # сразу; и с запасом — ещё полсотни программ с длинными путями и кириллицей
+        programs = MANY + [(r'C:\Program Files\Программа номер %d\Очень длинное имя папки с '
+                            r'пробелами и кириллицей\Ещё одна папка\application-%d.exe' % (i, i), '')
+                           for i in range(50)]
+        plan = plan_for(programs)
+        firewall.log.disabled = True
+        self.addCleanup(setattr, firewall.log, 'disabled', False)
+        manager = FirewallManager(self.fw)
+        self.addCleanup(manager.shutdown)
+        self.fw.add(plan)
+        manager.set_enabled(group_rules(self.fw.state()[0]), False).result()
+        self.assertEqual({r.enabled for r in self.fw.state()[0]}, {False})
+        self.assertEqual(len(manager.entries), len(programs))
+        manager.take_messages()
+        manager.set_enabled(list(manager.entries), True).result()
+        ((kind, text),) = manager.take_messages()
+        self.assertEqual((kind, text[:15]), ('info', 'Снова запрещено'))
+        rules, _ = self.fw.state()
+        self.assertEqual(len(rules), 2 * len(programs))
+        self.assertEqual({r.enabled for r in rules}, {True})
+        self.assertEqual({r.program for r in rules}, {path for path, _service in programs})
 
     def test_single_rule_is_still_a_list(self):
         self.fw.add(block_plan(EXPLORER, (), ('out',)))
