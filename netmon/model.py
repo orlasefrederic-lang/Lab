@@ -32,10 +32,17 @@ INSTANCES_PER_PID = 4  # сколько последних экземпляро�
 # Время создания процесса из Windows, время событий ETW (сеанс пишет системное время)
 # и момент, когда мы видели процесс, берутся из одних часов; допуск — только их шаг.
 CLOCK_EPS = 0.05
-# Событие ETW о запуске пишется ещё во время создания процесса: от времени создания
-# (GetProcessTimes) до него — миллисекунды. 1 с — с большим запасом.
-START_LAG = 1.0
+# Событие ETW о запуске пишется тем же системным вызовом, что создаёт процесс: от времени
+# создания (GetProcessTimes) до него — миллисекунды. Четверть секунды — с большим запасом.
+START_LAG = 0.25
+# Время создания одного и того же процесса Windows сообщает одинаково (GetProcessTimes),
+# поэтому у записи из истории и у работающего процесса оно совпадает, а не «близко».
+SAME_CREATED = 0.001
 BOUNDS_PER_PID = 8    # сколько последних запусков/остановок PID помнить в накопителе
+STOPS_PER_PID = 4     # сколько «ничьих» событий о завершении PID помнить
+# Событие о завершении может обогнать событие о запуске и пакеты того же процесса только
+# на время доставки событий ETW (секунды); полминуты — с большим запасом.
+EARLY_STOP_WINDOW = 30.0
 _DRIVE_PATH = re.compile(r'^[a-z]:\\')
 
 
@@ -92,7 +99,8 @@ class Proc:
     __slots__ = ('uid', 'pid', 'name', 'snap_name', 'path', 'cmdline', 'services', 'started',
                  'ended', 'first_seen', 'last_seen', 'sent', 'recv', 'lo_sent', 'lo_recv',
                  'endpoints', 'lo_eps', 'conns', 'dirty', 'dirty_eps', 'persisted',
-                 'need_details', 'absent', 'accept_ports', 'etw_started', 'seen_by_etw')
+                 'need_details', 'absent', 'accept_ports', 'own_start', 'adopted', 'etw_seen',
+                 'end_exact')
 
     def __init__(self, uid, pid, ts):
         self.uid = uid
@@ -116,8 +124,10 @@ class Proc:
         self.need_details = True
         self.absent = False
         self.accept_ports = set()   # локальные порты, на которые этот экземпляр принимал TCP
-        self.etw_started = False    # событие ETW о запуске именно этого экземпляра уже было
-        self.seen_by_etw = False    # first_seen — время события ETW (точное), а не снимка
+        self.own_start = None       # время события ETW о запуске, принятого за запуск экземпляра
+        self.adopted = frozenset()  # что взято из этого события на веру: 'path', 'started'
+        self.etw_seen = None        # самое раннее событие ETW экземпляра: тогда он точно работал
+        self.end_exact = False      # ended — из события о завершении, а не догадка
 
     @property
     def has_net(self):
@@ -191,6 +201,7 @@ class Model:
         self.listen_table = set()    # (pid, порт) — слушающие TCP-сокеты
         self.listen_known = False
         self._instances = {}         # pid -> последние экземпляры с этим PID (новые в конце)
+        self._early_stops = {}       # pid -> события о завершении, пришедшие раньше записи
         self._conn_uids = set()      # uid процессов с ненулевым числом открытых соединений
         self.local_ips = {'127.0.0.1', '::1'}
         self._resumable = {}         # pid -> Proc из истории, который, возможно, ещё работает
@@ -340,7 +351,7 @@ class Model:
         return result
 
     def _instance_at(self, pid, ts):
-        """Известный экземпляр процесса с этим PID, который жил в момент ts, или None.
+        """(экземпляр процесса с этим PID для события в момент ts или None, точно ли попадание).
 
         События ETW из разных буферов могут прийти не по порядку: поздний пакет
         старого процесса не должен записываться новому владельцу PID.
@@ -354,122 +365,241 @@ class Model:
         lifetimes = self._lifetimes(pid)
         for proc, begin, end in reversed(lifetimes):
             if (begin is None or begin <= ts) and (end is None or ts <= end):
-                return proc
+                return proc, True
         for i in range(len(lifetimes) - 1, -1, -1):
             proc, begin, end = lifetimes[i]
             if begin is not None and ts < begin:
                 continue                    # тогда этот процесс ещё не был запущен
             if i + 1 < len(lifetimes) or end is None or ts <= end + SLACK:
-                return proc
-            return None
-        return lifetimes[0][0] if lifetimes else None   # раньше всех известных экземпляров
+                return proc, False
+            return None, False
+        # раньше всех известных экземпляров
+        return (lifetimes[0][0] if lifetimes else None), False
+
+    def _held_until(self, proc):
+        """Момент, до которого PID точно принадлежал этому экземпляру.
+
+        Следующий владелец PID появился не раньше: после запуска экземпляра, после
+        события ETW от него, после его события о завершении. Время снимка процессов —
+        момент после конца чтения, поэтому от него отнимается SLACK.
+        """
+        marks = [proc.first_seen - SLACK]
+        if proc.started is not None:
+            marks.append(proc.started)
+        if proc.etw_seen is not None:
+            marks.append(proc.etw_seen)
+        if proc.end_exact:
+            marks.append(proc.ended)
+        return max(marks)
 
     def _clamp_previous(self, proc):
-        """Предыдущие владельцы PID завершились до запуска proc (время из снимка — с запасом)."""
+        """Предыдущие владельцы PID завершились до запуска proc.
+
+        Уточняется только время завершения «по догадке» (процесс пропал из снимка, PID
+        занял другой процесс). Время из события о завершении не меняется, и раньше
+        момента, когда прежний процесс точно работал, его конец не ставится.
+        """
         if proc.started is None:
             return
         for other in self._instances.get(proc.pid, ()):
             if other is proc:
                 break
-            if other.ended is not None and other.ended > proc.started:
-                other.ended = proc.started
+            if other.ended is None or other.end_exact:
+                continue
+            end = max(proc.started, self._held_until(other))
+            if end < other.ended:
+                other.ended = end
                 other.dirty = True
 
-    def _proc_at(self, pid, ts, by_etw=False):
+    @staticmethod
+    def _note_etw(proc, ts):
+        """Событие ETW в момент ts точно относится к экземпляру: тогда он работал."""
+        if proc.etw_seen is None or ts < proc.etw_seen:
+            proc.etw_seen = ts
+
+    def _proc_at(self, pid, ts, etw=False):
         """Экземпляр, которому принадлежит событие; при необходимости создаёт новый.
 
-        by_etw: ts — время события ETW, то есть в этот момент процесс точно был жив.
+        etw: ts — время события ETW (пакет, принятое соединение). Если оно попало точно
+        во время жизни экземпляра, это запоминается: в тот момент экземпляр работал.
         """
-        proc = self._instance_at(pid, ts)
-        if proc is not None:
-            return proc
-        current = self.by_pid.get(pid)
-        if current is not None and current.ended is None:
-            return current
-        # PID свободен или его прежний владелец уже завершился: это новый процесс,
-        # о запуске которого мы ещё не знаем
-        proc = self._new_proc(pid, ts)
-        proc.seen_by_etw = by_etw
+        proc, exact = self._instance_at(pid, ts)
+        if proc is None:
+            current = self.by_pid.get(pid)
+            if current is not None and current.ended is None:
+                return current
+            # PID свободен или его прежний владелец уже завершился: это новый процесс,
+            # о запуске которого мы ещё не знаем. Запись заводит само это событие
+            proc, exact = self._new_proc(pid, ts), True
+            if etw:
+                self._take_early_stop(proc, ts)
+        if etw and exact:
+            self._note_etw(proc, ts)
         return proc
 
-    def _seen_alive_before(self, proc, ts):
-        """Экземпляр точно был жив раньше момента ts?
+    def _other_exe(self, proc, path):
+        """Точно ли path — другой exe, чем у записи (если сравнить не с чем — нет).
 
-        Время события ETW с другим событием ETW сравнивается точно. Время снимка
-        процессов берётся через time.time(), у которого может быть другой шаг часов,
-        поэтому для него допуск CLOCK_EPS.
+        Полные пути сравниваются целиком (C:\\Old\\app.exe и C:\\Other\\app.exe — разные
+        программы). Если какой-то путь не вида C:\\… (сетевой, \\Device\\…) или неизвестен,
+        сравниваются имена файлов. Путь, взятый на веру из запоздавшего события о запуске,
+        для сверки не годится: сверяется то, что известно точно.
         """
-        return proc.first_seen + (0.0 if proc.seen_by_etw else CLOCK_EPS) < ts
+        if not path or proc.pid in SPECIAL_NAMES:
+            return False
+        own_path = '' if 'path' in proc.adopted else proc.path
+        old_key, new_key = _path_key(own_path), _path_key(path)
+        if old_key and new_key:
+            return old_key != new_key
+        known = proc.snap_name or (ntpath.basename(own_path) if own_path else None)
+        base = ntpath.basename(path)
+        return bool(known and base and base.lower() != known.lower())
 
-    def _late_start(self, proc, ts):
-        """Может ли запуск в момент ts быть запуском самого proc?
+    def _own_start(self, proc, prev, ts, path):
+        """Может ли событие о запуске (момент ts, образ path) быть запуском самого proc?
 
         Так бывает, когда запись создана по снимку процессов или по трафику раньше, чем
-        дошло событие ETW о запуске. Но запуск у процесса один, и он раньше завершения
-        процесса и раньше момента, когда процесс видели живым.
-        """
-        if proc.etw_started:
-            return False             # свой запуск у этого экземпляра уже был
-        if proc.ended is not None and ts >= proc.ended:
-            return False             # запущен после завершения записи — это другой процесс
-        if proc.started is not None and not (proc.started - CLOCK_EPS <= ts
-                                             <= proc.started + START_LAG):
-            return False             # время создания (GetProcessTimes) не сходится с запуском
-        return not self._seen_alive_before(proc, ts)   # процесс работал ещё до этого запуска
+        дошло событие ETW о запуске. Этому не должно противоречить ничто известное:
+        это тот же exe, запуск раньше завершения и раньше любого момента, когда процесс
+        уже работал, но позже, чем PID освободил предыдущий владелец (prev). События ETW
+        сравниваются между собой точно; для времени снимка и времени создания из
+        GetProcessTimes — допуск на шаг часов.
 
-    def _started_instance(self, pid, ts):
-        """Уже записанный экземпляр, чей запуск пришёл только сейчас, или None."""
-        for proc in reversed(self._instances.get(pid, ())):
-            if self._late_start(proc, ts):
-                return proc
-            if ((proc.started is not None and proc.started <= ts)
-                    or self._seen_alive_before(proc, ts)
-                    or (proc.ended is not None and proc.ended <= ts)):
-                return None          # этот экземпляр начался раньше — запуск у нового процесса
-        return None
+        Подходящих запусков может прийти несколько (прежние владельцы PID жили доли
+        секунды): своим считается самый поздний из них — раз процесс после него работал,
+        более ранние относились не к нему.
+        """
+        if proc.own_start is not None and ts <= proc.own_start:
+            return False             # уже принят более поздний запуск
+        if self._other_exe(proc, path):
+            return False             # запущен другой exe
+        if proc.ended is not None and ts >= proc.ended:
+            return False             # запущен после завершения записи
+        created = None if 'started' in proc.adopted else proc.started
+        if created is not None and not (created - CLOCK_EPS <= ts <= created + START_LAG):
+            return False             # время создания (GetProcessTimes) не сходится с запуском
+        if proc.etw_seen is not None and proc.etw_seen < ts:
+            return False             # событие ETW от процесса было раньше этого запуска
+        if proc.first_seen + CLOCK_EPS < ts:
+            return False             # процесс видели раньше этого запуска
+        if prev is not None and ts < self._held_until(prev):
+            return False             # тогда PID ещё принадлежал предыдущему владельцу
+        return True
+
+    @staticmethod
+    def _began_before(proc, ts):
+        """Появился ли экземпляр раньше момента ts (где в ts запущен ДРУГОЙ процесс).
+
+        Если да, тот процесс новее экземпляра; если нет — он владел PID раньше.
+        """
+        if proc.own_start is not None and ts <= proc.own_start:
+            return False             # событие раньше собственного запуска экземпляра
+        return ((proc.started is not None and proc.started < ts)
+                or (proc.etw_seen is not None and proc.etw_seen < ts)
+                or (proc.ended is not None and proc.ended <= ts)
+                or proc.first_seen < ts)
 
     def _apply_start(self, pid, ts, image):
+        """Событие ETW о запуске: чей это запуск?
+
+        Экземпляры PID просматриваются от нового к старому. Запуск либо «свой» для уже
+        существующей записи (она создана по снимку или по трафику раньше, чем дошло
+        событие), либо относится к процессу, которого в записях нет. Новая запись
+        заводится, только если такой процесс новее всех известных.
+        """
         path = self.nt_path(image) if image else ''
         name = ntpath.basename(path) if path else None
         cand = self._resumable.pop(pid, None)
         if cand is not None:
             self._finalize(cand)
-        proc = self._started_instance(pid, ts)
-        if proc is not None:
-            # запись этого процесса уже есть (по снимку процессов или по трафику),
-            # а событие о его запуске дошло только сейчас — новую не заводим
-            proc.etw_started = True
-            if path and not proc.path:
-                proc.path, proc.name = path, name
-                proc.dirty = True
-            if proc.started is None:
-                proc.started = ts
-                proc.dirty = True
-                self._clamp_previous(proc)
-            return
+        instances = self._instances.get(pid, ())
+        last = len(instances) - 1
+        for i in range(last, -1, -1):
+            proc = instances[i]
+            if self._own_start(proc, instances[i - 1] if i else None, ts, path):
+                # путь и время запуска берутся из события, только если точных сведений
+                # (из GetProcessTimes) нет; более поздний подходящий запуск их заменит
+                proc.own_start = ts
+                if path and (not proc.path or 'path' in proc.adopted):
+                    proc.path, proc.name = path, name
+                    proc.adopted |= {'path'}
+                    proc.dirty = True
+                if proc.started is None or 'started' in proc.adopted:
+                    proc.started = ts
+                    proc.adopted |= {'started'}
+                    proc.dirty = True
+                    self._clamp_previous(proc)
+                return
+            if self._began_before(proc, ts):
+                if i < last:
+                    return   # процесс жил между двумя известными экземплярами; записи о нём нет
+                break        # процесс новее всех известных
+        else:
+            if instances:
+                return       # запоздавший запуск того, кто владел PID до всех известных
         cur = self.by_pid.get(pid)
-        if cur is not None and cur.started is not None and ts < cur.started - (
-                0.0 if cur.etw_started else CLOCK_EPS):
-            return   # запоздавший запуск одного из прежних владельцев PID, записи о котором нет
         if cur is not None:
             # PID уже у нового процесса: прежний завершился, а событие об этом
             # потеряно или ещё не дошло (если уже дошло, время завершения не меняется)
             self._end(cur, ts)
         proc = self._new_proc(pid, ts, name=name, path=path, started=ts)
-        proc.etw_started = proc.seen_by_etw = True
+        proc.own_start = proc.etw_seen = ts     # запись заведена самим событием о запуске
+        self._take_early_stop(proc, ts)
 
     def _apply_stop(self, pid, ts):
-        # завершиться мог только экземпляр, который в момент ts уже работал
-        for proc in reversed(self._instances.get(pid, ())):
-            if proc.started is not None and proc.started > ts:
-                continue          # запущен позже этого события
-            if proc.started is None and proc.first_seen > ts + SLACK:
-                continue          # мы видели его живым уже после этого момента
-            if proc.ended is None or ts < proc.ended:
-                proc.ended = ts   # событие точнее, чем время из догадок
-                proc.conns = 0
-                proc.dirty = True
+        """Событие ETW о завершении: чьё оно?
+
+        Завершиться мог только экземпляр, который в момент ts уже работал и у которого
+        события о завершении ещё не было. Экземпляры просматриваются от нового к старому.
+        """
+        instances = self._instances.get(pid, ())
+        for i in range(len(instances) - 1, -1, -1):
+            proc = instances[i]
+            prev = instances[i - 1] if i else None
+            if proc.started is not None:
+                if proc.started > ts:
+                    continue      # запущен позже этого события
+            elif proc.etw_seen is not None and proc.etw_seen > ts:
+                continue          # событие ETW от него было позже: в момент ts он не завершался
+            elif proc.first_seen > ts + SLACK:
+                continue          # увидели заметно позже
+            elif prev is not None and (ts < self._held_until(prev) or (
+                    proc.first_seen > ts and prev.ended is not None and not prev.end_exact
+                    and prev.ended >= ts)):
+                # PID тогда был ещё у предыдущего владельца; либо предыдущий уже считается
+                # завершённым «по догадке», а этот экземпляр увидели после ts — событие
+                # уточняет конец предыдущего, а не завершает нового
+                continue
+            if not proc.end_exact and (proc.ended is None or ts <= proc.ended):
+                self._end_exactly(proc, ts)
+                return
+            break                 # у этого экземпляра событие о завершении уже было
+        # Записи о завершившемся процессе ещё нет: у короткоживущих процессов событие
+        # о завершении иногда приходит раньше события о запуске и пакетов. Запоминаем его
+        if len(self._early_stops) > 10000:
+            self._early_stops.clear()
+        stops = self._early_stops.setdefault(pid, [])
+        bisect.insort(stops, ts)
+        del stops[:-STOPS_PER_PID]
+
+    def _end_exactly(self, proc, ts):
+        """Время завершения из события о завершении: оно точнее, чем время из догадок."""
+        proc.ended = ts
+        proc.end_exact = True
+        proc.conns = 0
+        proc.dirty = True
+
+    def _take_early_stop(self, proc, since):
+        """Запись только что заведена событием ETW в момент since. Если событие о завершении
+        этого процесса пришло раньше неё, это первое завершение не раньше since."""
+        stops = self._early_stops.get(proc.pid)
+        if not stops:
             return
+        i = bisect.bisect_left(stops, since)
+        if i < len(stops) and stops[i] - since <= EARLY_STOP_WINDOW:
+            self._end_exactly(proc, stops.pop(i))
+        if not stops:
+            del self._early_stops[proc.pid]
 
     def _apply_accept(self, pid, port, ts):
         proc = self._proc_at(pid, time.time() if ts is None else ts, ts is not None)
@@ -692,27 +822,35 @@ class Model:
     def _same_instance(self, proc, info):
         """Сведения, прочитанные по PID, относятся к этой записи, а не к новому владельцу PID?
 
-        1. Другой exe — другой процесс. Полные пути сравниваются целиком (C:\\Old\\app.exe и
-           C:\\Other\\app.exe — разные программы); если какой-то путь не вида C:\\… (сетевой,
-           \\Device\\…), сравниваются имена файлов.
-        2. first_seen — момент, когда этот экземпляр точно был жив (событие ETW, время после
-           снимка процессов). Процесс, созданный позже, — другой экземпляр, как бы быстро
-           ни сменился владелец PID и даже если exe тот же самый.
+        1. Другой exe — другой процесс (см. _other_exe).
+        2. Процесс, созданный позже, чем этот экземпляр уже работал (событие ETW от него,
+           снимок процессов), — другой экземпляр, как бы быстро ни сменился владелец PID
+           и даже если exe тот же самый.
         """
         path = info.get('path')
-        if path and proc.pid not in SPECIAL_NAMES:
-            new_path = self.nt_path(path)
-            old_key, new_key = _path_key(proc.path), _path_key(new_path)
-            if old_key and new_key:
-                if old_key != new_key:
-                    return False
-            else:
-                known = proc.snap_name or (ntpath.basename(proc.path) if proc.path else None)
-                base = ntpath.basename(new_path)
-                if known and base and base.lower() != known.lower():
-                    return False
+        if path and self._other_exe(proc, self.nt_path(path)):
+            return False
         started = info.get('started')
-        return started is None or started <= proc.first_seen + CLOCK_EPS
+        if started is None:
+            return True
+        seen = proc.first_seen if proc.etw_seen is None else min(proc.first_seen, proc.etw_seen)
+        return started <= seen + CLOCK_EPS
+
+    def _continues(self, cand, proc):
+        """Работающий процесс proc — тот же, что запись cand из прошлого запуска монитора?
+
+        Пока монитор был закрыт, PID мог достаться другой программе, в том числе с тем же
+        именем файла, или тому же exe, запущенному заново. Поэтому нужны то же время
+        создания и тот же exe: полный путь, если он известен у обоих, иначе имя файла.
+        """
+        if not (proc.started and cand.started):
+            return False
+        if abs(proc.started - cand.started) > SAME_CREATED:
+            return False
+        old_key, new_key = _path_key(cand.path), _path_key(proc.path)
+        if old_key and new_key:
+            return old_key == new_key
+        return cand.name.lower() == proc.name.lower()
 
     def fill_details(self, uid, info, now=None):
         """info: dict(path, started, cmdline[, exited]) или None, если процесса уже нет.
@@ -745,19 +883,21 @@ class Model:
                 return
             if info.get('path'):
                 proc.path = self.nt_path(info['path'])
+                proc.adopted -= {'path'}       # теперь путь известен точно
                 if proc.pid not in SPECIAL_NAMES:
                     proc.name = ntpath.basename(proc.path) or proc.name
             if info.get('started'):
                 proc.started = info['started']
+                proc.adopted -= {'started'}
                 self._clamp_previous(proc)
             if info.get('cmdline'):
                 proc.cmdline = info['cmdline']
             if info.get('exited'):
                 self._end(proc, info['exited'])
+                proc.end_exact = True      # время завершения сообщила сама Windows
             proc.dirty = True
             if cand is not None:
-                if (proc.started and cand.started and abs(proc.started - cand.started) < 2.0
-                        and cand.name.lower() == proc.name.lower()):
+                if self._continues(cand, proc):
                     self._reattach(cand, proc)
                 else:
                     self._finalize(cand)
@@ -819,7 +959,11 @@ class Model:
     def _reattach(self, cand, new):
         """Процесс из истории всё ещё работает: продолжаем его старую запись."""
         cand.ended = None
+        cand.end_exact = False
         cand.absent = False
+        cand.own_start = new.own_start
+        cand.adopted = frozenset()
+        cand.etw_seen = new.etw_seen
         cand.snap_name = new.snap_name
         cand.path = new.path or cand.path
         cand.cmdline = new.cmdline or cand.cmdline
@@ -911,6 +1055,7 @@ class Model:
             self._resumable.clear()
             self._open_eps.clear()
             self._instances.clear()
+            self._early_stops.clear()
             self._conn_uids.clear()
             self._deleted = []
             self.total_events = 0
