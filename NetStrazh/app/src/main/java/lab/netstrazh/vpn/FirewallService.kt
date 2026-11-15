@@ -27,6 +27,22 @@ import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.Socket
 
+/**
+ * The apps to keep out of the VPN: those the user marked ([byUser]), and the proxy app when it is to
+ * go around us. Under Android's "Block connections without VPN" ([lockdown]) the proxy app is never
+ * among them, not even when the user marked it by hand: Android cuts off every app outside the VPN,
+ * so the proxy would lose its server, and every other app its internet with it. Inside the VPN its
+ * traffic leaves directly all the same (the engine knows it by its UID).
+ */
+fun appsToExclude(p: ProxyConfig, byUser: Set<String>, lockdown: Boolean, self: String): Set<String> {
+    val proxyApp = p.appPkg.takeIf { p.enabled && it.isNotEmpty() && it != self } ?: return byUser
+    return when {
+        lockdown -> byUser - proxyApp
+        p.bypassApp -> byUser + proxyApp
+        else -> byUser
+    }
+}
+
 class FirewallService : VpnService(), EngineHost {
     private var engine: Engine? = null
     private lateinit var net: NetMonitor
@@ -45,6 +61,22 @@ class FirewallService : VpnService(), EngineHost {
     private val captureCheck = Runnable { checkCapture() }
     private val checker = java.util.concurrent.Executors.newSingleThreadExecutor { r -> Thread(r, "ns-capture").apply { isDaemon = true } }
     private var captureFailures = 0
+
+    /**
+     * Nothing tells a VPN service that the system's "always-on VPN" or "block connections without
+     * VPN" was switched while it runs, so it asks every few seconds (two cheap calls): under the block
+     * the proxy app has to be inside the VPN, without it outside. Looking once a minute, as before,
+     * left the proxy app cut off from its server for up to that long.
+     */
+    private val modeCheck = object : Runnable {
+        override fun run() {
+            main.postDelayed(this, MODE_EVERY_MS)
+            if (engine != null && excludedNow() != appliedExcluded) restartEngine()
+        }
+    }
+
+    /** Our interface exists on the system's side: only then does Android say how it runs us. */
+    private var tunUp = false
 
     /** The journal keeps only the configured number of days, also while the VPN runs for weeks. */
     private val prune = object : Runnable {
@@ -84,8 +116,8 @@ class FirewallService : VpnService(), EngineHost {
         }
         Prefs.enabled = true
         if (engine == null) startEngine()
-        // Android starts us again when "always-on VPN" or "block connections without VPN" is
-        // switched: under the block the proxy app has to move inside the VPN (see excludedNow).
+        // Started again while running (the app's switch, the system making us the always-on VPN): a
+        // moment to look whether the system's block changed (see modeCheck).
         else if (excludedNow() != appliedExcluded) restartEngine()
         return START_STICKY
     }
@@ -109,7 +141,9 @@ class FirewallService : VpnService(), EngineHost {
 
     /**
      * Brings up the VPN interface and the engine. When an engine is already running (restart after a
-     * rule or network change) the new interface is established first, so traffic never bypasses us.
+     * rule or network change) the new interface is established before the old one is closed, so the
+     * VPN is never down in between. How fast Android routes apps into the new one is up to Android:
+     * the capture check watches that.
      */
     private fun startEngine() {
         net.start()
@@ -142,6 +176,8 @@ class FirewallService : VpnService(), EngineHost {
         updateNotification()
         main.removeCallbacks(captureCheck)
         main.postDelayed(captureCheck, CAPTURE_FIRST_MS)
+        main.removeCallbacks(modeCheck)
+        main.postDelayed(modeCheck, MODE_EVERY_MS)
     }
 
     private fun checkCapture() {
@@ -193,9 +229,6 @@ class FirewallService : VpnService(), EngineHost {
                 updateNotification()
             }
             main.postDelayed(captureCheck, CAPTURE_EVERY_MS)
-            // The system's "block connections without VPN" may have been switched meanwhile (nothing
-            // tells us): the proxy app then has to move into the VPN or out of it.
-            if (!first && excludedNow() != appliedExcluded) restartEngine()
             return
         }
         captureFailures++
@@ -211,7 +244,26 @@ class FirewallService : VpnService(), EngineHost {
         }
     }
 
+    /**
+     * Establishes the interface. The first one after a start is made for the system's block as it
+     * was last seen: Android tells how things really are only once an interface is up (see
+     * [readSystemMode]). If that turns out different, the interface is established again at once,
+     * with the right apps in it, instead of leaving the proxy app cut off until the next check.
+     */
     private fun establishTun(cfg: TunConfig): ParcelFileDescriptor? {
+        val known = tunUp
+        val first = establishFor(cfg, excludedNow()) ?: return null
+        tunUp = true
+        if (known) return first
+        val wanted = excludedNow()
+        if (wanted == appliedExcluded) return first
+        Log.i(Engine.TAG, "the system's VPN block turned out to be ${if (lockdown) "on" else "off"}: establishing again for it")
+        val second = establishFor(cfg, wanted) ?: return first
+        try { first.close() } catch (_: Exception) {}
+        return second
+    }
+
+    private fun establishFor(cfg: TunConfig, excluded: Set<String>): ParcelFileDescriptor? {
         val b = Builder()
             .setSession(getString(R.string.app_name))
             .setMtu(TunConfig.MTU)
@@ -231,12 +283,14 @@ class FirewallService : VpnService(), EngineHost {
         }
         b.setMetered(false)
         net.best?.let { b.setUnderlyingNetworks(arrayOf(it)) }
-        appliedExcluded = excludedNow()
-        for (pkg in appliedExcluded) {
+        for (pkg in excluded) {
             try { b.addDisallowedApplication(pkg) } catch (_: Exception) {}
         }
         return try {
-            b.establish()
+            b.establish()?.also {
+                appliedExcluded = excluded
+                interfacesBuilt++
+            }
         } catch (e: Exception) {
             Log.e(Engine.TAG, "establish failed", e)
             null
@@ -253,9 +307,11 @@ class FirewallService : VpnService(), EngineHost {
         main.removeCallbacks(netChanged)
         main.removeCallbacks(prune)
         main.removeCallbacks(captureCheck)
+        main.removeCallbacks(modeCheck)
         captureFailures = 0
         captureBroken = false
         stopEngine()
+        tunUp = false
         net.stop()
         running = false
         stopForeground(STOP_FOREGROUND_REMOVE)
@@ -292,19 +348,31 @@ class FirewallService : VpnService(), EngineHost {
     private fun wantIpv6(): Boolean = Prefs.ipv6 && net.hasIpv6
 
     /** Apps excluded from the VPN when the interface was established. */
-    private var appliedExcluded: Set<String> = emptySet()
+    @Volatile private var appliedExcluded: Set<String> = emptySet()
+
+    /** The apps the running interface leaves outside the VPN (for diagnostics and tests). */
+    val excludedApps: Set<String> get() = appliedExcluded
+
+    /** Apps to keep out of the VPN as things are now: see [appsToExclude] for the rules. */
+    private fun excludedNow(): Set<String> {
+        readSystemMode()
+        return appsToExclude(Prefs.proxy, Rules.excludedPackages(), lockdown, packageName)
+    }
 
     /**
-     * Apps kept out of the VPN: the user's exclusions, plus the proxy app when it should bypass us.
-     * Not under "Block connections without VPN": Android then cuts every app outside the VPN, and the
-     * proxy app would lose its server; inside, its traffic still goes directly (it is recognised).
+     * Asks Android whether it runs us as the always-on VPN and blocks connections outside the VPN.
+     * It answers only while our interface is up: before the first one both read "no", whatever the
+     * settings are. Until then the block is taken as it was seen last (remembered across starts), so
+     * that a start under the block does not shut the proxy app out first.
      */
-    private fun excludedNow(): Set<String> {
-        val p = Prefs.proxy
+    private fun readSystemMode() {
+        if (!tunUp) {
+            lockdown = Prefs.lockdownSeen
+            return
+        }
         lockdown = try { isLockdownEnabled } catch (_: Exception) { false }
         alwaysOn = try { isAlwaysOn } catch (_: Exception) { false }
-        val proxyApp = if (p.enabled && p.bypassApp && !lockdown && p.appPkg.isNotEmpty() && p.appPkg != packageName) setOf(p.appPkg) else emptySet()
-        return Rules.excludedPackages() + proxyApp
+        if (Prefs.lockdownSeen != lockdown) Prefs.lockdownSeen = lockdown
     }
 
     /**
@@ -324,10 +392,13 @@ class FirewallService : VpnService(), EngineHost {
                 suggestedProxyPkg = pkgs[0]
                 return@post
             }
-            if (lockdown) return@post
-            Log.i(Engine.TAG, "proxy served by $pkg: keeping it out of the VPN")
+            // Remembered under the system's block too, where it stays inside: once the block is
+            // lifted, it is known whom to let out.
             Prefs.proxy = p.copy(appPkg = pkg)
-            restartEngine()
+            if (excludedNow() != appliedExcluded) {
+                Log.i(Engine.TAG, "proxy served by $pkg: keeping it out of the VPN")
+                restartEngine()
+            }
         }
     }
 
@@ -425,6 +496,8 @@ class FirewallService : VpnService(), EngineHost {
         private const val CAPTURE_WINDOW_MS = 2_500L
         private const val PROBE_EVERY_MS = 200L
         private const val MAX_CAPTURE_RESTARTS = 3
+        /** How often the system is asked whether it blocks connections outside the VPN. */
+        const val MODE_EVERY_MS = 5_000L
         private val V6_ROUTES = listOf(
             "::" to 1, "8000::" to 2, "c000::" to 3, "e000::" to 4, "f000::" to 5,
             "f800::" to 6, "fc00::" to 7, "fe00::" to 9, "fec0::" to 10,
@@ -453,6 +526,18 @@ class FirewallService : VpnService(), EngineHost {
         /** How many times a lost capture was detected (for diagnostics and tests). */
         @Volatile var captureRecoveries = 0
             private set
+        /** How many interfaces were established since the app started (for diagnostics and tests). */
+        @Volatile var interfacesBuilt = 0
+            private set
+
+        /**
+         * True when [pkg] is the proxy app and the system's block keeps it inside the VPN, although it
+         * is marked to go around it (by the proxy settings or by the user).
+         */
+        fun keptInside(pkg: String?): Boolean {
+            val p = Prefs.proxy
+            return pkg != null && running && lockdown && p.enabled && p.appPkg == pkg
+        }
 
         fun start(ctx: Context) {
             val i = Intent(ctx, FirewallService::class.java).setAction(ACTION_START)

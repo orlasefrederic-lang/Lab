@@ -10,5 +10,19 @@
             android:name="lab.netstrazh.OtherAppProxy"
             android:exported="true"
             android:process=":proxy" />
+
+        <!-- Made the device owner of the emulator by the test that needs Android's always-on VPN and
+             "block connections without VPN" switched: see TestAdmin. -->
+        <receiver
+            android:name="lab.netstrazh.TestAdmin"
+            android:exported="true"
+            android:permission="android.permission.BIND_DEVICE_ADMIN">
+            <meta-data
+                android:name="android.app.device_admin"
+                android:resource="@xml/test_admin" />
+            <intent-filter>
+                <action android:name="android.app.action.DEVICE_ADMIN_ENABLED" />
+            </intent-filter>
+        </receiver>
     </application>
 </manifest>

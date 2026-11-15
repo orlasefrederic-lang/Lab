@@ -106,4 +106,12 @@ object Prefs {
     var logDays: Int
         get() = sp.getInt("log_days", 7)
         set(v) = sp.edit().putInt("log_days", v).apply()
+
+    /**
+     * What Android last said about its "Block connections without VPN" for us. It answers only while
+     * our interface is up, so a fresh start goes by this until the first interface exists.
+     */
+    var lockdownSeen: Boolean
+        get() = sp.getBoolean("lockdown_seen", false)
+        set(v) = sp.edit().putBoolean("lockdown_seen", v).apply()
 }

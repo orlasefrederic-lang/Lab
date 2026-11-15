@@ -25,7 +25,8 @@ class HostsActivity : Activity() {
     /**
      * A rule as it is shown: [who] names the app in words, [pkg] gives its icon, [uid] opens its card
      * (both null when there is no single installed app behind the rule); [stopped] attempts were
-     * stopped by it as far as the journal goes back (-1: not counted yet), the [last] one then.
+     * stopped by it since it was made, as far as the journal goes back (-1: not counted yet), the
+     * [last] one then.
      */
     class Item(val rule: Rules.HostRule, val who: String, val pkg: String?, val uid: Int?, val stopped: Int, val last: Long)
 
@@ -77,7 +78,7 @@ class HostsActivity : Activity() {
         val rules = Rules.hostRules()
         // Shown at once; what each rule has stopped is filled in when the journal has been read.
         show(items(rules, null))
-        Bg.run({ items(rules, Db.stopped(Engine.NOTE_HOST_BLOCKED)) }) { if (!isDestroyed) show(it) }
+        Bg.run({ items(rules, stoppedFor(rules)) }) { if (!isDestroyed) show(it) }
     }
 
     private fun show(items: List<Item>) {
@@ -98,12 +99,19 @@ class HostsActivity : Activity() {
 
     companion object {
         /**
+         * What the journal holds of attempts stopped by host rules, cut at the times [rules] were made
+         * (see [Db.stopped]), so that [items] can count for each rule only what came after it.
+         */
+        fun stoppedFor(rules: List<Rules.HostRule>): List<StoppedRow> =
+            Db.stopped(Engine.NOTE_HOST_BLOCKED, rules.map { it.since })
+
+        /**
          * The rules as shown, newest first; rules whose time was not recorded come last. [stopped] is
-         * what the journal holds of attempts stopped by host rules, or null while it is being read.
+         * what [stoppedFor] read from the journal, or null while it is being read.
          */
         fun items(rules: List<Rules.HostRule>, stopped: List<StoppedRow>?): List<Item> =
             rules.map { r ->
-                val hits = stopped?.filter { (r.key == Rules.ALL || r.appId == it.appId) && r.covers(Rules.normalizeHost(it.host)) }
+                val hits = stopped?.filter { r.counts(it) }
                 val n = hits?.sumOf { it.count } ?: -1
                 val last = hits?.maxOfOrNull { it.last } ?: 0L
                 val uidKey = Rules.uidOfKey(r.key)
@@ -119,10 +127,10 @@ class HostsActivity : Activity() {
         fun sinceText(r: Rules.HostRule): String =
             if (r.since > 0) "заблокирован " + Fmt.since(r.since) else "заблокирован до версии 3.5, время не записано"
 
-        /** What the rule has stopped; empty while that is not counted yet. */
+        /** What the rule has stopped since it was made; empty while that is not counted yet. */
         fun stoppedText(it: Item): String = when {
             it.stopped < 0 -> ""
-            it.stopped == 0 -> "попыток не было"
+            it.stopped == 0 -> "попыток с тех пор не было"
             else -> "остановлено попыток: ${it.stopped}, последняя ${Fmt.ago(it.last)}"
         }
 

@@ -1,6 +1,8 @@
 package lab.netstrazh;
 
 import android.app.Service;
+import android.app.admin.DevicePolicyManager;
+import android.content.ComponentName;
 import android.content.Intent;
 import android.os.Binder;
 import android.os.IBinder;
@@ -28,6 +30,10 @@ import java.util.concurrent.Future;
  * under another UID than the app: what a separate proxy app such as v2rayNG is to NetStrazh. Its
  * sockets are ordinary ones, routed by Android like any app's.
  *
+ * The same process also speaks for the test APK as the device owner, once the test made it one (see
+ * {@link TestAdmin}): it switches Android's always-on VPN and "block connections without VPN", which
+ * the app under test cannot do itself.
+ *
  * Plain Java on purpose: this process has neither the app's classes nor the Kotlin library.
  */
 public class OtherAppProxy extends Service {
@@ -35,6 +41,12 @@ public class OtherAppProxy extends Service {
     public static final int GET_PORT = 1;
     public static final int GET_UID = 2;
     public static final int GET_LOG = 3;
+    /** In: the VPN package (null: none) and 1 or 0 for the block. Out: "ok" or what went wrong. */
+    public static final int SET_ALWAYS_ON = 4;
+    /** Gives the device up again. Out: "ok" or what went wrong. */
+    public static final int CLEAR_OWNER = 5;
+    /** Out: 1 when the test APK is the device owner. */
+    public static final int IS_OWNER = 6;
 
     private final ExecutorService pool = Executors.newCachedThreadPool();
     private final List<String> log = new ArrayList<>();
@@ -93,11 +105,53 @@ public class OtherAppProxy extends Service {
                             reply.writeStringList(new ArrayList<>(log));
                         }
                         return true;
+                    case SET_ALWAYS_ON: {
+                        String pkg = data.readString();
+                        boolean lockdown = data.readInt() != 0;
+                        reply.writeString(fromTheAppUnderTest() ? setAlwaysOn(pkg, lockdown) : "not for this caller");
+                        return true;
+                    }
+                    case CLEAR_OWNER:
+                        reply.writeString(fromTheAppUnderTest() ? clearOwner() : "not for this caller");
+                        return true;
+                    case IS_OWNER:
+                        reply.writeInt(policy().isDeviceOwnerApp(getPackageName()) ? 1 : 0);
+                        return true;
                     default:
                         return super.onTransact(code, data, reply, flags);
                 }
             }
         };
+    }
+
+    private DevicePolicyManager policy() {
+        return (DevicePolicyManager) getSystemService(DEVICE_POLICY_SERVICE);
+    }
+
+    /** The service is open to every app on the device; the owner's powers are for the test only. */
+    private boolean fromTheAppUnderTest() {
+        String[] pkgs = getPackageManager().getPackagesForUid(Binder.getCallingUid());
+        String app = getPackageName().replaceFirst("\\.test$", "");
+        return pkgs != null && java.util.Arrays.asList(pkgs).contains(app);
+    }
+
+    /** What the system's VPN settings screen does with its two switches, for the given VPN app. */
+    private String setAlwaysOn(String pkg, boolean lockdown) {
+        try {
+            policy().setAlwaysOnVpnPackage(new ComponentName(this, TestAdmin.class), pkg, lockdown);
+            return "ok";
+        } catch (Exception e) {
+            return e.toString();
+        }
+    }
+
+    private String clearOwner() {
+        try {
+            policy().clearDeviceOwnerApp(getPackageName());
+            return "ok";
+        } catch (Exception e) {
+            return e.toString();
+        }
     }
 
     private void note(String s) {

@@ -7,6 +7,7 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.view.Gravity
+import android.view.View
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ScrollView
@@ -28,6 +29,7 @@ class AppActivity : Activity() {
     private lateinit var wifi: TextView
     private lateinit var mobile: TextView
     private lateinit var exclude: Switch
+    private lateinit var exNote: TextView
     private lateinit var ruleNote: TextView
     private lateinit var trafficBox: LinearLayout
     private lateinit var liveBox: LinearLayout
@@ -95,6 +97,8 @@ class AppActivity : Activity() {
         }
         exRow.addView(exclude, lp(WRAP, WRAP).apply { leftMargin = dp(8) })
         fw.addView(exRow)
+        exNote = text("", 12.5f, Pal.danger)
+        fw.addView(exNote, lp().apply { topMargin = dp(6) })
         col.addView(fw)
 
         // Right under the switches: these are firewall rules too, and must be easy to find and lift.
@@ -198,8 +202,24 @@ class AppActivity : Activity() {
         exclude.isEnabled = canExclude
         wifi.alpha = if (wifi.isEnabled) 1f else 0.4f
         mobile.alpha = if (mobile.isEnabled) 1f else 0.4f
+        // Under the system's "block connections without VPN" an app outside the VPN has no network at
+        // all; the proxy app is therefore kept inside whatever this switch says (see appsToExclude).
+        val locked = FirewallService.running && FirewallService.lockdown
+        val keptIn = excluded && FirewallService.keptInside(ruleKey)
+        exNote.text = when {
+            !excluded || !locked -> ""
+            keptIn -> "В системе включено «Блокировать соединения без VPN», поэтому сейчас это приложение всё же " +
+                "остаётся в Страже: вне VPN Android оставил бы прокси без связи с сервером, а с ним без интернета " +
+                "остались бы все приложения. Его собственные соединения Страж пропускает напрямую."
+            else -> "⚠ В системе включено «Блокировать соединения без VPN»: приложение, идущее мимо Стража, Android " +
+                "оставляет совсем без сети. Чтобы оно работало, выключите этот переключатель."
+        }
+        exNote.setTextColor(if (keptIn) Pal.sub else Pal.danger)
+        exNote.visibility = if (exNote.text.isEmpty()) View.GONE else View.VISIBLE
         ruleNote.text = when {
             !canRule -> if (uid == android.os.Process.myUid()) "Это сам Сетевой страж." else "Это сводная строка, а не владелец соединений."
+            keptIn -> "Приложение отмечено «мимо Стража», но сейчас остаётся в нём: так требует системная блокировка."
+            excluded && locked -> "⚠ Приложение идёт мимо Стража, и система оставила его без сети."
             excluded -> "Приложение идёт мимо Стража."
             f and Rules.BLOCK_ALL == Rules.BLOCK_ALL -> "Интернет запрещён. Нажмите, чтобы разрешить."
             f and Rules.WIFI != 0 -> "Запрещён Wi-Fi. Мобильный интернет разрешён."
@@ -342,9 +362,10 @@ class AppActivity : Activity() {
             line(trafficBox, "Нет доступа к истории использования", "Разрешите его на вкладке «Трафик».")
         }
         val appId = if (uid < 0) uid else uid % 100000
+        val rules = Rules.hostRulesFor(uid)
         Bg.run({
             Triple(Db.destinations(uid), Db.dnsNames(uid), Db.recentForUid(uid, 60)) to
-                Db.stopped(lab.netstrazh.vpn.Engine.NOTE_HOST_BLOCKED).filter { it.appId == appId }
+                HostsActivity.stoppedFor(rules).filter { it.appId == appId }
         }) { (lists, st) ->
             val (dest, dns, recent) = lists
             stopped = st

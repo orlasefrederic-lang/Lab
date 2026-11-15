@@ -655,10 +655,24 @@ class E2eTest {
         /** What it was asked to carry: "CONNECT host:port" and "UDP ip:port". */
         val log: List<String> get() = ask(OtherAppProxy.GET_LOG) { it.createStringArrayList() ?: ArrayList() }
 
-        private fun <T> ask(code: Int, read: (android.os.Parcel) -> T): T {
+        /** True once the test APK is the device owner (see [TestAdmin]). */
+        val isOwner: Boolean get() = ask(OtherAppProxy.IS_OWNER) { it.readInt() == 1 }
+
+        /**
+         * As the device owner: makes [vpn] the system's always-on VPN (null: none), with or without
+         * "block connections without VPN". Returns "ok" or what went wrong.
+         */
+        fun alwaysOn(vpn: String?, lockdown: Boolean): String =
+            ask(OtherAppProxy.SET_ALWAYS_ON, { it.writeString(vpn); it.writeInt(if (lockdown) 1 else 0) }) { it.readString() ?: "" }
+
+        /** Gives the device up again, so the test APK can be removed. Returns "ok" or what went wrong. */
+        fun clearOwner(): String = ask(OtherAppProxy.CLEAR_OWNER) { it.readString() ?: "" }
+
+        private fun <T> ask(code: Int, write: (android.os.Parcel) -> Unit = {}, read: (android.os.Parcel) -> T): T {
             val data = android.os.Parcel.obtain()
             val reply = android.os.Parcel.obtain()
             try {
+                write(data)
                 assertTrue("the proxy app answers", binder.transact(code, data, reply, 0))
                 return read(reply)
             } finally {
@@ -872,7 +886,7 @@ class E2eTest {
             }
             var item: HostsActivity.Item? = null
             waitFor(15_000, "the stopped attempt is counted for the rule") {
-                item = HostsActivity.items(Rules.hostRules(), Db.stopped(Engine.NOTE_HOST_BLOCKED))
+                item = HostsActivity.items(Rules.hostRules(), HostsActivity.stoppedFor(Rules.hostRules()))
                     .firstOrNull { it.rule.key == pkg && it.rule.host == host }
                 (item?.stopped ?: 0) >= 1
             }
@@ -894,9 +908,204 @@ class E2eTest {
     }
 
     /**
-     * Runs last: the user's switch off and on again, three times. After every start, traffic must
-     * really go through the VPN (an answer alone does not show that): the capture probe, this app's
-     * TCP and UDP, and another app's TCP (the shell, uid 2000) are all checked, and every failure is
+     * A rule counts only what it stopped itself. An address blocked, unblocked and blocked again
+     * starts from nothing: what the journal still holds from the first time is not shown as the new
+     * rule's doing, with a "last attempt" older than the rule.
+     */
+    @Test fun t24_addressBlockedAgainCountsAnew() {
+        val host = "t24-${SystemClock.uptimeMillis()}.example.org"
+        fun item(): HostsActivity.Item {
+            val rules = Rules.hostRules()
+            return HostsActivity.items(rules, HostsActivity.stoppedFor(rules)).single { it.rule.key == Rules.ALL && it.rule.host == host }
+        }
+        /** Everything the journal holds for the host, whichever rule stopped it. */
+        fun inJournal(): Int = Db.stopped(Engine.NOTE_HOST_BLOCKED).filter { it.host.endsWith(host) }.sumOf { it.count }
+        Rules.setHostBlocked(Rules.ALL, host, true)
+        try {
+            Thread.sleep(300)
+            for (sub in listOf("a", "b", "c")) assertEquals("refused under the first rule", 5, rcode(dnsQueryUdp(TunConfig.DNS4, "$sub.$host")))
+            waitFor(15_000, "the first rule counts its three attempts") { item().stopped >= 3 }
+            val first = item()
+            assertTrue("its last attempt is its own: ${first.last} >= ${first.rule.since}", first.last >= first.rule.since)
+
+            Rules.setHostBlocked(Rules.ALL, host, false)
+            Thread.sleep(50)
+            Rules.setHostBlocked(Rules.ALL, host, true)
+            val again = item()
+            assertTrue("it is a new rule: ${again.rule.since} > ${first.rule.since}", again.rule.since > first.rule.since)
+            assertTrue("the journal still holds the old attempts: ${inJournal()}", inJournal() >= first.stopped)
+            assertEquals("a rule made anew has stopped nothing yet", 0, again.stopped)
+            assertEquals("and has no last attempt", 0L, again.last)
+            assertTrue("which is what it says: ${HostsActivity.details(again, ", ")}", HostsActivity.details(again, ", ").contains("попыток с тех пор не было"))
+
+            Thread.sleep(300)
+            assertEquals("refused under the new rule", 5, rcode(dnsQueryUdp(TunConfig.DNS4, "d.$host")))
+            waitFor(15_000, "the new rule counts its own attempt") { item().stopped >= 1 }
+            val now = item()
+            // One query, sent again only if its answer was slow: never the three from before as well.
+            assertTrue("only what came after it: ${now.stopped} of ${inJournal()} in the journal", now.stopped < inJournal())
+            assertTrue("the last attempt is not older than the rule: ${now.last} >= ${now.rule.since}", now.last >= now.rule.since)
+        } finally {
+            Rules.setHostBlocked(Rules.ALL, host, false)
+        }
+    }
+
+    /**
+     * This app's traffic goes through the proxy app, and the proxy app's own connections are where
+     * they should be: [inside] the VPN they come through the engine and leave directly, outside it
+     * the engine never sees them.
+     */
+    private fun checkProxied(app: OtherApp, svc: FirewallService, inside: Boolean, what: String) {
+        val t1 = System.currentTimeMillis()
+        val before = connectsTo(app, "example.net").size
+        val r = httpGet("example.net")
+        assertTrue("$what: " + r.take(100), r.startsWith("HTTP/1."))
+        val mine = waitSeen("$what: own TCP through the proxy app") { it.proto == "TCP" && it.port == 80 && it.uid == myUid && it.ts >= t1 }
+        assertEquals("$what: TCP went through the proxy", VIA_PROXY, mine.via)
+        assertEquals("$what: one CONNECT for one request: ${app.log}", before + 1, connectsTo(app, "example.net").size)
+        if (inside) {
+            assertEquals("$what: proxy app recognised by its UID", app.uid, svc.upstream?.proxyUid)
+            val its = waitSeen("$what: the proxy app's own TCP") { it.proto == "TCP" && it.port == 80 && it.uid == app.uid && it.ts >= t1 }
+            assertEquals("$what: the proxy app's traffic leaves directly, not through its own proxy", "", its.via)
+            assertFalse("$what: the proxy app's traffic is not blocked", its.blocked)
+        } else {
+            Db.sync()
+            assertTrue("$what: the proxy app's own traffic stays out of the VPN", seen().none { it.uid == app.uid && it.ts >= t1 })
+        }
+    }
+
+    /**
+     * Android's "Always-on VPN" with "Block connections without VPN", switched for real: the test APK
+     * becomes the device owner for it (only a device owner and the Settings app may switch them).
+     *
+     * Under the block Android cuts off every app outside the VPN, so the proxy app has to be inside
+     * it. Android tells a VPN app about the block only once its interface is up: a start under the
+     * block used to shut the proxy app out, and with it every app's internet, for up to a minute.
+     * Now the interface is right at once, the block is remembered for the next start, switching it
+     * while running is noticed within seconds, and a proxy app marked "мимо Стража" by hand stays in.
+     *
+     * Runs after everything else: it ends with Android taking the VPN away.
+     */
+    @Test fun t40_startingAndRunningUnderTheSystemsVpnBlock() {
+        val self = ctx.packageName
+        val app = startOtherApp()
+        fun state(): String = "\nblock: system says ${try { FirewallService.instance?.isLockdownEnabled } catch (e: Exception) { e }}, " +
+            "app saw ${FirewallService.lockdown}, remembers ${Prefs.lockdownSeen}; excluded=${FirewallService.instance?.excludedApps} " +
+            "interfaces built=${FirewallService.interfacesBuilt} running=${FirewallService.running} " +
+            "owner=${try { app.isOwner } catch (e: Throwable) { e }}" +
+            "\nsystem log:\n" + shell("logcat -d -t 600").lines()
+                .filter { l -> listOf("DevicePolicy", "device owner", "Vpn", "NetStrazh", "AndroidRuntime").any { it in l } }.takeLast(60).joinToString("\n")
+        fun stopVpn(what: String) {
+            InstrumentationRegistry.getInstrumentation().runOnMainSync { FirewallService.stop(ctx) }
+            waitFor(10_000, what) { !FirewallService.running && FirewallService.instance == null }
+        }
+        /** Waits for the engine made after [since] to be verified; returns the service. */
+        fun verified(since: Long, what: String): FirewallService {
+            waitFor(30_000, "VPN running ($what)") { FirewallService.running }
+            waitFor(30_000, "capture verified ($what)") { Live.startedAt >= since && FirewallService.captureVerifiedAt >= Live.startedAt }
+            return FirewallService.instance!!
+        }
+        try {
+            val owner = shell("dpm set-device-owner ${app.pkg}/${TestAdmin::class.java.name}").trim()
+            Log.i(TAG, "device owner: $owner")
+            assertTrue("the test APK must become the device owner: $owner", app.isOwner)
+
+            // The proxy app set up as v2rayNG is: known by its package, to go around the VPN.
+            Prefs.proxy = ProxyConfig(ProxyType.SOCKS5, "127.0.0.1", app.port, dnsServer = "1.1.1.1", bypassApp = true, appPkg = app.pkg)
+            stopVpn("VPN stopped before the block")
+
+            // 1. A start under a block the app does not know of yet (the first start after an update,
+            // or the block switched on while the app was off). Android starts the service itself, as
+            // it does after a reboot.
+            Prefs.lockdownSeen = false
+            var built = FirewallService.interfacesBuilt
+            var lost = FirewallService.captureRecoveries
+            var t0 = System.currentTimeMillis()
+            assertEquals("always-on VPN with the block", "ok", app.alwaysOn(self, true))
+            val svc = verified(t0, "started under the block")
+            assertTrue("the system says the block is on", svc.isLockdownEnabled)
+            assertTrue("the app saw the block", FirewallService.lockdown)
+            assertTrue("and remembers it", Prefs.lockdownSeen)
+            assertFalse("the proxy app is inside the VPN: ${svc.excludedApps}", app.pkg in svc.excludedApps)
+            assertEquals("an interface for what was remembered, then at once one for how things are",
+                built + 2 + (FirewallService.captureRecoveries - lost), FirewallService.interfacesBuilt)
+            checkProxied(app, svc, inside = true, what = "started under the block")
+
+            // 2. The block is switched off while the app runs. Nothing announces that: the app finds
+            // out by itself and lets the proxy app out of the VPN again.
+            t0 = System.currentTimeMillis()
+            assertEquals("always-on VPN without the block", "ok", app.alwaysOn(self, false))
+            waitFor(20_000, "the proxy app is let out once the block is off") { !FirewallService.lockdown && app.pkg in svc.excludedApps }
+            Log.i(TAG, "block switched off: noticed after ${System.currentTimeMillis() - t0} ms")
+            verified(t0, "block switched off")
+            assertFalse("the system says the block is off", svc.isLockdownEnabled)
+            assertFalse("remembered as off", Prefs.lockdownSeen)
+            checkProxied(app, svc, inside = false, what = "block switched off")
+
+            // 3. And switched on while the app runs: the proxy app is taken in before long.
+            t0 = System.currentTimeMillis()
+            assertEquals("the block again", "ok", app.alwaysOn(self, true))
+            waitFor(20_000, "the proxy app is taken in once the block is on") { FirewallService.lockdown && app.pkg !in svc.excludedApps }
+            Log.i(TAG, "block switched on: noticed after ${System.currentTimeMillis() - t0} ms")
+            verified(t0, "block switched on")
+            checkProxied(app, svc, inside = true, what = "block switched on")
+
+            // 4. Under the block the proxy app stays inside also when the user marks it "мимо Стража":
+            // outside it would have no network, and neither would anyone else then.
+            built = FirewallService.interfacesBuilt
+            lost = FirewallService.captureRecoveries
+            Rules.set(app.pkg, Rules.EXCLUDE)
+            Thread.sleep(1_500)
+            assertTrue("marked by hand", app.pkg in Rules.excludedPackages())
+            assertFalse("still inside the VPN: ${svc.excludedApps}", app.pkg in svc.excludedApps)
+            assertTrue("and the app says so", FirewallService.keptInside(app.pkg))
+            assertEquals("nothing to rebuild for it", built + (FirewallService.captureRecoveries - lost), FirewallService.interfacesBuilt)
+            checkProxied(app, svc, inside = true, what = "proxy app marked by hand under the block")
+            // Its card, the firewall list and the proxy settings explain this state: they must open in it.
+            ActivityScenario.launch<AppActivity>(Intent(ctx, AppActivity::class.java).putExtra("uid", app.uid)).use { Thread.sleep(1500) }
+            ActivityScenario.launch(MainActivity::class.java).use { sc ->
+                sc.onActivity { it.select(3) }
+                Thread.sleep(1500)
+            }
+            ActivityScenario.launch(SettingsActivity::class.java).use { Thread.sleep(1500) }
+            Rules.set(app.pkg, 0)
+
+            // 5. A start under a block the app remembers: the first interface is the right one.
+            stopVpn("VPN stopped under the block")
+            assertTrue("the block is remembered while the app is off", Prefs.lockdownSeen)
+            ActivityScenario.launch(MainActivity::class.java).use { Thread.sleep(1500) } // the header says why nothing has internet
+            built = FirewallService.interfacesBuilt
+            lost = FirewallService.captureRecoveries
+            t0 = System.currentTimeMillis()
+            assertEquals("Android starts its always-on VPN again", "ok", app.alwaysOn(self, true))
+            val again = verified(t0, "started under a remembered block")
+            assertTrue("the block is on", again.isLockdownEnabled && FirewallService.lockdown)
+            assertFalse("the proxy app is inside the VPN: ${again.excludedApps}", app.pkg in again.excludedApps)
+            assertEquals("one interface is enough", built + 1 + (FirewallService.captureRecoveries - lost), FirewallService.interfacesBuilt)
+            checkProxied(app, again, inside = true, what = "started under a remembered block")
+        } catch (e: Throwable) {
+            throw AssertionError("under the system's VPN block: $e" + state() +
+                (try { FirewallService.instance?.let { proxyDiag(app, it) } } catch (d: Throwable) { "\n(no proxy diagnostics: $d)" } ?: ""), e)
+        } finally {
+            // Each step on its own: the device must be given up whatever else went wrong, or the
+            // test APK cannot be removed afterwards.
+            fun step(what: String, block: () -> Any?) {
+                try { Log.i(TAG, "$what: ${block()}") } catch (e: Throwable) { Log.w(TAG, "$what failed: $e") }
+            }
+            step("rule removed") { Rules.set(app.pkg, 0) }
+            Prefs.proxy = ProxyConfig.OFF
+            // Always-on off: Android takes the VPN away with it (onRevoke), as its settings screen does.
+            step("always-on off") { app.alwaysOn(null, false) }
+            step("device owner given up") { app.clearOwner() + ", still the owner: " + app.isOwner }
+            Prefs.lockdownSeen = false
+            step("proxy app unbound") { ctx.unbindService(app.conn) }
+        }
+    }
+
+    /**
+     * The user's switch off and on again, three times. After every start, traffic must really go
+     * through the VPN (an answer alone does not show that): the capture probe, this app's TCP and
+     * UDP, and another app's TCP (the shell, uid 2000) are all checked, and every failure is
      * reported, not just the first.
      */
     @Test fun t30_powerSwitchOffAndOn() {

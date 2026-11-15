@@ -169,6 +169,11 @@ class MainActivity : Activity() {
                 headerAction = { startActivity(Intent(this, SettingsActivity::class.java)) }
                 "Сейчас работает другой VPN. Как работать вместе ›"
             }
+            // Switched off under the system's block, the whole phone is offline: say why.
+            Prefs.lockdownSeen -> {
+                headerAction = { FirewallPage.showLeakHelp(this) }
+                "Защита выключена. При системной «блокировке без VPN» интернета сейчас нет ни у одного приложения ›"
+            }
             else -> "Защита выключена"
         }
         status.setTextColor(when {
@@ -193,6 +198,10 @@ class MainActivity : Activity() {
     fun onPowerToggle(on: Boolean) {
         if (on) requestStart() else {
             pendingStart = false
+            if (FirewallService.running && FirewallService.lockdown) {
+                Toast.makeText(this, "В системе включено «Блокировать соединения без VPN»: пока Страж выключен, " +
+                    "интернета не будет ни у одного приложения.", Toast.LENGTH_LONG).show()
+            }
             FirewallService.stop(this)
             updateHeader()
             pages.getOrNull(current)?.onShow()

@@ -17,6 +17,7 @@ import android.widget.Toast
 import lab.netstrazh.Prefs
 import lab.netstrazh.data.Apps
 import lab.netstrazh.data.ProxyApps
+import lab.netstrazh.data.Rules
 import lab.netstrazh.vpn.FirewallService
 import lab.netstrazh.vpn.ProxyConfig
 import lab.netstrazh.vpn.ProxyTester
@@ -310,9 +311,16 @@ class SettingsActivity : Activity() {
                     } else if (cfg.bypassApp && cfg.appPkg.isNotEmpty() && !FirewallService.lockdown) {
                         sb.append("\n«${Apps.labelForPackage(cfg.appPkg)}» работает мимо Стража: его связь с сервером идёт по обычной сети.")
                     }
-                    if (cfg.bypassApp && FirewallService.lockdown) {
+                    val byHand = Rules.excludedPackages()
+                    if (FirewallService.lockdown && (cfg.bypassApp || cfg.appPkg in byHand)) {
                         sb.append("\nВключено «Блокировать соединения без VPN»: прокси-приложение остаётся в Страже " +
                             "(вне VPN Android отрезал бы его от сервера), его трафик идёт напрямую.")
+                    }
+                    // Which app serves the proxy is not known, and it may be one of those left without network.
+                    if (FirewallService.lockdown && cfg.appPkg.isEmpty() && up.proxyUid < 0 && byHand.isNotEmpty()) {
+                        sb.append("\n⚠ Включено «Блокировать соединения без VPN»: приложения, идущие мимо Стража, система " +
+                            "оставляет без сети. Если среди них ваше VPN-приложение, оно не достучится до сервера — " +
+                            "снимите с него «мимо Стража».")
                     }
                     if (up.udpUnsupported) sb.append("\nПрокси не передаёт UDP" + if (cfg.udpDirect) " — UDP идёт напрямую." else " — UDP блокируется.")
                     val ev = up.recentEvents().filter { now - it.lastAt < 24 * 3_600_000L }

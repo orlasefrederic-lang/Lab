@@ -110,9 +110,14 @@ class FirewallPage(act: MainActivity) : Page(act) {
          * closes them: Android's own "block connections without VPN".
          */
         fun showLeakHelp(ctx: android.content.Context) {
+            // Apps the user lets go around the VPN lose the network under the block (not the proxy app).
+            val cutOff = if (FirewallService.running && FirewallService.lockdown)
+                Rules.excludedPackages().filter { !FirewallService.keptInside(it) } else emptyList()
             val state = when {
                 !FirewallService.running -> "Включена ли блокировка, видно, когда Страж работает."
-                FirewallService.lockdown -> "Сейчас: блокировка включена ✓"
+                FirewallService.lockdown -> "Сейчас: блокировка включена ✓" + if (cutOff.isEmpty()) "" else
+                    "\n\n⚠ Сейчас идут мимо Стража и потому остались без сети: " +
+                        cutOff.joinToString { "«${Apps.labelForPackage(it)}»" } + "."
                 FirewallService.alwaysOn -> "Сейчас: «Постоянная VPN» включена, а «Блокировать соединения без VPN» — нет."
                 else -> "Сейчас: блокировка выключена."
             }
@@ -130,7 +135,9 @@ class FirewallPage(act: MainActivity) : Page(act) {
                         "«Блокировать соединения без VPN».\n\n" +
                         "После этого без работающего Стража интернета нет ни у одного приложения. " +
                         "Прокси-приложение (v2rayNG и т. п.) Страж в этом режиме оставляет у себя и сам пускает " +
-                        "его трафик напрямую — иначе Android отрезал бы его от сервера.\n\n" + state
+                        "его трафик напрямую — иначе Android отрезал бы его от сервера. Остальные приложения, " +
+                        "которым вы разрешили идти «мимо Стража», при такой блокировке остаются без сети: " +
+                        "так устроен Android.\n\n" + state
                 )
                 .setPositiveButton("Настройки VPN") { _, _ ->
                     try {
@@ -212,17 +219,22 @@ class FirewallPage(act: MainActivity) : Page(act) {
             title.text = it.label
             icon.setImageDrawable(Apps.icon(it.pkg) ?: context.getDrawable(android.R.drawable.sym_def_app_icon))
             val f = it.flags
+            val excluded = f and Rules.EXCLUDE != 0
+            // Under the system's block an app outside the VPN has no network; the proxy app stays inside.
+            val keptIn = excluded && FirewallService.keptInside(it.pkg)
+            val cutOff = excluded && !keptIn && FirewallService.running && FirewallService.lockdown
             sub.text = when {
-                f and Rules.EXCLUDE != 0 -> "мимо Стража: не отслеживается и не блокируется"
+                keptIn -> "прокси: при системной блокировке остаётся в Страже"
+                cutOff -> "мимо Стража — система оставила без сети"
+                excluded -> "мимо Стража: не отслеживается и не блокируется"
                 f and Rules.BLOCK_ALL == Rules.BLOCK_ALL -> "интернет запрещён полностью"
                 f and Rules.WIFI != 0 -> "запрещён Wi-Fi, мобильный разрешён"
                 f and Rules.MOBILE != 0 -> "запрещён мобильный, Wi-Fi разрешён"
                 else -> it.uid?.let { u -> "UID $u" } ?: it.pkg
             }
-            sub.setTextColor(if (f and Rules.BLOCK_ALL != 0) Pal.danger else Pal.sub)
+            sub.setTextColor(if (f and Rules.BLOCK_ALL != 0 || cutOff) Pal.danger else Pal.sub)
             context.stylePill(wifi, if (f and Rules.WIFI != 0) 4 else 3)
             context.stylePill(mobile, if (f and Rules.MOBILE != 0) 4 else 3)
-            val excluded = f and Rules.EXCLUDE != 0
             wifi.visibility = if (excluded) GONE else VISIBLE
             mobile.visibility = if (excluded) GONE else VISIBLE
         }

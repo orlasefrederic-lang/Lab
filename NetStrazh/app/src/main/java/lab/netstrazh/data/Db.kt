@@ -40,8 +40,11 @@ class DestRow(
     val blocked: Int,
 )
 
-/** Attempts of one app (by app id) to reach one host that were stopped, with the time of the last one. */
-class StoppedRow(val appId: Int, val host: String, val count: Int, val last: Long)
+/**
+ * Attempts of one app (by app id) to reach one host that were stopped: how many, the [first] and the
+ * [last] of them. One app and host may come in several rows, one per stretch of time (see [Db.stopped]).
+ */
+class StoppedRow(val appId: Int, val host: String, val count: Int, val first: Long, val last: Long)
 
 /** Connection journal stored in SQLite. Writes are batched on a background thread. */
 class Db private constructor(ctx: Context) : SQLiteOpenHelper(ctx, "netstrazh.db", null, 2) {
@@ -218,13 +221,26 @@ class Db private constructor(ctx: Context) : SQLiteOpenHelper(ctx, "netstrazh.db
         /**
          * What the journal holds of attempts stopped for the reason [note] (e.g. a blocked address),
          * per app and host name, so a host rule can show what it has been doing.
+         *
+         * A rule must count only what happened since it was made (an address blocked, unblocked and
+         * blocked again starts from nothing). So the rows are cut at the given moments, [marks] (the
+         * times the rules were made): no row returned spans one of them, and a rule made at a mark
+         * counts just the rows whose [StoppedRow.first] is not before it. Still one pass over the journal.
          */
-        fun stopped(note: String): List<StoppedRow> {
+        fun stopped(note: String, marks: Collection<Long> = emptyList()): List<StoppedRow> {
             sync()
-            val sql = "SELECT uid % 100000, host, COUNT(*), MAX(ts) FROM conn " +
-                "WHERE blocked = 1 AND note = ? AND host IS NOT NULL AND host != '' GROUP BY uid % 100000, host"
-            return query(sql, arrayOf(note)) { c -> StoppedRow(c.getInt(0), c.getString(1), c.getInt(2), c.getLong(3)) }
+            // The stretch a journal row falls into: how many of the marks it is not before. The marks
+            // are our own numbers; only the newest MAX_MARKS are used (SQLite limits an expression).
+            val cuts = marks.filter { it > 0 }.distinct().sorted().takeLast(MAX_MARKS)
+            // (Without marks there is no third term: a bare number there would mean a column.)
+            val stretch = if (cuts.isEmpty()) "" else ", " + cuts.joinToString(" + ") { "(ts >= $it)" }
+            val sql = "SELECT uid % 100000, host, COUNT(*), MIN(ts), MAX(ts) FROM conn " +
+                "WHERE blocked = 1 AND note = ? AND host IS NOT NULL AND host != '' " +
+                "GROUP BY uid % 100000, host$stretch"
+            return query(sql, arrayOf(note)) { c -> StoppedRow(c.getInt(0), c.getString(1), c.getInt(2), c.getLong(3), c.getLong(4)) }
         }
+
+        private const val MAX_MARKS = 400
 
         private const val ROW_COLS = "ts, te, uid, proto, ip, port, host, tx, rx, blocked, net, via, note"
 

@@ -46,6 +46,14 @@ object Rules {
     class HostRule(val key: String, val host: String, val since: Long, val appId: Int?) {
         /** True when the rule blocks [name]: the host itself or a subdomain of it. */
         fun covers(name: String): Boolean = name == host || name.endsWith(".$host")
+
+        /**
+         * True when the stopped attempts in [row] are this rule's doing: of an app it applies to, to
+         * an address it covers, and made since the rule exists. What was stopped before that, by this
+         * rule's earlier self (blocked, unblocked, blocked again) or by another rule, is not handed down.
+         */
+        fun counts(row: StoppedRow): Boolean =
+            (key == ALL || appId == row.appId) && row.first >= since && covers(normalizeHost(row.host))
     }
 
     /** DNS queries of a blocked app are answered "refused" instead of being resolved. */
