@@ -920,12 +920,29 @@ class E2eTest {
         }
         /** Everything the journal holds for the host, whichever rule stopped it. */
         fun inJournal(): Int = Db.stopped(Engine.NOTE_HOST_BLOCKED).filter { it.host.endsWith(host) }.sumOf { it.count }
+        // An attempt is a TLS connection naming the host: it is cut, closed and in the journal at once
+        // (a refused DNS query gets there only when its flow is given up, half a minute later).
+        val ip = InetAddress.getByName("www.google.com")
+        val tls = javax.net.ssl.SSLSocketFactory.getDefault() as javax.net.ssl.SSLSocketFactory
+        fun attempt(name: String) {
+            try {
+                (tls.createSocket() as javax.net.ssl.SSLSocket).use { t ->
+                    t.sslParameters = t.sslParameters.apply { serverNames = listOf(javax.net.ssl.SNIHostName(name)) }
+                    t.connect(InetSocketAddress(ip, 443), 10_000)
+                    t.soTimeout = 10_000
+                    t.startHandshake()
+                }
+                fail("handshake with the blocked name $name went through")
+            } catch (_: IOException) {
+            }
+        }
         Rules.setHostBlocked(Rules.ALL, host, true)
         try {
             Thread.sleep(300)
-            for (sub in listOf("a", "b", "c")) assertEquals("refused under the first rule", 5, rcode(dnsQueryUdp(TunConfig.DNS4, "$sub.$host")))
+            for (sub in listOf("a", "b", "c")) attempt("$sub.$host")
             waitFor(15_000, "the first rule counts its three attempts") { item().stopped >= 3 }
             val first = item()
+            assertEquals("three attempts, three counted", 3, first.stopped)
             assertTrue("its last attempt is its own: ${first.last} >= ${first.rule.since}", first.last >= first.rule.since)
 
             Rules.setHostBlocked(Rules.ALL, host, false)
@@ -933,17 +950,17 @@ class E2eTest {
             Rules.setHostBlocked(Rules.ALL, host, true)
             val again = item()
             assertTrue("it is a new rule: ${again.rule.since} > ${first.rule.since}", again.rule.since > first.rule.since)
-            assertTrue("the journal still holds the old attempts: ${inJournal()}", inJournal() >= first.stopped)
+            assertEquals("the journal still holds the old attempts", 3, inJournal())
             assertEquals("a rule made anew has stopped nothing yet", 0, again.stopped)
             assertEquals("and has no last attempt", 0L, again.last)
             assertTrue("which is what it says: ${HostsActivity.details(again, ", ")}", HostsActivity.details(again, ", ").contains("попыток с тех пор не было"))
 
             Thread.sleep(300)
-            assertEquals("refused under the new rule", 5, rcode(dnsQueryUdp(TunConfig.DNS4, "d.$host")))
+            attempt("d.$host")
             waitFor(15_000, "the new rule counts its own attempt") { item().stopped >= 1 }
             val now = item()
-            // One query, sent again only if its answer was slow: never the three from before as well.
-            assertTrue("only what came after it: ${now.stopped} of ${inJournal()} in the journal", now.stopped < inJournal())
+            assertEquals("only what came after it, not the three from before as well", 1, now.stopped)
+            assertEquals("all four are in the journal", 4, inJournal())
             assertTrue("the last attempt is not older than the rule: ${now.last} >= ${now.rule.since}", now.last >= now.rule.since)
         } finally {
             Rules.setHostBlocked(Rules.ALL, host, false)
