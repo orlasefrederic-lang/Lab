@@ -172,7 +172,7 @@ class MainActivity : Activity() {
             // Switched off under the system's block, the whole phone is offline: say why.
             Prefs.lockdownSeen -> {
                 headerAction = { FirewallPage.showLeakHelp(this) }
-                "Защита выключена. При системной «блокировке без VPN» интернета сейчас нет ни у одного приложения ›"
+                "Защита выключена. При системной блокировке без VPN интернета сейчас нет ни у кого ›"
             }
             else -> "Защита выключена"
         }

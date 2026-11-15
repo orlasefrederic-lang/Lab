@@ -123,9 +123,12 @@ class FirewallService : VpnService(), EngineHost {
     }
 
     override fun onRevoke() {
-        // The user disconnected us in system settings or another VPN took over.
+        // The user disconnected us in system settings or another VPN took over. Either way we are not
+        // the always-on VPN any more (while we are, Android lets nobody take over), so its block is
+        // not ours to remember: the next start is an ordinary one.
         Prefs.enabled = false
         Prefs.revokedAt = System.currentTimeMillis()
+        Prefs.lockdownSeen = false
         shutdown()
         stopSelf()
     }

@@ -995,9 +995,17 @@ class E2eTest {
             "owner=${try { app.isOwner } catch (e: Throwable) { e }}" +
             "\nsystem log:\n" + shell("logcat -d -t 600").lines()
                 .filter { l -> listOf("DevicePolicy", "device owner", "Vpn", "NetStrazh", "AndroidRuntime").any { it in l } }.takeLast(60).joinToString("\n")
+        val cm = ctx.getSystemService(ConnectivityManager::class.java)
         fun stopVpn(what: String) {
             InstrumentationRegistry.getInstrumentation().runOnMainSync { FirewallService.stop(ctx) }
             waitFor(10_000, what) { !FirewallService.running && FirewallService.instance == null }
+            // Android starts its always-on VPN only when it sees none connected: wait until it has
+            // noticed that ours is gone (the network lingers for a moment after the service stopped).
+            @Suppress("DEPRECATION")
+            waitFor(10_000, "$what: the system took the VPN network down") {
+                cm.allNetworks.none { cm.getNetworkCapabilities(it)?.hasTransport(NetworkCapabilities.TRANSPORT_VPN) == true }
+            }
+            Thread.sleep(500)
         }
         /** Waits for the engine made after [since] to be verified; returns the service. */
         fun verified(since: Long, what: String): FirewallService {
@@ -1097,6 +1105,8 @@ class E2eTest {
             // Always-on off: Android takes the VPN away with it (onRevoke), as its settings screen does.
             step("always-on off") { app.alwaysOn(null, false) }
             step("device owner given up") { app.clearOwner() + ", still the owner: " + app.isOwner }
+            // An owner that takes its always-on VPN back also withdraws the VPN consent (Android 14).
+            step("VPN consent given again") { shell("appops set $self ACTIVATE_VPN allow") }
             Prefs.lockdownSeen = false
             step("proxy app unbound") { ctx.unbindService(app.conn) }
         }

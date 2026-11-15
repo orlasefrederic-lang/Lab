@@ -114,6 +114,10 @@ class FirewallPage(act: MainActivity) : Page(act) {
             val cutOff = if (FirewallService.running && FirewallService.lockdown)
                 Rules.excludedPackages().filter { !FirewallService.keptInside(it) } else emptyList()
             val state = when {
+                // Android tells only a running VPN; what was seen last is remembered.
+                !FirewallService.running && Prefs.lockdownSeen -> "Когда Страж работал в последний раз, блокировка была " +
+                    "включена. Пока он выключен, интернета нет ни у одного приложения: включите Стража или " +
+                    "выключите блокировку в настройках VPN."
                 !FirewallService.running -> "Включена ли блокировка, видно, когда Страж работает."
                 FirewallService.lockdown -> "Сейчас: блокировка включена ✓" + if (cutOff.isEmpty()) "" else
                     "\n\n⚠ Сейчас идут мимо Стража и потому остались без сети: " +
