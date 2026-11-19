@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Сведения об оборудовании компьютера (Windows 10/11 и Linux).
+Рентген — сведения об оборудовании компьютера и его проверка (Windows 10/11 и Linux).
 
 Собирает подробную информацию обо всём установленном железе: система и корпус,
 BIOS/UEFI, материнская плата, процессор, оперативная память (по модулям),
@@ -16,13 +16,15 @@ BIOS/UEFI, материнская плата, процессор, операти
 
 Раздел «Проверка состояния» подсказывает, не б/у ли железо: износ батареи,
 наработка и объём записанного на диск, ошибки SMART, память и устройства.
+Нагрузочный тест (--stress) показывает, как процессор держит частоту и греется.
 
 Примеры запуска:
-    python hardware_info.py              отчёт в консоль + файлы TXT, HTML, JSON
-    python hardware_info.py --open       то же и сразу открыть HTML-отчёт
-    python hardware_info.py --elevate    с правами администратора (в Linux — root через sudo)
-    python hardware_info.py --anon       скрыть серийные номера, MAC, IP и т. п.
-    python hardware_info.py --help       все параметры
+    python rentgen.py                отчёт в консоль + файлы TXT, HTML, JSON
+    python rentgen.py --open         то же и сразу открыть HTML-отчёт
+    python rentgen.py --elevate      с правами администратора (в Linux — root через sudo)
+    python rentgen.py --stress       и нагрузочный тест процессора на 60 секунд
+    python rentgen.py --anon         скрыть серийные номера, MAC, IP и т. п.
+    python rentgen.py --help         все параметры
 """
 
 from __future__ import annotations
@@ -33,18 +35,22 @@ import ctypes
 import datetime as dt
 import getpass
 import gzip
+import hashlib
 import html
 import json
 import math
+import multiprocessing
 import os
 import platform
 import re
 import shutil
+import signal
 import socket
 import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import xml.etree.ElementTree as ET
 from collections import Counter, OrderedDict
@@ -54,7 +60,8 @@ try:
 except ImportError:  # не Windows — работает только режим --load-raw
     winreg = None
 
-VERSION = "2.1.1"
+APP_NAME = "Рентген"
+VERSION = "3.0"
 IS_WINDOWS = sys.platform == "win32"
 IS_LINUX = sys.platform.startswith("linux")
 CREATE_NO_WINDOW = 0x08000000 if IS_WINDOWS else 0  # без мелькающего окна консоли
@@ -595,7 +602,7 @@ def nvme_health_windows(disk_numbers):
     return result
 
 
-def collect_local(has_battery=False, nvme_disks=()):
+def collect_local(has_battery=False, nvme_disks=(), has_nvidia=False):
     info = {"is_admin": is_admin()}
     if not IS_WINDOWS:
         return info
@@ -612,6 +619,8 @@ def collect_local(has_battery=False, nvme_disks=()):
     }
     if nvme_disks and info["is_admin"]:
         steps["nvme_health"] = lambda: nvme_health_windows(nvme_disks)
+    if has_nvidia:  # предел мощности видеокарты знает только nvidia-smi из драйвера NVIDIA
+        steps["nvidia"] = lambda: nvidia_smi() or None
     if has_battery:
         steps["battery_ioctl"] = battery_ioctl
         # Отчёт powercfg — запасной путь, если драйвер не отдал паспортную ёмкость
@@ -1395,31 +1404,71 @@ def linux_sound(pci, usb):
     return rows
 
 
+NVIDIA_QUERIES = (
+    ("pci.bus_id", "name", "memory.total", "driver_version", "vbios_version", "serial"),
+    ("pci.bus_id", "power.default_limit", "power.max_limit"),  # отдельно: старый драйвер может не знать поле
+)
+
+
+def nvidia_smi():
+    """Сведения от nvidia-smi из фирменного драйвера NVIDIA: {адрес PCI: {поле: значение}}."""
+    gpus = {}
+    for fields in NVIDIA_QUERIES:
+        out = run_tool(["nvidia-smi", "--query-gpu=" + ",".join(fields), "--format=csv,noheader,nounits"])
+        for line in (out or "").splitlines():
+            values = [x.strip() for x in line.split(",")]
+            if len(values) == len(fields):
+                gpus.setdefault(values[0].lower()[-12:], {}).update(zip(fields, values))
+    return gpus
+
+
+def nouveau_vram(addr):
+    """Объём видеопамяти у открытого драйвера nouveau, когда фирменного драйвера NVIDIA нет (Live-Ubuntu)."""
+    try:
+        import fcntl
+    except ImportError:
+        return None
+    for node in llist(f"/sys/bus/pci/devices/{addr}/drm"):
+        if not node.startswith("renderD"):
+            continue
+        try:
+            fd = os.open(_lp(f"/dev/dri/{node}"), os.O_RDWR | os.O_CLOEXEC)
+        except OSError:
+            continue
+        try:
+            buf = bytearray(struct.pack("=QQ", 8, 0))  # NOUVEAU_GETPARAM_FB_SIZE
+            fcntl.ioctl(fd, 0xC0106440, buf)  # DRM_IOCTL_NOUVEAU_GETPARAM
+            return struct.unpack("=QQ", buf)[1] or None
+        except OSError:
+            return None
+        finally:
+            os.close(fd)
+    return None
+
+
 def linux_gpus(pci):
-    nvidia = {}
-    out = run_tool(["nvidia-smi", "--query-gpu=pci.bus_id,name,memory.total,driver_version,vbios_version,serial",
-                    "--format=csv,noheader,nounits"])
-    for line in (out or "").splitlines():
-        f = [x.strip() for x in line.split(",")]
-        if len(f) == 6:
-            nvidia[f[0].lower()[-12:]] = f
+    nvidia = nvidia_smi()
     rows = []
     for d in pci:
         if d["class"] >> 16 != 0x03:
             continue
-        nv = nvidia.get(d["addr"].lower()[-12:])
-        name = nv[1] if nv else d["name"]
-        if not nv and d["short_vendor"] and not name.upper().startswith(d["short_vendor"].upper()):
+        nv = nvidia.get(d["addr"].lower()[-12:]) or {}
+        name = nv.get("name") or d["name"]
+        if not nv.get("name") and d["short_vendor"] and not name.upper().startswith(d["short_vendor"].upper()):
             name = f"{d['short_vendor']} {name}"
         vram = to_int(lread(f"/sys/bus/pci/devices/{d['addr']}/mem_info_vram_total"))  # AMD
-        if nv and to_int(nv[2]):
-            vram = to_int(nv[2]) * 1024 * 1024
-        driver = " ".join(x for x in (d["driver"], nv[3] if nv else d["driver_version"]) if x)
-        vbios = nv[4] if nv else lread(f"/sys/bus/pci/devices/{d['addr']}/vbios_version")  # NVIDIA / AMD
-        serial = nv[5] if nv and re.search(r"[1-9A-Za-z]", nv[5] or "") and "N/A" not in nv[5] else None
+        if to_int(nv.get("memory.total")):
+            vram = to_int(nv["memory.total"]) * 1024 * 1024
+        elif not vram and d["driver"] == "nouveau":
+            vram = nouveau_vram(d["addr"])
+        driver = " ".join(x for x in (d["driver"], nv.get("driver_version") or d["driver_version"]) if x)
+        vbios = nv.get("vbios_version") or lread(f"/sys/bus/pci/devices/{d['addr']}/vbios_version")  # NVIDIA / AMD
+        serial = nv.get("serial")
+        serial = serial if re.search(r"[1-9A-Za-z]", serial or "") and "N/A" not in serial else None
         rows.append({"Name": name, "AdapterCompatibility": d["vendor"], "VRAM": vram, "DriverVersion": driver or None,
-                     "PNPDeviceID": d["pnp"], "Status": "OK" if d["driver"] else "нет драйвера",
-                     "VideoBios": clean(vbios), "SerialNumber": clean(serial)})
+                     "Driver": d["driver"], "PNPDeviceID": d["pnp"], "Status": "OK" if d["driver"] else "нет драйвера",
+                     "VideoBios": clean(vbios), "SerialNumber": clean(serial),
+                     "PowerLimit": nv.get("power.default_limit"), "PowerLimitMax": nv.get("power.max_limit")})
     return rows
 
 
@@ -1560,14 +1609,326 @@ def collect_linux():
             "wmi": {"data": data, "errors": errors}, "local": local}
 
 
-def collect_linux_elevated():
+def collect_linux_elevated(stress=None):
     """Собрать данные с правами root через sudo, а отчёт сохранить от имени пользователя."""
     cmd = ["sudo", sys.executable] + ([] if getattr(sys, "frozen", False) else [os.path.abspath(__file__)])
+    cmd += ["--collect-to", "-"] + (["--stress", str(stress)] if stress else [])
     print("Для полного отчёта нужны права root — sudo может спросить пароль.", file=sys.stderr)
-    proc = subprocess.run(cmd + ["--collect-to", "-"], stdout=subprocess.PIPE)
+    # Ctrl+C во время теста должен прервать только тест в процессе под sudo, а не весь отчёт.
+    # Обработчик, а не SIG_IGN: игнорирование сигнала унаследовал бы и процесс под sudo.
+    previous = signal.signal(signal.SIGINT, lambda *_: None) if stress else None
+    try:
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE)
+    finally:
+        if stress:
+            signal.signal(signal.SIGINT, previous)
+    if proc.returncode in (130, -signal.SIGINT):
+        raise KeyboardInterrupt
     if proc.returncode != 0 or not proc.stdout:
         raise CollectError("не удалось получить права root через sudo")
     return json.loads(proc.stdout.decode("utf-8"))
+
+
+# ---------------------------------------------------------------------------
+# Нагрузочный тест процессора
+# ---------------------------------------------------------------------------
+
+def stress_worker(seconds):
+    """Нагрузка на один поток. Длинная арифметика и SHA-512 выполняются в C-коде, а не в интерпретаторе."""
+    stop = time.monotonic() + seconds
+    a, m, x = (1 << 4093) - 1, (1 << 4099) - 1, 3
+    block = bytes(range(256)) * 256
+    try:
+        while time.monotonic() < stop:
+            for _ in range(32):
+                x = x * a % m
+            hashlib.sha512(block).digest()
+    except KeyboardInterrupt:
+        pass
+
+
+CPU_HWMON = ("coretemp", "k10temp", "zenpower")
+CPU_THERMAL_ZONES = ("x86_pkg_temp", "TCPU", "cpu-thermal", "cpu_thermal")
+
+
+class LinuxSensors:
+    """Датчики процессора в Linux: температура, частоты, мощность (RAPL), троттлинг и вентиляторы."""
+
+    def __init__(self):
+        self.temps, self.tjmax = [], None
+        for hw in llist("/sys/class/hwmon"):
+            base = f"/sys/class/hwmon/{hw}"
+            if lread(base + "/name") not in CPU_HWMON:
+                continue
+            inputs = [f[:-6] for f in llist(base) if re.fullmatch(r"temp\d+_input", f)]
+            labels = {t: lread(f"{base}/{t}_label") or "" for t in inputs}
+            # Процессор целиком: Package (Intel), Tdie или Tctl (AMD); если подписей нет — все датчики
+            main = ([t for t in inputs if re.match(r"Package id|Tdie", labels[t])]
+                    or [t for t in inputs if labels[t].startswith("Tctl")] or inputs)
+            for t in main:
+                self.temps.append(f"{base}/{t}_input")
+                crit = to_int(lread(f"{base}/{t}_crit"))
+                if crit and 60000 <= crit <= 125000:
+                    self.tjmax = max(self.tjmax or 0, crit // 1000)
+        if not self.temps:
+            self.temps = [f"/sys/class/thermal/{z}/temp" for z in llist("/sys/class/thermal")
+                          if lread(f"/sys/class/thermal/{z}/type") in CPU_THERMAL_ZONES]
+        self.cpus = [c for c in llist("/sys/devices/system/cpu") if re.fullmatch(r"cpu\d+", c)]
+        top = {int(c[3:]): to_int(lread(f"/sys/devices/system/cpu/{c}/cpufreq/cpuinfo_max_freq")) or 0
+               for c in self.cpus}
+        peak = max(top.values(), default=0)
+        self.efficient = {n for n, khz in top.items() if khz and khz < 0.9 * peak}  # E-ядра гибридных процессоров
+        self.rapl = [f"/sys/class/powercap/{d}" for d in llist("/sys/class/powercap")
+                     if re.fullmatch(r"intel-rapl:\d+", d)
+                     and (lread(f"/sys/class/powercap/{d}/name") or "").startswith("package")]
+        self.fans = [f"/sys/class/hwmon/{hw}/{f}" for hw in llist("/sys/class/hwmon")
+                     for f in llist(f"/sys/class/hwmon/{hw}") if re.fullmatch(r"fan\d+_input", f)]
+        self.energy = None
+
+    def freqs(self):
+        """Текущие частоты потоков, МГц: из /proc/cpuinfo (x86), иначе из cpufreq."""
+        freqs, cpu = {}, None
+        for line in (lread("/proc/cpuinfo") or "").splitlines():
+            key, _, value = line.partition(":")
+            key = key.strip()
+            if key == "processor":
+                cpu = to_int(value.strip())
+            elif key == "cpu MHz" and cpu is not None:
+                try:
+                    freqs[cpu] = float(value)
+                except ValueError:
+                    pass
+        if not freqs:
+            for c in self.cpus:
+                khz = to_int(lread(f"/sys/devices/system/cpu/{c}/cpufreq/scaling_cur_freq"))
+                if khz:
+                    freqs[int(c[3:])] = khz / 1000
+        return freqs
+
+    def power(self):
+        """Потребление процессора, Вт, по счётчикам энергии RAPL (их может читать только root)."""
+        now, values = time.monotonic(), []
+        for d in self.rapl:
+            energy = to_int(lread(d + "/energy_uj"))
+            if energy is None:
+                return None
+            values.append((energy, to_int(lread(d + "/max_energy_range_uj"))))
+        previous, self.energy = self.energy, (now, values)
+        if not values or not previous or now - previous[0] < 0.2:
+            return None
+        total = 0
+        for (energy, wrap), (before, _) in zip(values, previous[1]):
+            total += energy - before + (wrap or 0) * (energy < before)  # счётчик переполнился и пошёл с нуля
+        return round(total / 1e6 / (now - previous[0]), 1)
+
+    def sample(self):
+        temps = [to_int(lread(p)) for p in self.temps]
+        temps = [t / 1000 for t in temps if t and 0 < t < 150000]
+        s = {"temp": round(max(temps), 1) if temps else None, "power": self.power()}
+        freqs = self.freqs()
+        if freqs:
+            s["freq"] = round(sum(freqs.values()) / len(freqs))
+            if self.efficient:
+                for key, group in (("freq_p", [v for n, v in freqs.items() if n not in self.efficient]),
+                                   ("freq_e", [v for n, v in freqs.items() if n in self.efficient])):
+                    s[key] = round(sum(group) / len(group)) if group else None
+        fans = [to_int(lread(p)) for p in self.fans]
+        if any(fans):
+            s["fans"] = [f or 0 for f in fans]
+        return s
+
+    def throttle_ms(self):
+        """Сколько миллисекунд процессор сбрасывал частоту из-за перегрева (счётчик ядра Linux для Intel)."""
+        packages = {}
+        for c in self.cpus:
+            ms = to_int(lread(f"/sys/devices/system/cpu/{c}/thermal_throttle/package_throttle_total_time_ms"))
+            if ms is not None:
+                packages[lread(f"/sys/devices/system/cpu/{c}/topology/physical_package_id") or "0"] = ms
+        return sum(packages.values()) if packages else None
+
+    def close(self):
+        pass
+
+
+# Счётчики производительности раз в секунду. Скрипт должен оставаться чисто ASCII.
+STRESS_PS_SCRIPT = r"""
+$ErrorActionPreference = 'SilentlyContinue'
+$ProgressPreference = 'SilentlyContinue'
+while ($true) {
+    $o = [ordered]@{}
+    $p = Get-CimInstance -ClassName 'Win32_PerfFormattedData_Counters_ProcessorInformation' -Filter "Name='_Total'"
+    if ($p) {
+        $o['perf'] = $p.PercentProcessorPerformance
+        $o['mhz'] = $p.ProcessorFrequency
+        $o['limit'] = $p.PercentPerformanceLimit
+    }
+    $zones = New-Object System.Collections.ArrayList
+    foreach ($z in @(Get-CimInstance -ClassName 'Win32_PerfFormattedData_Counters_ThermalZoneInformation')) {
+        [void]$zones.Add([ordered]@{ hp = $z.HighPrecisionTemperature; k = $z.Temperature; passive = $z.PercentPassiveLimit })
+    }
+    $o['zones'] = $zones
+    [Console]::Out.WriteLine((ConvertTo-Json -InputObject $o -Compress -Depth 4))
+    [Console]::Out.Flush()
+    Start-Sleep -Milliseconds 800
+}
+"""
+
+
+class WindowsSensors:
+    """Счётчики Windows: частота, ограничение производительности и термозоны ACPI (через PowerShell)."""
+
+    def __init__(self):
+        self.tjmax, self.efficient = None, set()
+        self.latest, self.count, self.proc = {}, 0, None
+        ps = find_powershell()
+        if not ps:
+            return
+        try:
+            self.proc = subprocess.Popen([ps, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command",
+                                          "$s = [Console]::In.ReadToEnd(); & ([scriptblock]::Create($s))"],
+                                         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                         creationflags=CREATE_NO_WINDOW)
+            self.proc.stdin.write(STRESS_PS_SCRIPT.encode("ascii"))
+            self.proc.stdin.close()
+        except OSError:
+            self.proc = None
+            return
+        threading.Thread(target=self._read, daemon=True).start()
+        stop = time.monotonic() + 20  # PowerShell запускается несколько секунд, первый замер бывает нулевым
+        while self.count < 2 and time.monotonic() < stop and self.proc.poll() is None:
+            time.sleep(0.2)
+
+    def _read(self):
+        for line in self.proc.stdout:
+            try:
+                self.latest = json.loads(line.decode("ascii", "replace"))
+                self.count += 1
+            except ValueError:
+                pass
+
+    def sample(self):
+        d, s = self.latest, {}
+        perf, mhz = d.get("perf"), d.get("mhz")
+        if isinstance(perf, (int, float)) and isinstance(mhz, (int, float)) and perf > 0 and mhz > 0:
+            s["freq"] = round(mhz * perf / 100)  # номинальная частота × «% Processor Performance»
+        if isinstance(d.get("limit"), (int, float)):
+            s["limit"] = d["limit"]
+        temps, passive = [], []
+        zones = d.get("zones")
+        for z in [zones] if isinstance(zones, dict) else zones or []:
+            if not isinstance(z, dict):
+                continue
+            hp, k = z.get("hp"), z.get("k")  # десятые доли кельвина / кельвины
+            t = (hp / 10 - 273.15 if isinstance(hp, (int, float)) and hp > 0 else
+                 k - 273.15 if isinstance(k, (int, float)) and k > 0 else None)
+            if t is not None and -20 < t < 150:
+                temps.append(t)
+            if isinstance(z.get("passive"), (int, float)):
+                passive.append(z["passive"])
+        s["temp"] = round(max(temps), 1) if temps else None
+        if passive:
+            s["passive"] = min(passive)
+        return s
+
+    def throttle_ms(self):
+        return None
+
+    def close(self):
+        if self.proc and self.proc.poll() is None:
+            self.proc.kill()
+
+
+def on_ac_power():
+    """Работает ли ноутбук от сети: True / False; None — батареи нет или не понять."""
+    if IS_WINDOWS:
+        class PowerStatus(ctypes.Structure):
+            _fields_ = [("ac", ctypes.c_ubyte), ("flag", ctypes.c_ubyte), ("percent", ctypes.c_ubyte),
+                        ("saver", ctypes.c_ubyte), ("life", ctypes.c_ulong), ("full_life", ctypes.c_ulong)]
+        status = PowerStatus()
+        if not ctypes.windll.kernel32.GetSystemPowerStatus(ctypes.byref(status)) or status.flag & 128:
+            return None  # 128 — батареи нет, 255 — состояние неизвестно
+        return {0: False, 1: True}.get(status.ac)
+    states = [lread(f"/sys/class/power_supply/{p}/status") for p in llist("/sys/class/power_supply")
+              if lread(f"/sys/class/power_supply/{p}/type") == "Battery"
+              and lread(f"/sys/class/power_supply/{p}/scope") != "Device"]  # не батареи мышей и наушников
+    if "Discharging" in states:
+        return False
+    return True if any(s in ("Charging", "Full", "Not charging") for s in states) else None
+
+
+def stress_progress(s, seconds):
+    parts = []
+    if s.get("freq"):
+        parts.append(f"{fnum(s['freq'] / 1000, 2)} ГГц")
+    if s.get("temp") is not None:
+        parts.append(f"{fnum(s['temp'], 0)} °C")
+    if s.get("power"):
+        parts.append(f"{fnum(s['power'], 0)} Вт")
+    return f"  {s['t']:>4}/{seconds} с: " + (" · ".join(parts) or "показания датчиков недоступны")
+
+
+def stress_base_mhz(raw):
+    """Базовая (номинальная) частота процессора из собранных сведений, МГц."""
+    cpus = as_list(((raw.get("wmi") or {}).get("data") or {}).get("cpu"))
+    return next((to_int(c.get("MaxClockSpeed")) for c in cpus if isinstance(c, dict)), None)
+
+
+def run_stress(seconds, base_mhz=None):
+    """Нагрузить все потоки процессора на seconds секунд и раз в секунду снимать показания датчиков."""
+    threads = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else os.cpu_count() or 1
+    result = {"seconds": seconds, "threads": threads, "base_mhz": base_mhz, "samples": []}
+    try:
+        result["on_ac"] = on_ac_power()
+    except Exception:  # сведения о питании — не главное в тесте
+        result["on_ac"] = None
+    print(f"Нагрузочный тест процессора: {seconds} с на {threads} "
+          f"{ru_plural(threads, ('поток', 'потока', 'потоков'))}. Прервать — Ctrl+C.", file=sys.stderr)
+    sensors, workers, throttle = None, [], None
+    try:
+        sensors = LinuxSensors() if IS_LINUX else WindowsSensors() if IS_WINDOWS else None
+        if sensors:
+            result.update(tjmax=sensors.tjmax, hybrid=bool(sensors.efficient))
+            sensors.sample()  # первый замер мощности — только точка отсчёта
+            time.sleep(1)
+            result["idle"] = sensors.sample()
+            throttle = sensors.throttle_ms()
+        sys.stdout.flush()  # иначе копии процесса при fork допишут недописанный вывод ещё раз
+        sys.stderr.flush()
+        mp = multiprocessing.get_context("fork" if IS_LINUX else "spawn")
+        workers = [mp.Process(target=stress_worker, args=(seconds + 5,), daemon=True) for _ in range(threads)]
+        for w in workers:
+            w.start()
+        started = time.monotonic()
+        for n in range(1, seconds + 1):
+            time.sleep(max(0.0, started + n - time.monotonic()))
+            s = sensors.sample() if sensors else {}
+            s["t"] = n
+            result["samples"].append(s)
+            if n % 5 == 0 or n == seconds:
+                print(stress_progress(s, seconds), file=sys.stderr)
+    except KeyboardInterrupt:
+        result["interrupted"] = True
+        print("Тест прерван.", file=sys.stderr)
+    finally:
+        for w in workers:
+            if w.is_alive():
+                w.terminate()
+        for w in workers:
+            if w.pid is not None:
+                w.join(timeout=3)
+    try:
+        if sensors and throttle is not None:
+            end = sensors.throttle_ms()
+            result["throttle_ms"] = max(0, end - throttle) if end is not None else None
+        if sensors and result["samples"] and not result.get("interrupted"):
+            time.sleep(5)  # насколько быстро процессор остывает после нагрузки
+            result["after"] = sensors.sample()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if sensors:
+            sensors.close()
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -1889,6 +2250,42 @@ def fdisk_size(value):
     return f"{fbytes(n)} ({label} по маркировке)"
 
 
+VRAM_SIZES_GB = (2, 3, 4, 6, 8, 10, 11, 12, 16, 20, 24, 32, 48, 64, 80, 96, 128, 192)
+
+
+def fvram(value):
+    """Видеопамять. Драйвер часто сообщает чуть меньше паспортной: часть занята под служебные нужды."""
+    n = to_int(value)
+    if not n or n <= 0:
+        return None
+    gib = n / 2 ** 30
+    nominal = next((s for s in VRAM_SIZES_GB if s >= gib - 0.02), None) if gib >= 1.8 else None
+    if not nominal or nominal - gib > 2:
+        return fbytes(n)
+    return f"{nominal} ГБ" + (f" (доступно {fbytes(n)})" if nominal - gib >= 0.05 else "")
+
+
+def fwatts(value):
+    m = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*W?\s*", str(value or ""))
+    return float(m.group(1)) if m and float(m.group(1)) > 0 else None
+
+
+def power_limit_text(default, maximum):
+    low, high = fwatts(default), fwatts(maximum)
+    if low and high and high - low >= 1:
+        return f"{fnum(low, 0)} Вт, максимум {fnum(high, 0)} Вт"
+    return f"{fnum(low or high, 0)} Вт" if low or high else None
+
+
+def fghz(mhz, digits=1):
+    return f"{fnum(mhz / 1000, digits)} ГГц" if mhz else None
+
+
+def mean(values):
+    values = [v for v in values if isinstance(v, (int, float)) and not isinstance(v, bool)]
+    return sum(values) / len(values) if values else None
+
+
 def fspeed(bps):
     n = to_int(bps)
     if not n or n >= 2 ** 62:
@@ -2092,7 +2489,7 @@ class Section:
 
 class Report:
     def __init__(self, computer, generated):
-        self.title = "Сведения об оборудовании компьютера"
+        self.title = f"{APP_NAME} — сведения об оборудовании"
         self.computer = computer
         self.generated = generated
         self.sections = []
@@ -2137,6 +2534,7 @@ class Ctx:
         self.dates = []  # (компонент, дата текстом, год, неделя) — даты изготовления экземпляров
         self.battery_complete = False
         self.battery_noted = False
+        self.stress = raw.get("stress")  # результаты нагрузочного теста (--stress)
         self._drivers = None
 
     def rows(self, key):
@@ -2362,6 +2760,146 @@ def build_cpu(ctx):
     return sec
 
 
+def build_stress(ctx):
+    st = ctx.stress or {}
+    samples = [s for s in as_list(st.get("samples")) if isinstance(s, dict) and to_int(s.get("t"))]
+    sec = Section("stress", "Нагрузочный тест процессора")
+    if not samples:
+        if st:
+            ctx.checks.append(("Нагрузочный тест", "ℹ тест прерван в самом начале, результатов нет"))
+        return sec
+    dur = to_int(samples[-1]["t"])
+    head, tail = samples[1:6] or samples, samples[-10:]  # первая секунда — потоки ещё запускаются
+    hybrid, base, threads = st.get("hybrid"), to_int(st.get("base_mhz")), to_int(st.get("threads")) or 0
+    idle, after = st.get("idle") or {}, st.get("after") or {}
+
+    def avg(rows, key):
+        return mean([r.get(key) for r in rows])
+
+    def number(value):
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+    kv = sec.kv()
+    load = f"{dur} с на {threads} {ru_plural(threads, ('поток', 'потока', 'потоков'))}"
+    if st.get("interrupted"):
+        load += f" (тест прерван, план — {st.get('seconds')} с)"
+    kv.add("Нагрузка", load)
+    kv.add("Питание", {True: "от сети", False: "от батареи — результат занижен"}.get(st.get("on_ac")))
+
+    temps = [s["temp"] for s in samples if number(s.get("temp"))]
+    span = temps + ([idle["temp"]] if number(idle.get("temp")) else [])
+    # Термозоны ACPI в Windows часто показывают постоянное число, а не температуру процессора
+    temp_ok = bool(temps) and (ctx.platform == "linux" or max(span) - min(span) >= 2)
+    tmax = max(temps) if temp_ok else None
+    if temp_ok:
+        peak_at = next(s["t"] for s in samples if number(s.get("temp")) and s["temp"] >= tmax - 1)
+        parts = [f"до нагрузки {fnum(idle['temp'], 0)} °C"] if number(idle.get("temp")) else []
+        parts.append(f"максимум {fnum(tmax, 0)} °C (на {peak_at}-й секунде)")
+        if number(after.get("temp")):
+            parts.append(f"через 5 с после нагрузки {fnum(after['temp'], 0)} °C")
+        text = ", ".join(parts)
+        if st.get("tjmax"):
+            text += f"; предел процессора (TjMax) {st['tjmax']} °C"
+        kv.add("Температура процессора", text)
+    elif ctx.platform == "windows":
+        kv.add("Температура процессора", "Windows без сторонних драйверов её не показывает")
+
+    def fall(a, b):
+        return f" (−{round((1 - b / a) * 100)} %)" if b <= 0.95 * a else ""
+
+    key = "freq_p" if hybrid else "freq"
+    f0, f1 = avg(head, key), avg(tail, key)
+    drop = 1 - f1 / f0 if f0 and f1 else None
+    if hybrid:
+        groups = [(label, avg(head, k), avg(tail, k)) for label, k in (("P-ядра", "freq_p"), ("E-ядра", "freq_e"))]
+        freq = ", ".join(f"{label} {fnum(a / 1000, 1)} → {fghz(b)}{fall(a, b)}" for label, a, b in groups if a and b)
+        freq = f"в начале → в конце: {freq}" if freq else None
+    else:
+        freq = f"в начале {fghz(f0)}, в конце {fghz(f1)}{fall(f0, f1)}" if f0 and f1 else None
+    if freq and base:
+        freq += f"; базовая {fghz(base)}"
+    kv.add("Частота", freq)
+    p0, p1, pavg = avg(head, "power"), avg(tail, "power"), avg(samples, "power")
+    if pavg:
+        kv.add("Потребление процессора",
+               f"в начале {fnum(p0 or 0, 0)} Вт, в конце {fnum(p1 or 0, 0)} Вт, в среднем {fnum(pavg, 0)} Вт")
+    throttle = to_int(st.get("throttle_ms"))
+    share = throttle / (dur * 1000) if throttle is not None else None
+    if throttle is not None:
+        kv.add("Сброс частоты из-за перегрева", "не было" if throttle < 100 else
+               f"{fnum(throttle / 1000, 1)} с из {dur} ({round(share * 100)} % времени)")
+    limits = [s["limit"] for s in samples if number(s.get("limit"))]
+    if limits and min(limits) < 100:
+        kv.add("Ограничение производительности", f"было: до {fnum(min(limits), 0)} % от номинальной частоты")
+    passive = [s["passive"] for s in samples if number(s.get("passive"))]
+    if passive and min(passive) < 100:
+        kv.add("Защита от перегрева (ACPI)", f"срабатывала: частота снижалась до {fnum(min(passive), 0)} %")
+    fans = {}
+    for s in samples:
+        for i, rpm in enumerate(as_list(s.get("fans"))):
+            if number(rpm):
+                fans[i] = max(fans.get(i, 0), rpm)
+    if any(fans.values()):
+        kv.add("Вентиляторы", ", ".join(f"до {fint(v)} об/мин" for v in fans.values() if v))
+
+    table = sec.table("Ход теста", ["Время", "Частота", "P-ядра", "E-ядра", "Температура", "Мощность"],
+                      collapsible=True)
+    for s in samples:
+        if s["t"] % 5 and s is not samples[-1]:
+            continue
+        table.add(f"{s['t']} с", fghz(s.get("freq"), 2), fghz(s.get("freq_p"), 2) if hybrid else None,
+                  fghz(s.get("freq_e"), 2) if hybrid else None,
+                  f"{fnum(s['temp'], 0)} °C" if temp_ok and number(s.get("temp")) else None,
+                  f"{fnum(s['power'], 0)} Вт" if number(s.get("power")) else None)
+    sec.notes.append("Тест нагружает вычислениями все потоки процессора, видеокарта не нагружается. Результат "
+                     "зависит от режима питания (у игровых ноутбуков — профиль в фирменной программе) и от того, "
+                     "свободны ли вентиляционные решётки: ставьте ноутбук на стол, а не на колени или одеяло.")
+    if ctx.platform == "windows" and not temp_ok:
+        sec.notes.append("Температуру процессора Windows без сторонних драйверов не показывает. Перегрев точнее "
+                         "проверяется в Linux с загрузочной флешки: там видны температура, мощность и сброс частоты.")
+
+    items = [(1, "ноутбук работал от батареи — подключите зарядку и повторите тест")] if st.get("on_ac") is False else []
+    hot = temp_ok and tmax >= (st.get("tjmax") or 95) - 3
+    at_limit = f" ({fnum(tmax, 0)} °C)" if tmax else ""
+    if share is not None and share >= 0.3 and drop is not None and drop >= 0.3:
+        items.append((2, f"сильный перегрев: {round(share * 100)} % времени процессор сбрасывал частоту из-за "
+                         f"температуры, частота упала на {round(drop * 100)} % — охлаждение не справляется "
+                         "(засохшая термопаста, пыль, неисправный вентилятор)"))
+    elif share is not None and share >= 0.05:
+        items.append((1, f"процессор упирается в температурный предел{at_limit} и сбрасывает частоту — у игровых "
+                         "ноутбуков так бывает, но сравните с обзорами этой модели"))
+    elif share is None and hot and drop is not None and drop >= 0.3:
+        items.append((1, f"температура дошла до предела{at_limit}, а частота упала на {round(drop * 100)} % — "
+                         "охлаждения не хватает"))
+    elif passive and min(passive) < 100:
+        items.append((1, "сработала защита от перегрева: Windows снижала частоту процессора"))
+    elif not temp_ok and f1 and base and f1 < 0.8 * base:
+        items.append((1, f"частота под нагрузкой ниже базовой ({fghz(f1)} при базовой {fghz(base)}) — "
+                         "возможен перегрев или экономичный режим питания"))
+    elif f0 and f1:
+        ok = f"под нагрузкой частота {'P-ядер ' if hybrid else ''}{fghz(f0)} → {fghz(f1)}"
+        if temp_ok:
+            ok += f", температура до {fnum(tmax, 0)} °C"
+        if share is not None:
+            ok += (", перегрева нет" if throttle < 100 else
+                   f", кратковременный сброс частоты из-за перегрева ({fnum(throttle / 1000, 1)} с)")
+            if drop and drop >= 0.2:
+                ok += "; частоту снизило штатное ограничение мощности"
+        elif hot:
+            ok += " — работа у температурного предела для современных процессоров бывает штатной"
+        elif not temp_ok:
+            ok += "; температуру датчики не сообщают, поэтому перегрев не оценить"
+        items.append((0, ok))
+    else:
+        ctx.checks.append(("Нагрузочный тест", "ℹ датчики процессора недоступны — оценить нагрев нельзя"))
+        return sec
+    text = verdict(items)
+    if not temp_ok and share is None and text.startswith("✔"):
+        text = "ℹ" + text[1:]  # без температуры «всё в порядке» сказать нельзя
+    ctx.checks.append(("Нагрузочный тест", text))
+    return sec
+
+
 def memory_type(m):
     t = SMBIOS_MEMORY_TYPES.get(to_int(m.get("SMBIOSMemoryType")))
     return t or WMI_MEMORY_TYPES.get(to_int(m.get("MemoryType")))
@@ -2463,26 +3001,44 @@ def gpu_vram(gpu, registry):
     for e in gpu_registry_entries(gpu, registry):
         size = to_int(e.get("memory"))
         if size and size > 0:
-            return fbytes(size)
+            return fvram(size)
     ram = to_int(gpu.get("AdapterRAM"))
     if ram and ram > 0:
         if ram >= 0xFFF00000:
             return "4 ГБ или больше (точнее WMI не сообщает)"
-        return fbytes(ram)
+        return fvram(ram)
     return None
+
+
+def nvidia_entry(ctx, name, ids):
+    """Данные nvidia-smi для видеокарты из WMI: в Windows адрес PCI не известен, сопоставляем по названию."""
+    entries = list((ctx.local.get("nvidia") or {}).values())
+    for e in entries:
+        if name and (clean(e.get("name")) or "").casefold() == name.casefold():
+            return e
+    nvidia_rows = [g for g in ctx.rows("gpu") if (hw_ids(g.get("PNPDeviceID")) or "").startswith("10DE:")]
+    if len(entries) == 1 and len(nvidia_rows) == 1 and (ids or "").startswith("10DE:"):
+        return entries[0]
+    return {}
 
 
 def build_gpu(ctx):
     gpus = ctx.rows("gpu")
     registry = ctx.local.get("gpu_registry") or []
     sec = Section("gpu", "Видеокарты")
-    summary = []
+    summary, without_nvidia_driver = [], []
     for i, g in enumerate(gpus, 1):
         kv = sec.kv(f"Видеоадаптер {i}" if len(gpus) > 1 else None)
         name = clean(g.get("Name"))
         pnp = g.get("PNPDeviceID")
-        vram = fbytes(g.get("VRAM")) if to_int(g.get("VRAM")) else gpu_vram(g, registry)
+        vram = fvram(g.get("VRAM")) if to_int(g.get("VRAM")) else gpu_vram(g, registry)
         ids = hw_ids(pnp)
+        nv = nvidia_entry(ctx, name, ids) if ctx.platform == "windows" else {}
+        power = power_limit_text(g.get("PowerLimit") or nv.get("power.default_limit"),
+                                 g.get("PowerLimitMax") or nv.get("power.max_limit"))
+        kernel_driver = g.get("Driver") or (clean(g.get("DriverVersion")) or "").split(" ")[0]
+        if ctx.platform == "linux" and (ids or "").startswith("10DE:") and kernel_driver != "nvidia":
+            without_nvidia_driver.append(bool(vram))
         vendor = clean(g.get("AdapterCompatibility"))
         if not vendor and ids:
             vendor = PCI_VENDORS.get(ids.split(":")[0])
@@ -2508,6 +3064,7 @@ def build_gpu(ctx):
             arch = f"встроена в процессор ({gen})" if gen else None
         kv.add("Архитектура (год выхода модели)", arch)
         kv.add("Видеопамять", vram)
+        kv.add("Предел мощности (TGP)", power)
         kv.add("Текущий режим", mode)
         kv.add("Драйвер", driver)
         bios = clean(g.get("VideoBios")) or next((clean(e.get("bios")) for e in gpu_registry_entries(g, registry)
@@ -2519,9 +3076,17 @@ def build_gpu(ctx):
         if status and status.upper() != "OK":
             kv.add("Состояние", status)
         if name:
-            summary.append(name + (f" ({vram})" if vram and "WMI" not in vram else ""))
+            summary.append(name + (f" ({vram.split(' (')[0]})" if vram and "WMI" not in vram else ""))
     if summary:
         ctx.facts["Видеокарта" if len(summary) == 1 else "Видеокарты"] = "; ".join(summary)
+    if without_nvidia_driver:
+        sec.notes.append(
+            "Фирменного драйвера NVIDIA в системе нет (обычное дело для Live-режима Ubuntu), поэтому модель "
+            "видеокарты определена по коду устройства VEN:DEV — это надёжно. "
+            + ("Объём видеопамяти показан по данным открытого драйвера nouveau. " if all(without_nvidia_driver)
+               else "Объём видеопамяти без драйвера NVIDIA узнать нельзя. ")
+            + "Предел мощности (TGP) и версию BIOS видеокарты сообщает только драйвер NVIDIA: в Windows или "
+              "в Linux с этим драйвером, например в Pop!_OS (NVIDIA).")
     return sec
 
 
@@ -3266,7 +3831,7 @@ LOCAL_NAMES = {
     "ubr": "номер обновления Windows", "gpu_registry": "видеопамять из реестра", "edid": "EDID мониторов",
     "displays": "режимы мониторов", "battery_report": "отчёт о батарее (powercfg)",
     "nvme_health": "журнал SMART NVMe-дисков",
-    "battery_ioctl": "сведения о батарее от драйвера",
+    "battery_ioctl": "сведения о батарее от драйвера", "nvidia": "сведения от драйвера NVIDIA (nvidia-smi)",
 }
 
 
@@ -3276,7 +3841,7 @@ def build_notes(ctx, raw):
     if admin is False and ctx.platform == "linux":
         sec.notes.append("Программа запущена без прав root, поэтому не показаны модули памяти, серийные номера "
                          "и SMART-показатели накопителей. Для полного отчёта запустите её так: "
-                         "python3 hardware_info.py --elevate (или через sudo).")
+                         "python3 rentgen.py --elevate (или через sudo).")
     elif admin is False:
         sec.notes.append("Программа запущена без прав администратора, поэтому не показаны подробности TPM, "
                          "температура, износ и наработка накопителей. Для полного отчёта запустите её "
@@ -3301,14 +3866,14 @@ def build_notes(ctx, raw):
         info.append(f"PowerShell {raw['wmi']['ps_version']}")
     if raw.get("python"):
         info.append(f"Python {raw['python']}")
-    sec.notes.append(f"hardware_info.py {VERSION}: " + ", ".join(info) + ".")
+    sec.notes.append(f"{APP_NAME} {VERSION}: " + ", ".join(info) + ".")
     return sec
 
 
 def build_report(raw, include_devices=True):
     ctx = Ctx(raw)
     sections = [
-        build_system(ctx), build_os(ctx), build_bios(ctx), build_baseboard(ctx), build_cpu(ctx),
+        build_system(ctx), build_os(ctx), build_bios(ctx), build_baseboard(ctx), build_cpu(ctx), build_stress(ctx),
         build_memory(ctx), build_gpu(ctx), build_monitors(ctx), build_storage(ctx), build_network(ctx),
         build_audio(ctx), build_input(ctx),
         build_pnp_class(ctx, "camera", "Камеры", ("Camera", "Image"), fact="Камера"),
@@ -3427,7 +3992,7 @@ def render_html(report):
     e = html.escape
     out = ["<!DOCTYPE html>", '<html lang="ru"><head><meta charset="utf-8">',
            '<meta name="viewport" content="width=device-width, initial-scale=1">',
-           f"<title>Оборудование — {e(report.computer)}</title>", f"<style>{HTML_CSS}</style></head><body>",
+           f"<title>{APP_NAME} — {e(report.computer)}</title>", f"<style>{HTML_CSS}</style></head><body>",
            '<div class="wrap"><header>', f"<h1>{e(report.title)}</h1>",
            f'<div class="meta">Компьютер: <b>{e(report.computer)}</b> · отчёт от {e(report.generated or "")}</div>',
            "</header><nav>"]
@@ -3472,7 +4037,7 @@ def render_html(report):
         if sec.notes:
             out.append('<ul class="notes">' + "".join(f"<li>{e(n)}</li>" for n in sec.notes) + "</ul>")
         out.append("</section>")
-    out.append(f"<footer>Создано программой hardware_info.py {VERSION}</footer></div></body></html>")
+    out.append(f"<footer>Создано программой {APP_NAME} {VERSION}</footer></div></body></html>")
     return "\n".join(out)
 
 
@@ -3488,7 +4053,7 @@ def render_json(report):
                 blocks.append({"type": "table", "title": b.title, "columns": b.columns, "rows": b.rows})
         sections.append({"id": sec.id, "title": sec.title, "blocks": blocks, "notes": sec.notes})
     return {"title": report.title, "computer": report.computer, "generated": report.generated,
-            "generator": f"hardware_info.py {VERSION}", "sections": sections}
+            "generator": f"{APP_NAME} {VERSION}", "sections": sections}
 
 
 # ---------------------------------------------------------------------------
@@ -3536,7 +4101,7 @@ def open_report(path):
 
 
 def save_reports(report, formats, out_dir, stamp, anon):
-    base = f"hardware_{'report' if anon else safe_name(report.computer)}_{stamp}"
+    base = f"rentgen_{'report' if anon else safe_name(report.computer)}_{stamp}"
     renderers = {
         "txt": (lambda: render_text(report), "utf-8-sig"),
         "html": (lambda: render_html(report), "utf-8"),
@@ -3562,9 +4127,9 @@ def save_reports(report, formats, out_dir, stamp, anon):
 
 def parse_args(argv):
     parser = argparse.ArgumentParser(
-        prog="hardware_info.py",
-        description="Собирает подробные сведения об оборудовании компьютера под Windows и Linux "
-                    "и сохраняет отчёт в TXT, HTML и JSON.")
+        prog="rentgen.py",
+        description=f"{APP_NAME}: собирает подробные сведения об оборудовании компьютера под Windows и Linux, "
+                    "проверяет его состояние и сохраняет отчёт в TXT, HTML и JSON.")
     parser.add_argument("-o", "--output", default=os.getcwd(),
                         help="папка для отчётов (по умолчанию — текущая)")
     parser.add_argument("-f", "--formats", nargs="+", choices=["txt", "html", "json"],
@@ -3578,24 +4143,35 @@ def parse_args(argv):
     parser.add_argument("--elevate", action="store_true",
                         help="получить права администратора (в Linux — root через sudo): больше данных — "
                              "модули памяти, SMART, TPM и др.")
+    parser.add_argument("--stress", nargs="?", const=60, type=int, metavar="СЕК",
+                        help="после сбора сведений провести нагрузочный тест процессора (по умолчанию 60 с): "
+                             "температура, частота, мощность, сброс частоты из-за перегрева")
     parser.add_argument("--pause", action="store_true", help="ждать нажатия Enter перед выходом")
     parser.add_argument("--dump-raw", action="store_true", help="сохранить также «сырые» данные (для отладки)")
     parser.add_argument("--load-raw", metavar="FILE", help="построить отчёт из ранее сохранённых сырых данных")
     parser.add_argument("--collect-to", metavar="FILE", help=argparse.SUPPRESS)  # служебный: сбор под sudo
     parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.stress is not None and not 10 <= args.stress <= 3600:
+        parser.error("длительность теста --stress — от 10 до 3600 секунд")
+    return args
 
 
 def run(args, argv):
     if args.load_raw:
         with open(args.load_raw, encoding="utf-8") as fh:
             raw = json.load(fh)
+        if args.stress:
+            print("С --load-raw нагрузочный тест не проводится: отчёт строится из сохранённых данных.",
+                  file=sys.stderr)
     elif IS_LINUX:
         if args.elevate and os.geteuid() != 0 and not args.collect_to:
-            raw = collect_linux_elevated()
+            raw = collect_linux_elevated(args.stress)  # тест пройдёт под root: мощность видна только ему
         else:
             print("Собираю сведения об оборудовании…", file=sys.stderr)
             raw = collect_linux()
+            if args.stress:
+                raw["stress"] = run_stress(args.stress, stress_base_mhz(raw))
         if args.collect_to:  # служебный режим: отдать сырые данные запустившему процессу
             text = json.dumps(raw)
             if args.collect_to == "-":
@@ -3620,10 +4196,14 @@ def run(args, argv):
         wmi_data = wmi.get("data") or {}
         local = collect_local(has_battery=bool(wmi_data.get("battery")),
                               nvme_disks=[d.get("DeviceId") for d in as_list(wmi_data.get("physdisk"))
-                                          if isinstance(d, dict) and to_int(d.get("BusType")) == 17])
+                                          if isinstance(d, dict) and to_int(d.get("BusType")) == 17],
+                              has_nvidia=any("VEN_10DE" in str(g.get("PNPDeviceID") or "").upper()
+                                             for g in as_list(wmi_data.get("gpu")) if isinstance(g, dict)))
         raw = {"collected_at": dt.datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
                "duration": round(time.time() - started, 1), "python": sys.version.split()[0],
                "wmi": wmi, "local": local}
+        if args.stress:
+            raw["stress"] = run_stress(args.stress, stress_base_mhz(raw))
 
     report = build_report(raw, include_devices=not args.no_devices)
     if args.anon:
@@ -3636,7 +4216,7 @@ def run(args, argv):
     if not args.no_save:
         saved = save_reports(report, args.formats, os.path.abspath(args.output), stamp, args.anon)
         if args.dump_raw and not args.load_raw:
-            path = os.path.join(os.path.abspath(args.output), f"hardware_raw_{stamp}.json")
+            path = os.path.join(os.path.abspath(args.output), f"rentgen_raw_{stamp}.json")
             with open(path, "w", encoding="utf-8") as fh:
                 json.dump(raw, fh, ensure_ascii=False, indent=1)
             give_to_sudo_user(path)
@@ -3680,4 +4260,5 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
+    multiprocessing.freeze_support()  # нагрузочный тест в программе, собранной в .exe
     sys.exit(main())
