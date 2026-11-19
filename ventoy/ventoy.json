@@ -1,0 +1,5 @@
+{
+    "control": [
+        { "VTOY_LINUX_REMOUNT": "1" }
+    ]
+}
