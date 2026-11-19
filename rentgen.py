@@ -61,7 +61,7 @@ except ImportError:  # не Windows — работает только режим
     winreg = None
 
 APP_NAME = "Рентген"
-VERSION = "3.0"
+VERSION = "3.0.1"
 IS_WINDOWS = sys.platform == "win32"
 IS_LINUX = sys.platform.startswith("linux")
 CREATE_NO_WINDOW = 0x08000000 if IS_WINDOWS else 0  # без мелькающего окна консоли
@@ -838,6 +838,30 @@ SPD_LAYOUTS = {0x0B: ("DDR3", 117, 120, 122, 128, 18), 0x0C: ("DDR4", 320, 323, 
                0x0E: ("DDR4", 320, 323, 325, 329, 20), 0x12: ("DDR5", 512, 515, 517, 521, 30)}
 
 
+DDR4_DIE_GBIT = {0: 0.25, 1: 0.5, 2: 1, 3: 2, 4: 4, 5: 8, 6: 16, 7: 32, 8: 12, 9: 24}
+DDR5_DIE_GBIT = {1: 4, 2: 8, 3: 12, 4: 16, 5: 24, 6: 32, 7: 48, 8: 64}
+DDR5_DIES = {0: 1, 2: 2, 3: 4, 4: 8, 5: 16}
+
+
+def spd_size(kind, data):
+    """Объём модуля по SPD, байт: ёмкость кристалла × кристаллов на шину × ранги."""
+    if kind == "DDR3":
+        die, org, bus = DDR4_DIE_GBIT.get(data[4] & 0x0F), data[7], data[8]
+        dies, width, ranks = 1, 4 << (org & 7), ((org >> 3) & 7) + 1
+        bus_width, channels = 8 << (bus & 7), 1
+    elif kind == "DDR4":
+        die, org, bus, package = DDR4_DIE_GBIT.get(data[4] & 0x0F), data[12], data[13], data[6]
+        dies = ((package >> 4) & 7) + 1 if package & 0x03 == 2 else 1  # 3DS: несколько кристаллов в корпусе
+        width, ranks, bus_width, channels = 4 << (org & 7), ((org >> 3) & 7) + 1, 8 << (bus & 7), 1
+    else:  # DDR5: размеры первого типа кристаллов, два подканала на модуле
+        die, dies = DDR5_DIE_GBIT.get(data[4] & 0x1F), DDR5_DIES.get(data[4] >> 5)
+        width, ranks = 4 << (data[6] >> 5), ((data[234] >> 3) & 7) + 1
+        bus_width, channels = 8 << (data[235] & 7), ((data[235] >> 5) & 3) + 1
+    if not die or not dies or width > bus_width:
+        return None
+    return int(die * 2 ** 30 / 8 * dies * bus_width // width * ranks * channels)
+
+
 def parse_spd(data):
     """Данные из микросхемы SPD модуля памяти — то же, что показывают CPU-Z и decode-dimms."""
     layout = SPD_LAYOUTS.get(data[2]) if data and len(data) > 2 else None
@@ -849,7 +873,7 @@ def parse_spd(data):
     year, week = bcd(data[date]), bcd(data[date + 1])
     serial_hex = data[serial:serial + 4].hex().upper()
     return {
-        "type": kind, "vendor": f"{data[mfr]:02X}{data[mfr + 1]:02X}",
+        "type": kind, "vendor": f"{data[mfr]:02X}{data[mfr + 1]:02X}", "size": spd_size(kind, data),
         "year": 2000 + year if year else None, "week": week if week and 1 <= week <= 53 else None,
         "serial": serial_hex if serial_hex not in ("00000000", "FFFFFFFF") else None,
         "part": clean(data[part:part + part_len].decode("ascii", "replace")),
@@ -1082,7 +1106,9 @@ def linux_cpu(sockets_smbios):
             "Architecture": {"x86_64": 9, "amd64": 9, "i386": 0, "i686": 0, "aarch64": 12, "armv7l": 5}.get(machine),
             "AddressWidth": 64 if machine in ("x86_64", "amd64", "aarch64") else 32,
             "VirtualizationFirmwareEnabled": bool(flags & {"vmx", "svm"}) if x86 else None,
-            "SecondLevelAddressTranslationExtensions": bool(flags & {"ept", "npt"}) if x86 else None,
+            # без включённой виртуализации процессор не показывает и признак SLAT
+            "SecondLevelAddressTranslationExtensions": (bool(flags & {"ept", "npt"})
+                                                        if x86 and flags & {"vmx", "svm"} else None),
         })
     return rows, "hypervisor" in flags
 
@@ -1476,6 +1502,28 @@ LAPTOP_CHASSIS = {8, 9, 10, 11, 14, 30, 31, 32}
 DESKTOP_CHASSIS = {3, 4, 5, 6, 7, 13, 15, 16, 35, 36}
 
 
+LIVE_MEDIA_MOUNTS = ("/cdrom", "/run/live/medium", "/run/initramfs/live", "/run/archiso/bootmnt")
+
+
+def linux_live_session():
+    """Система загружена с флешки (Live): Ubuntu давно не пишет boot=casper, зато монтирует носитель в /cdrom."""
+    cmdline = lread("/proc/cmdline") or ""
+    if any(k in cmdline for k in ("boot=casper", "boot=live", "rd.live.image", "archisobasedir")):
+        return True
+    mounts = {line.split()[1] for line in (lread("/proc/mounts") or "").splitlines() if len(line.split()) > 2}
+    return bool(mounts & set(LIVE_MEDIA_MOUNTS))
+
+
+def passwordless_sudo():
+    if not shutil.which("sudo"):
+        return False
+    try:
+        return subprocess.run(["sudo", "-n", "true"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                              timeout=15).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
 def collect_linux():
     started = time.time()
     is_root = os.geteuid() == 0
@@ -1549,8 +1597,9 @@ def collect_linux():
             module.update(ManufactureYear=info["year"], ManufactureWeek=info["week"])
     if spd and not data["memory"]:  # без прав root модули видны только через SPD
         data["memory"] = [{"Manufacturer": m["vendor"], "PartNumber": m["part"], "SerialNumber": m["serial"],
-                           "ManufactureYear": m["year"], "ManufactureWeek": m["week"],
-                           "SMBIOSMemoryType": {"DDR3": 24, "DDR4": 26, "DDR5": 34}.get(m["type"])} for m in spd]
+                           "Capacity": m.get("size"), "ManufactureYear": m["year"], "ManufactureWeek": m["week"],
+                           "SMBIOSMemoryType": {"DDR3": 24, "DDR4": 26, "DDR5": 34}.get(m["type"]),
+                           "Source": "spd"} for m in spd]
     elif not spd and is_root and any(to_int(m.get("FormFactor")) in (8, 12) for m in data["memory"]):
         errors["spd"] = ("даты изготовления модулей не прочитаны: не загружен драйвер SPD "
                          "(для DDR4 — sudo modprobe ee1004, для DDR5 — sudo modprobe spd5118, затем запустите снова)")
@@ -1563,7 +1612,7 @@ def collect_linux():
         "Kernel": platform.release(),
         "OSArchitecture": "64-разрядная" if platform.architecture()[0] == "64bit" else "32-разрядная",
         "LastBootUpTime": (dt.datetime.now() - dt.timedelta(seconds=uptime)).strftime("%Y-%m-%dT%H:%M:%S") if uptime else None,
-        "LiveSession": any(k in cmdline for k in ("boot=casper", "boot=live", "rd.live.image", "archisobasedir")),
+        "LiveSession": linux_live_session(),
         "TotalVisibleMemorySize": to_int(mem.get("MemTotal")), "FreePhysicalMemory": to_int(mem.get("MemAvailable")),
     }]
 
@@ -1601,6 +1650,7 @@ def collect_linux():
             drivers.append({"DeviceID": d["pnp"], "DriverVersion": " ".join(x for x in (d["driver"], version) if x)})
     data["pnp"], data["drivers"] = pnp, drivers
 
+    local["nomodeset"] = "nomodeset" in cmdline.split()  # пункт «safe graphics»: видеодрайверы отключены
     local["firmware"] = "UEFI" if lexists("/sys/firmware/efi") else "Legacy BIOS"
     sb = lread("/sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c", binary=True)
     local["secure_boot"] = bool(sb[4]) if sb and len(sb) >= 5 else None
@@ -1609,11 +1659,12 @@ def collect_linux():
             "wmi": {"data": data, "errors": errors}, "local": local}
 
 
-def collect_linux_elevated(stress=None):
+def collect_linux_elevated(stress=None, announce=True):
     """Собрать данные с правами root через sudo, а отчёт сохранить от имени пользователя."""
     cmd = ["sudo", sys.executable] + ([] if getattr(sys, "frozen", False) else [os.path.abspath(__file__)])
     cmd += ["--collect-to", "-"] + (["--stress", str(stress)] if stress else [])
-    print("Для полного отчёта нужны права root — sudo может спросить пароль.", file=sys.stderr)
+    if announce:
+        print("Для полного отчёта нужны права root — sudo может спросить пароль.", file=sys.stderr)
     # Ctrl+C во время теста должен прервать только тест в процессе под sudo, а не весь отчёт.
     # Обработчик, а не SIG_IGN: игнорирование сигнала унаследовал бы и процесс под sudo.
     previous = signal.signal(signal.SIGINT, lambda *_: None) if stress else None
@@ -2912,7 +2963,8 @@ def build_memory(ctx):
     sec = Section("memory", "Оперативная память")
     kv = sec.kv()
 
-    total = sum(to_int(m.get("Capacity")) or 0 for m in mods)
+    spd_only = bool(mods) and all(m.get("Source") == "spd" for m in mods)  # без прав root: только микросхемы SPD
+    total = 0 if spd_only else sum(to_int(m.get("Capacity")) or 0 for m in mods)
     slots = sum(to_int(a.get("MemoryDevices")) or 0 for a in arrays)
     max_kb = sum((to_int(a.get("MaxCapacityEx")) or to_int(a.get("MaxCapacity")) or 0) for a in arrays)
     types = list(OrderedDict.fromkeys(t for t in (memory_type(m) for m in mods) if t))
@@ -2940,7 +2992,7 @@ def build_memory(ctx):
     table = sec.table("Модули памяти", ["Слот", "Объём", "Тип", "Скорость", "Напряжение",
                                         "Производитель", "Партномер", "Дата изготовления", "Серийный номер"],
                       sensitive=["Серийный номер"])
-    for m in mods:
+    for n, m in enumerate(mods, 1):
         slot = clean(m.get("DeviceLocator"))
         bank = clean(m.get("BankLabel"))
         if bank and slot and bank != slot:
@@ -2957,7 +3009,7 @@ def build_memory(ctx):
                   clean(m.get("SerialNumber")))
         made = made_text(m.get("ManufactureYear"), m.get("ManufactureWeek"))
         if made:
-            label = f"модуль памяти {mods.index(m) + 1}" if len(mods) > 1 else "память"
+            label = f"модуль памяти {n}" if len(mods) > 1 else "память"
             ctx.dates.append((label, made, to_int(m.get("ManufactureYear")), to_int(m.get("ManufactureWeek")) or 0))
 
     items = []
@@ -2968,9 +3020,11 @@ def build_memory(ctx):
         items.append((1, f"память работает на {slow[0][0]} МТ/с вместо паспортных {slow[0][1]}"))
     if len(mods) == 1 and slots >= 2:
         items.append((1, "установлен один модуль: память работает в одноканальном режиме, это медленнее"))
-    if mods and not items:
-        items.append((0, f"{fbytes(total)}, {len(mods)} {ru_plural(len(mods), ('модуль', 'модуля', 'модулей'))}, "
-                         "без замечаний"))
+    if spd_only:
+        items.append((1, f"без прав root видны не все модули и не видны слоты и частоты — {admin_hint(ctx)}"))
+    elif mods and not items:
+        count = f"{len(mods)} {ru_plural(len(mods), ('модуль', 'модуля', 'модулей'))}"
+        items.append((0, (f"{fbytes(total)}, " if total else "") + count + ", без замечаний"))
     if not mods and ctx.platform == "linux" and ctx.local.get("is_admin") is False:
         items.append((1, f"модули памяти не видны — {admin_hint(ctx)}"))
     if items:
@@ -3010,6 +3064,27 @@ def gpu_vram(gpu, registry):
     return None
 
 
+# Видеопамять ноутбучных GeForce по характеристикам NVIDIA: у каждой модели она одна, кроме двух отмеченных
+NVIDIA_LAPTOP_VRAM_GB = {
+    "GTX 1650": "4", "GTX 1650 Ti": "4", "GTX 1660 Ti": "6", "RTX 2050": "4", "RTX 2060": "6", "RTX 2070": "8",
+    "RTX 2070 Super": "8", "RTX 2080": "8", "RTX 2080 Super": "8", "RTX 3050": "4 или 6", "RTX 3050 Ti": "4",
+    "RTX 3060": "6", "RTX 3070": "8", "RTX 3070 Ti": "8", "RTX 3080": "8 или 16", "RTX 3080 Ti": "16",
+    "RTX 4050": "6", "RTX 4060": "8", "RTX 4070": "8", "RTX 4080": "12", "RTX 4090": "16",
+    "RTX 5050": "8", "RTX 5060": "8", "RTX 5070": "8", "RTX 5070 Ti": "12", "RTX 5080": "16", "RTX 5090": "24",
+}
+
+
+def nvidia_laptop_vram(name):
+    """Видеопамять ноутбучной GeForce по названию модели, когда драйвер её не сообщил."""
+    if not re.search(r"Mobile|Laptop|Max-Q", name or "", re.I):
+        return None
+    m = re.search(r"\b(GTX|RTX)\s*(\d{4})(\s*(?:Ti|Super))?\b", name, re.I)
+    if not m:
+        return None
+    key = f"{m.group(1).upper()} {m.group(2)}" + (f" {m.group(3).strip().title()}" if m.group(3) else "")
+    return NVIDIA_LAPTOP_VRAM_GB.get(key)
+
+
 def nvidia_entry(ctx, name, ids):
     """Данные nvidia-smi для видеокарты из WMI: в Windows адрес PCI не известен, сопоставляем по названию."""
     entries = list((ctx.local.get("nvidia") or {}).values())
@@ -3037,8 +3112,11 @@ def build_gpu(ctx):
         power = power_limit_text(g.get("PowerLimit") or nv.get("power.default_limit"),
                                  g.get("PowerLimitMax") or nv.get("power.max_limit"))
         kernel_driver = g.get("Driver") or (clean(g.get("DriverVersion")) or "").split(" ")[0]
+        spec = nvidia_laptop_vram(name) if (not vram or "WMI" in vram) and (ids or "").startswith("10DE:") else None
+        if spec:  # драйвер не сообщил объём (или WMI обрезал его до 4 ГБ)
+            vram = f"{spec} ГБ (по характеристикам модели)"
         if ctx.platform == "linux" and (ids or "").startswith("10DE:") and kernel_driver != "nvidia":
-            without_nvidia_driver.append(bool(vram))
+            without_nvidia_driver.append("spec" if spec else "driver" if vram else None)
         vendor = clean(g.get("AdapterCompatibility"))
         if not vendor and ids:
             vendor = PCI_VENDORS.get(ids.split(":")[0])
@@ -3079,13 +3157,21 @@ def build_gpu(ctx):
             summary.append(name + (f" ({vram.split(' (')[0]})" if vram and "WMI" not in vram else ""))
     if summary:
         ctx.facts["Видеокарта" if len(summary) == 1 else "Видеокарты"] = "; ".join(summary)
+    if ctx.platform == "linux" and ctx.local.get("nomodeset"):
+        sec.notes.append("Система загружена в режиме безопасной графики (пункт «safe graphics», параметр nomodeset): "
+                         "видеодрайверы в нём отключены, поэтому у видеокарт нет драйвера, а мониторы не видны. "
+                         "Для полного отчёта загрузитесь обычным пунктом «Try or Install Ubuntu».")
     if without_nvidia_driver:
+        sources = set(without_nvidia_driver)
+        vram_notes = [text for key, text in (
+            ("driver", "Объём видеопамяти показан по данным открытого драйвера nouveau."),
+            ("spec", "Объём видеопамяти указан по характеристикам модели: у ноутбучных GeForce он у каждой "
+                     "модели свой и не меняется."),
+            (None, "Объём видеопамяти без драйвера видеокарты узнать нельзя.")) if key in sources]
         sec.notes.append(
             "Фирменного драйвера NVIDIA в системе нет (обычное дело для Live-режима Ubuntu), поэтому модель "
-            "видеокарты определена по коду устройства VEN:DEV — это надёжно. "
-            + ("Объём видеопамяти показан по данным открытого драйвера nouveau. " if all(without_nvidia_driver)
-               else "Объём видеопамяти без драйвера NVIDIA узнать нельзя. ")
-            + "Предел мощности (TGP) и версию BIOS видеокарты сообщает только драйвер NVIDIA: в Windows или "
+            "видеокарты определена по коду устройства VEN:DEV — это надёжно. " + " ".join(vram_notes)
+            + " Предел мощности (TGP) и версию BIOS видеокарты сообщает только драйвер NVIDIA: в Windows или "
               "в Linux с этим драйвером, например в Pop!_OS (NVIDIA).")
     return sec
 
@@ -3592,8 +3678,11 @@ def build_battery(ctx):
         cycle_count = to_int(c.get("CycleCount")) or to_int(r.get("cycles"))
         charge = to_int(b.get("EstimatedChargeRemaining"))
         runtime = to_int(b.get("EstimatedRunTime"))
-        wear = max(0.0, 100 - current * 100 / designed) if designed and current else None
-        if wear is None:
+        unit = r.get("unit") or ("усл. ед." if r.get("relative") else "мВт·ч")
+        # У батарей ноутбуков не больше 100 Вт·ч (около 9 000 мА·ч); большее число — сбой или неверные единицы
+        implausible = bool(designed) and designed > {"мВт·ч": 100000, "мА·ч": 20000}.get(unit, float("inf"))
+        wear = max(0.0, 100 - current * 100 / designed) if designed and current and not implausible else None
+        if wear is None and not implausible:
             ctx.battery_complete = False
             if r and not to_int(r.get("design")):
                 sec.notes.append("Прошивка не сообщает Windows паспортную ёмкость батареи (драйвер батареи её "
@@ -3623,8 +3712,9 @@ def build_battery(ctx):
             kv.add("Оставшееся время", fduration(dt.timedelta(minutes=runtime)))
         kv.add("Химия", chemistry)
         # некоторые батареи сообщают ёмкость в мА·ч или в условных единицах
-        unit = r.get("unit") or ("усл. ед." if r.get("relative") else "мВт·ч")
-        kv.add("Паспортная ёмкость", f"{fint(designed)} {unit}" if designed else None)
+        kv.add("Паспортная ёмкость", (f"{fint(designed)} {unit}" + (" — неправдоподобно много, данные батареи "
+                                                                     "неверны" if implausible else ""))
+               if designed else None)
         kv.add("Полная ёмкость сейчас", f"{fint(current)} {unit}" if current else None)
         if wear is not None:
             kv.add("Износ", f"{fnum(wear, 1)} % (осталось {fnum(100 - wear, 1)} % паспортной ёмкости)")
@@ -3650,6 +3740,10 @@ def build_battery(ctx):
                 items.append((1, f"износ {w} % — батарея заметно изношена, у нового ноутбука так быть не должно"))
             else:
                 items.append((2, f"износ {w} % — батарея сильно изношена"))
+        elif implausible:
+            items.append((1, "износ неизвестен: батарея сообщает неправдоподобную паспортную ёмкость "
+                             f"({fint(designed)} {unit}) — так бывает у неоригинальных батарей; сравните полную "
+                             "ёмкость сейчас с ёмкостью на наклейке батареи"))
         else:
             items.append((1, "износ неизвестен: система не сообщила паспортную ёмкость"))
         if cycle_count:
@@ -3780,7 +3874,7 @@ def build_checks(ctx):
         latest = max(ctx.dates, key=lambda d: (d[2], d[3]))
         text = "ℹ " + "; ".join(f"{name} — {made}" for name, made, _, _ in ctx.dates)
         if len(ctx.dates) > 1:
-            text += f". Значит, компьютер собран не раньше, чем {latest[1]} (самая поздняя дата)"
+            text = text.rstrip(".") + f". Значит, компьютер собран не раньше, чем {latest[1]} (самая поздняя дата)"
         kv.add("Даты изготовления", text)
     if kv.rows:
         sec.notes.append("✔ — в порядке, ⚠ — обратите внимание, ✖ — неисправность. У нового компьютера износ "
@@ -3841,7 +3935,7 @@ def build_notes(ctx, raw):
     if admin is False and ctx.platform == "linux":
         sec.notes.append("Программа запущена без прав root, поэтому не показаны модули памяти, серийные номера "
                          "и SMART-показатели накопителей. Для полного отчёта запустите её так: "
-                         "python3 rentgen.py --elevate (или через sudo).")
+                         "sh rentgen.sh или python3 rentgen.py --elevate (или через sudo).")
     elif admin is False:
         sec.notes.append("Программа запущена без прав администратора, поэтому не показаны подробности TPM, "
                          "температура, износ и наработка накопителей. Для полного отчёта запустите её "
@@ -4165,8 +4259,12 @@ def run(args, argv):
             print("С --load-raw нагрузочный тест не проводится: отчёт строится из сохранённых данных.",
                   file=sys.stderr)
     elif IS_LINUX:
-        if args.elevate and os.geteuid() != 0 and not args.collect_to:
-            raw = collect_linux_elevated(args.stress)  # тест пройдёт под root: мощность видна только ему
+        auto = (not args.elevate and not args.collect_to and os.geteuid() != 0
+                and linux_live_session() and passwordless_sudo())
+        if auto:  # с флешки sudo работает без пароля — полный отчёт, даже если программу запустили без --elevate
+            print("Live-система: беру права root через sudo, пароль не нужен.", file=sys.stderr)
+        if (args.elevate or auto) and os.geteuid() != 0 and not args.collect_to:
+            raw = collect_linux_elevated(args.stress, announce=not auto)  # тест под root: мощность видна только ему
         else:
             print("Собираю сведения об оборудовании…", file=sys.stderr)
             raw = collect_linux()
