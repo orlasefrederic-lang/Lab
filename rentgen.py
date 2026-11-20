@@ -61,7 +61,7 @@ except ImportError:  # не Windows — работает только режим
     winreg = None
 
 APP_NAME = "Рентген"
-VERSION = "3.0.1"
+VERSION = "3.0.2"
 IS_WINDOWS = sys.platform == "win32"
 IS_LINUX = sys.platform.startswith("linux")
 CREATE_NO_WINDOW = 0x08000000 if IS_WINDOWS else 0  # без мелькающего окна консоли
@@ -1184,7 +1184,101 @@ def nvme_smart_log(controller):
     return parse_nvme_health(buf.raw)
 
 
-def linux_smart(name, errors):
+class SgIoHdr(ctypes.Structure):
+    """struct sg_io_hdr из <scsi/sg.h>: запрос к диску в обход файловой системы."""
+    _fields_ = [("interface_id", ctypes.c_int), ("dxfer_direction", ctypes.c_int), ("cmd_len", ctypes.c_ubyte),
+                ("mx_sb_len", ctypes.c_ubyte), ("iovec_count", ctypes.c_ushort), ("dxfer_len", ctypes.c_uint),
+                ("dxferp", ctypes.c_void_p), ("cmdp", ctypes.c_void_p), ("sbp", ctypes.c_void_p),
+                ("timeout", ctypes.c_uint), ("flags", ctypes.c_uint), ("pack_id", ctypes.c_int),
+                ("usr_ptr", ctypes.c_void_p), ("status", ctypes.c_ubyte), ("masked_status", ctypes.c_ubyte),
+                ("msg_status", ctypes.c_ubyte), ("sb_len_wr", ctypes.c_ubyte), ("host_status", ctypes.c_ushort),
+                ("driver_status", ctypes.c_ushort), ("resid", ctypes.c_int), ("duration", ctypes.c_uint),
+                ("info", ctypes.c_uint)]
+
+
+def ata_smart_command(fd, feature, lba_low=0, data_in=True):
+    """Команда SMART диску SATA через SCSI ATA PASS-THROUGH (16), как у smartctl: (данные, sense)."""
+    import fcntl
+    data, sense = ctypes.create_string_buffer(512), ctypes.create_string_buffer(32)
+    # PIO с чтением одного сектора или команда без данных с возвратом регистров (CK_COND)
+    protocol, flags, count = (4, 0x0E, 1) if data_in else (3, 0x20, 0)
+    cdb = (ctypes.c_ubyte * 16)(0x85, protocol << 1, flags, 0, feature, 0, count, 0, lba_low,
+                                0, 0x4F, 0, 0xC2, 0, 0xB0, 0)  # 0xB0 — SMART, 4F/C2 — её «ключ»
+    hdr = SgIoHdr(interface_id=ord("S"), dxfer_direction=-3 if data_in else -1, cmd_len=16, mx_sb_len=32,
+                  dxfer_len=512 if data_in else 0, dxferp=ctypes.addressof(data) if data_in else None,
+                  cmdp=ctypes.addressof(cdb), sbp=ctypes.addressof(sense), timeout=10000)
+    fcntl.ioctl(fd, 0x2285, hdr)  # SG_IO
+    if hdr.host_status or hdr.driver_status & ~0x08 or (data_in and hdr.status):
+        raise OSError(f"диск не выполнил команду SMART (статус {hdr.status}, {hdr.host_status}, {hdr.driver_status})")
+    return data.raw, sense.raw[:hdr.sb_len_wr]
+
+
+def ata_smart_passed(sense):
+    """Итог SMART RETURN STATUS по регистрам LBA: 4F/C2 — исправен, F4/2C — порог превышен."""
+    regs = None
+    if sense and sense[0] & 0x7F in (0x72, 0x73):  # описательный формат: ищем дескриптор состояния ATA (09h)
+        pos = 8
+        while pos + 1 < len(sense):
+            if sense[pos] == 0x09 and pos + 12 <= len(sense):
+                regs = (sense[pos + 9], sense[pos + 11])
+                break
+            pos += 2 + sense[pos + 1]
+    elif sense and sense[0] & 0x7F in (0x70, 0x71) and len(sense) >= 12:  # фиксированный формат SAT-3
+        regs = (sense[10], sense[11])
+    return {(0x4F, 0xC2): True, (0xF4, 0x2C): False}.get(regs)
+
+
+def parse_ata_smart(data, thresholds=None, passed=None, rotational=False):
+    """Атрибуты SMART диска SATA (структура SMART READ DATA, 30 записей по 12 байт)."""
+    attrs, limits = {}, {}
+    for i in range(30):
+        e = data[2 + i * 12:14 + i * 12]
+        if len(e) == 12 and e[0]:
+            attrs[e[0]] = {"flags": e[1] | e[2] << 8, "value": e[3], "raw": int.from_bytes(e[5:11], "little")}
+        t = (thresholds or b"")[2 + i * 12:14 + i * 12]
+        if len(t) == 12 and t[0]:
+            limits[t[0]] = t[1]
+    if not attrs:
+        raise ValueError("диск не вернул атрибуты SMART")
+
+    def raw(aid, mask=0xFFFFFFFF):
+        return attrs[aid]["raw"] & mask if aid in attrs else None
+
+    if passed is None and limits:  # нет итога от диска — сравниваем «критичные» атрибуты с порогами
+        passed = not any(a["flags"] & 1 and limits.get(aid) and a["value"] <= limits[aid] for aid, a in attrs.items())
+    hours = raw(9)
+    temp = raw(194, 0xFF) or raw(190, 0xFF)
+    r = {"Health": None if passed is None else (0 if passed else 2), "PowerOnHours": hours if hours and hours < 200000 else None,
+         "StartStopCycleCount": raw(12), "Temperature": temp if temp and temp < 100 else None,
+         "ReallocatedSectors": raw(5), "PendingSectors": raw(197), "ReadErrorsUncorrected": raw(198)}
+    if rotational and raw(241, 2 ** 48 - 1):  # у жёстких дисков — в секторах; у SSD единицы у всех разные
+        r["DataWrittenBytes"] = raw(241, 2 ** 48 - 1) * 512
+    for aid in (231, 233, 177, 169):  # «остаток ресурса» у разных производителей SSD
+        if not rotational and aid in attrs and 0 <= attrs[aid]["value"] <= 100:
+            r["Wear"] = 100 - attrs[aid]["value"]
+            break
+    return {k: v for k, v in r.items() if v is not None}
+
+
+def ata_smart(device, rotational=False):
+    """SMART диска SATA прямо у диска — без smartctl и без интернета (нужны права root)."""
+    fd = os.open(device, os.O_RDONLY | os.O_NONBLOCK)
+    try:
+        data, _ = ata_smart_command(fd, 0xD0)  # SMART READ DATA
+        try:
+            thresholds, _ = ata_smart_command(fd, 0xD1, lba_low=1)  # SMART READ THRESHOLDS (у новых может не быть)
+        except OSError:
+            thresholds = None
+        try:
+            passed = ata_smart_passed(ata_smart_command(fd, 0xDA, data_in=False)[1])  # SMART RETURN STATUS
+        except OSError:
+            passed = None
+    finally:
+        os.close(fd)
+    return parse_ata_smart(data, thresholds, passed, rotational)
+
+
+def linux_smart(name, bus, errors, rotational=False):
     out = run_tool(["smartctl", "-j", "-a", f"/dev/{name}"])
     if out:
         try:
@@ -1194,14 +1288,13 @@ def linux_smart(name, errors):
         except ValueError:
             pass
     m = re.match(r"(nvme\d+)", name)
-    if m:
-        try:
+    try:
+        if m:
             return nvme_smart_log(_lp(f"/dev/{m.group(1)}"))
-        except (OSError, ValueError) as exc:
-            errors.setdefault("smart", f"{name}: {exc}")
-    elif not shutil.which("smartctl"):
-        errors.setdefault("smart", "для SMART-показателей SATA- и USB-дисков установите smartmontools "
-                                   "(sudo apt install smartmontools)")
+        if bus == 11:  # внутренний SATA; флешкам и USB-боксам команды ATA не шлём — от них они могут зависнуть
+            return ata_smart(_lp(f"/dev/{name}"), rotational)
+    except (OSError, ValueError) as exc:
+        errors.setdefault("smart", f"{name}: {exc}")
     return {}
 
 
@@ -1256,7 +1349,7 @@ def linux_storage(is_root, errors):
             serial, firmware = clean(udev.get("ID_SERIAL_SHORT")), clean(lread(base + "/device/rev"))
         media = None if bus in (7, 14) else (3 if lread(base + "/queue/rotational") == "1" else 4)
         disk_id = str(len(disks))
-        smart = linux_smart(name, errors) if is_root and bus != 14 else {}  # у виртуальных дисков SMART нет
+        smart = linux_smart(name, bus, errors, media == 3) if is_root and bus != 14 else {}  # у виртуальных SMART нет
         disks.append({"DeviceId": disk_id, "FriendlyName": model or name, "SerialNumber": serial, "MediaType": media,
                       "BusType": bus, "Size": size, "HealthStatus": smart.pop("Health", None),
                       "FirmwareVersion": firmware})
@@ -2890,8 +2983,12 @@ def build_stress(ctx):
         for i, rpm in enumerate(as_list(s.get("fans"))):
             if number(rpm):
                 fans[i] = max(fans.get(i, 0), rpm)
-    if any(fans.values()):
-        kv.add("Вентиляторы", ", ".join(f"до {fint(v)} об/мин" for v in fans.values() if v))
+    speeds = [v for v in fans.values() if v]
+    if len(set(speeds)) == 1 and len(speeds) > 1:
+        kv.add("Вентиляторы", f"до {fint(speeds[0])} об/мин ({len(speeds)} "
+                              f"{ru_plural(len(speeds), ('вентилятор', 'вентилятора', 'вентиляторов'))})")
+    elif speeds:
+        kv.add("Вентиляторы", ", ".join(f"до {fint(v)} об/мин" for v in speeds))
 
     table = sec.table("Ход теста", ["Время", "Частота", "P-ядра", "E-ядра", "Температура", "Мощность"],
                       collapsible=True)
@@ -2930,7 +3027,7 @@ def build_stress(ctx):
     elif f0 and f1:
         ok = f"под нагрузкой частота {'P-ядер ' if hybrid else ''}{fghz(f0)} → {fghz(f1)}"
         if temp_ok:
-            ok += f", температура до {fnum(tmax, 0)} °C"
+            ok += f", температура до {fnum(tmax, 0)} °C" + (f" (предел {st['tjmax']} °C)" if st.get("tjmax") else "")
         if share is not None:
             ok += (", перегрева нет" if throttle < 100 else
                    f", кратковременный сброс частоты из-за перегрева ({fnum(throttle / 1000, 1)} с)")
@@ -3274,9 +3371,9 @@ def build_storage(ctx):
     disks = ctx.rows("physdisk")
     parts = ctx.rows("partition")
     health = {str(h.get("DeviceId")): h for h in ctx.rows("disk_health")}
-    for did, nvme in (ctx.local.get("nvme_health") or {}).items():  # журнал NVMe дополняет счётчики Windows
-        counters = {k: v for k, v in health.get(str(did), {}).items() if v is not None}
-        health[str(did)] = dict({k: v for k, v in nvme.items() if k != "Health"}, **counters)
+    for did, nvme in (ctx.local.get("nvme_health") or {}).items():  # живой журнал NVMe точнее счётчиков Windows
+        fresh = {k: v for k, v in nvme.items() if k != "Health" and v is not None}
+        health[str(did)] = dict(health.get(str(did), {}), **fresh)
     letters_by_disk = {}
     disk_by_letter = {}
     for p in parts:
