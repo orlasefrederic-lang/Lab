@@ -24,7 +24,7 @@ import firewall  # noqa: E402
 from console import run_firewall_cli  # noqa: E402
 from firewall import (DemoFirewall, FirewallError, FirewallManager, Rule,  # noqa: E402
                       WindowsFirewall, apply_block, block_plan, check_blockable, check_services,
-                      group_rules, normalize_path, parse_output, parse_state, rule_id,
+                      clean_path, group_rules, normalize_path, parse_output, parse_state, rule_id,
                       verify_block, warnings_for)
 
 EXPLORER = r'C:\Windows\explorer.exe'
@@ -68,6 +68,17 @@ class PlanTest(unittest.TestCase):
         self.assertEqual(normalize_path(r'%NETMON_TEST_ROOT%\Explorer.EXE'), r'c:\windows\explorer.exe')
         self.assertEqual(normalize_path('"C:/X/y.exe"'), r'c:\x\y.exe')
 
+    def test_paths_are_cleaned_for_rules(self):
+        # отчёт 1.5, п. 6: в правило попадает чистый путь — тот же, что сравнивается при проверке
+        plan = block_plan('  "C:/Windows/explorer.exe"  ')
+        self.assertEqual({p['program'] for p in plan}, {EXPLORER})
+        self.assertEqual([p['id'] for p in plan], [p['id'] for p in block_plan(EXPLORER)])
+        with mock.patch.dict(os.environ, {'LOCALAPPDATA': r'C:\Users\Костя\AppData\Local'}):
+            self.assertEqual(clean_path(r'%LOCALAPPDATA%\Tool\tool.exe'),
+                             r'C:\Users\Костя\AppData\Local\Tool\tool.exe')
+            plan = block_plan(r'%LOCALAPPDATA%\Tool\tool.exe')
+            self.assertEqual(plan[0]['program'], r'C:\Users\Костя\AppData\Local\Tool\tool.exe')
+
     def test_block_plan(self):
         plan = block_plan(EXPLORER)
         self.assertEqual([p['direction'] for p in plan], ['Outbound', 'Inbound'])
@@ -80,6 +91,16 @@ class PlanTest(unittest.TestCase):
     def test_check_blockable(self):
         self.assertIsNone(check_blockable(EXPLORER, []))
         self.assertIn('ядро', check_blockable(r'C:\Windows\System32\ntoskrnl.exe', [], pid=4))
+        # отчёт 1.5, п. 6: ядро нельзя запретить и по пути, без PID (консоль, выбор файла)
+        self.assertIn('ядро', check_blockable(r'C:\Windows\System32\ntoskrnl.exe', []))
+        self.assertIn('ядро', check_blockable(r'%SystemRoot%\System32\NTOSKRNL.EXE', []))
+        # переменные окружения раскрываются до проверки; нужен путь с диском или сетевой
+        with mock.patch.dict(os.environ, {'SystemRoot': r'C:\Windows'}):
+            self.assertIsNone(check_blockable(r'%SystemRoot%\explorer.exe', []))
+        self.assertIsNone(check_blockable(r'\\server\share\app.exe', []))
+        for bad in (r'\Windows\explorer.exe', r'Windows\explorer.exe', r'%NO_SUCH_VAR_X%\app.exe',
+                    r'C:explorer.exe'):
+            self.assertIn('полный путь', check_blockable(bad, []), bad)
         self.assertIn('svchost', check_blockable(SVCHOST, []))
         self.assertIsNone(check_blockable(SVCHOST, ['BITS']))
         self.assertIsNotNone(check_blockable('', []))
@@ -313,6 +334,29 @@ class ManagerTest(unittest.TestCase):
         self.m.refresh().result()
         self.assertEqual(self.m.status(EXPLORER), ('', ''))           # правда: запрета нет
 
+    def test_status_of_services(self):
+        # отчёт 1.5, п. 7: временно разрешённая служба и служба с одним действующим правилом
+        self.m.block(SVCHOST, ['BITS']).result()
+        self.assertEqual(self.m.status(SVCHOST, 'BITS'), ('blocked', 'запрещена'))
+        self.m.set_enabled(self.m.entries, False).result()
+        self.assertEqual(self.m.status(SVCHOST, 'BITS'), ('allowed', 'запрет выключен'))
+        self.backend.set_enabled([rule_id(SVCHOST, 'BITS', 'out')], True)
+        self.m.refresh().result()
+        self.assertEqual(self.m.status(SVCHOST, 'BITS'), ('partial', 'частично: BITS'))
+        self.assertEqual(self.m.status(SVCHOST, 'BITS, wuauserv')[0], 'partial')
+        self.assertEqual(self.m.status(SVCHOST, 'wuauserv'), ('', ''))
+
+    def test_status_when_rules_were_never_read(self):
+        # отчёт 1.5, п. 7: пока правила читаются — пусто; если первое чтение не удалось —
+        # «неизвестно», а не «запрета нет»
+        self.assertEqual(self.m.status(EXPLORER), ('', ''))
+        self.backend.fail_state = True
+        self.m.refresh().result()
+        self.assertEqual(self.m.status(EXPLORER), ('unknown', 'неизвестно'))
+        self.backend.fail_state = False
+        self.m.refresh().result()
+        self.assertEqual(self.m.status(EXPLORER), ('', ''))
+
     def test_reblock_restores_missing_rules(self):
         # отчёт 1.1, R2: пока запрет был временно выключен, исходящее правило удалили снаружи
         self.m.block(EXPLORER).result()
@@ -381,6 +425,27 @@ class CliTest(unittest.TestCase):
         with contextlib.redirect_stdout(out):
             code = run_firewall_cli(backend, args)
         return code, out.getvalue()
+
+    def test_cli_paths_and_services(self):
+        # отчёт 1.5, п. 5: относительный путь не достраивается до текущей папки, а отвергается;
+        # переменные окружения раскрываются; службы можно перечислить и через пробел
+        backend = DemoFirewall(delay=0)
+        code, out = self.run_cli(backend, block='explorer.exe')
+        self.assertEqual((code, backend.rules), (1, {}))
+        self.assertIn('полный путь', out)
+        with mock.patch.dict(os.environ, {'SystemRoot': r'C:\Windows'}):
+            code, out = self.run_cli(backend, block=r'%SystemRoot%\explorer.exe')
+        self.assertEqual(code, 0, out)
+        self.assertEqual({r.program for r in backend.rules.values()}, {EXPLORER})
+        code, out = self.run_cli(backend, block=SVCHOST, service=['BITS wuauserv', 'Dnscache;W32Time'])
+        self.assertEqual(code, 0, out)
+        self.assertEqual({r.service for r in backend.rules.values() if r.service},
+                         {'BITS', 'wuauserv', 'Dnscache', 'W32Time'})
+        code, out = self.run_cli(backend, unblock='explorer.exe')
+        self.assertEqual(code, 1)
+        self.assertIn('полный путь', out)
+        code, out = self.run_cli(backend, unblock=EXPLORER.upper())
+        self.assertEqual(code, 0, out)
 
     def test_failed_update_keeps_block_in_cli(self):
         backend = ScriptedFirewall()

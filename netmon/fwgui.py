@@ -49,7 +49,7 @@ class FirewallTab:
         self.btn_pause.pack(side='left', padx=(6, 0))
         self.btn_resume = ttk.Button(bar, text='Снова запретить', command=lambda: self.set_enabled(True))
         self.btn_resume.pack(side='left', padx=(6, 0))
-        ttk.Button(bar, text='Обновить', command=self.manager.refresh).pack(side='left', padx=(6, 0))
+        ttk.Button(bar, text='Обновить', command=self.refresh).pack(side='left', padx=(6, 0))
         self.state_label = ttk.Label(bar, text='Загрузка правил…')
         self.state_label.pack(side='right')
 
@@ -108,11 +108,14 @@ class FirewallTab:
 
     def _update_buttons(self):
         selected = self._selected()
+        # когда состояние правил неизвестно, по устаревшему списку решать нельзя: доступны
+        # оба действия, а итог проверится повторным чтением правил
+        known = self.manager.state_known
         self.btn_remove.state(['!disabled'] if selected else ['disabled'])
-        self.btn_pause.state(['!disabled'] if any(e.enabled is not False for e in selected)
-                             else ['disabled'])
-        self.btn_resume.state(['!disabled'] if any(e.enabled is not True for e in selected)
-                              else ['disabled'])
+        self.btn_pause.state(['!disabled'] if selected and (
+            not known or any(e.enabled is not False for e in selected)) else ['disabled'])
+        self.btn_resume.state(['!disabled'] if selected and (
+            not known or any(e.enabled is not True for e in selected)) else ['disabled'])
 
     def _menu(self, event):
         iid = self.tree.identify_row(event.y)
@@ -144,8 +147,14 @@ class FirewallTab:
             self.manager.unblock(selected)
             self.app.watch_firewall()
 
+    def refresh(self):
+        self.manager.refresh()
+        self.app.watch_firewall()
+
     def set_enabled(self, enabled):
-        selected = [e for e in self._selected() if e.enabled is not enabled]
+        selected = self._selected()
+        if self.manager.state_known:
+            selected = [e for e in selected if e.enabled is not enabled]
         if selected:
             self.manager.set_enabled(selected, enabled)
             self.app.watch_firewall()

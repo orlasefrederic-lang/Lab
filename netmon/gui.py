@@ -303,11 +303,11 @@ class App:
             return now - value
         return None
 
-    def _endpoint_hits(self, query, now):
+    def _endpoint_hits(self, query, now, hide_lo):
         cached_query, when, hits = self._ep_hits
-        if cached_query != query or now - when > 5:
-            hits = self.model.uids_matching_endpoints(query)
-            self._ep_hits = (query, now, hits)
+        if cached_query != (query, hide_lo) or now - when > 5:
+            hits = self.model.uids_matching_endpoints(query, skip_loopback=hide_lo)
+            self._ep_hits = ((query, hide_lo), now, hits)
         return hits
 
     @staticmethod
@@ -322,7 +322,7 @@ class App:
         only_running = self.var_running.get()
         threshold = self._threshold(now)
         query = self.var_search.get().strip().lower()
-        hits = self._endpoint_hits(query, now) if query else set()
+        hits = self._endpoint_hits(query, now, hide_lo) if query else set()
 
         rates = {}
         visible = []
@@ -434,9 +434,10 @@ class App:
         if group.count == 1:
             return group.n_eps
         key = (group.key, hide_lo)
+        stamp = (group.n_eps, tuple(group.uids))   # тот же состав группы и то же число адресатов
         cached = self._group_eps_cache.get(key)
-        if cached is None or cached[0] != group.n_eps:
-            cached = (group.n_eps, self.model.distinct_endpoints(group.uids, hide_lo))
+        if cached is None or cached[0] != stamp:
+            cached = (stamp, self.model.distinct_endpoints(group.uids, hide_lo))
             self._group_eps_cache[key] = cached
         return cached[1]
 
@@ -766,6 +767,7 @@ class App:
         self.monitor.request_clear()
         self.rates = RateTracker(3.0)
         self._group_eps_cache.clear()
+        self._ep_hits = (None, 0.0, set())
         self.root.after(800, lambda: self.refresh(tick=False))
 
     # ------------------------------------------------------------ настройки

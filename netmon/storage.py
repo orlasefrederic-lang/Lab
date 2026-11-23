@@ -92,18 +92,30 @@ class Storage:
             return list(procs.values())
 
     def save(self, procs, endpoints, deleted=()):
+        """deleted: id процессов (удаляются вместе с адресатами) или
+        (id процесса, протокол, IP, порт, входящее) — один адресат.
+
+        Удаление выполняется раньше записи: адресат, который перенесли к другому процессу
+        и затем вернули, не пропадёт.
+        """
         if not procs and not endpoints and not deleted:
             return
         with self._lock, self.conn:
+            for item in deleted:
+                if isinstance(item, tuple):
+                    uid, proto, ip, port, inbound = item
+                    self.conn.execute('DELETE FROM endpoints WHERE proc_id = ? AND proto = ? AND '
+                                      'ip = ? AND port = ? AND inbound = ?',
+                                      (uid, proto, ip, port, int(inbound)))
+                else:
+                    self.conn.execute('DELETE FROM endpoints WHERE proc_id = ?', (item,))
+                    self.conn.execute('DELETE FROM processes WHERE id = ?', (item,))
             self.conn.executemany(
                 'INSERT OR REPLACE INTO processes (%s) VALUES (%s)'
                 % (', '.join(PROC_COLUMNS), ', '.join('?' * len(PROC_COLUMNS))), procs)
             self.conn.executemany(
                 'INSERT OR REPLACE INTO endpoints (%s) VALUES (%s)'
                 % (', '.join(EP_COLUMNS), ', '.join('?' * len(EP_COLUMNS))), endpoints)
-            for uid in deleted:
-                self.conn.execute('DELETE FROM endpoints WHERE proc_id = ?', (uid,))
-                self.conn.execute('DELETE FROM processes WHERE id = ?', (uid,))
 
     def purge(self, keep_days):
         """Удаляет записи старше keep_days дней. Возвращает число удалённых процессов."""

@@ -182,6 +182,26 @@ class TdhTest(unittest.TestCase):
         self.assertEqual(fields['blob'], b'abc')
         self.assertEqual(fields['tail'], 7)
 
+    def test_decode_zero_param_length(self):
+        # отчёт 1.5, п. 8: длина из другого поля равна 0 — пустое значение, а не «до нуля»
+        # и не обрыв разбора всего события
+        U8, U16, UNICODE_T, ANSI_T, BINARY = 4, 6, 1, 2, 14
+        props = [Prop('BlobLen', 0, U16, 0, 1, 0),
+                 Prop('Blob', etw.PROPERTY_PARAM_LENGTH, BINARY, 0, 1, 0),
+                 Prop('StrLen', 0, U16, 0, 1, 0),
+                 Prop('Str', etw.PROPERTY_PARAM_LENGTH, UNICODE_T, 0, 1, 2),
+                 Prop('AnsiLen', 0, U16, 0, 1, 0),
+                 Prop('Ansi', etw.PROPERTY_PARAM_LENGTH, ANSI_T, 0, 1, 4),
+                 Prop('Tail', 0, U8, 0, 1, 0)]
+        fields = decode_payload(props, struct.pack('<HHHB', 0, 0, 0, 42), 8)
+        self.assertEqual((fields['blob'], fields['str'], fields['ansi'], fields['tail']),
+                         (b'', '', '', 42))
+        data = struct.pack('<H', 2) + b'\x01\x02' + struct.pack('<H', 1) + 'я'.encode('utf-16-le') \
+            + struct.pack('<H', 2) + b'ok' + struct.pack('<B', 7)
+        fields = decode_payload(props, data, 8)
+        self.assertEqual((fields['blob'], fields['str'], fields['ansi'], fields['tail']),
+                         (b'\x01\x02', 'я', 'ok', 7))
+
     def test_decode_stops_on_truncated_data(self):
         props = [Prop('A', 0, U32, 0, 1, 0), Prop('B', 0, U64, 0, 1, 0)]
         self.assertEqual(decode_payload(props, struct.pack('<I', 5) + b'\x01', 8), {'a': 5})

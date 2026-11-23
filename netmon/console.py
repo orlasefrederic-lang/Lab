@@ -4,9 +4,9 @@ import os
 import sys
 import time
 
-from firewall import (FirewallError, apply_block, block_plan, check_blockable, describe_state,
-                      directions_label, entry_key, group_rules, normalize_path, verify_block,
-                      verify_removed, warnings_for)
+from firewall import (FirewallError, apply_block, block_plan, check_blockable, clean_path,
+                      describe_state, directions_label, entry_key, group_rules, is_full_path,
+                      normalize_path, split_services, verify_block, verify_removed, warnings_for)
 from model import Model, display_name, group_views
 from util import RateTracker, fmt_bytes, fmt_datetime, fmt_rate, fmt_time, ip_category
 from version import APP_NAME, __version__
@@ -43,12 +43,17 @@ def run_console(monitor, keep_days=None, interval=2.0, top=25, hide_lo=True):
             time.sleep(interval)
             now = time.time()
             rows = []
+            running = set()
             for v in monitor.model.view():
                 sent = v.sent - v.lo_sent if hide_lo else v.sent
                 recv = v.recv - v.lo_recv if hide_lo else v.recv
-                up, down = rates.update(v.uid, now, sent, recv) if v.ended is None else (0, 0)
+                up = down = 0
+                if v.ended is None:
+                    running.add(v.uid)
+                    up, down = rates.update(v.uid, now, sent, recv)
                 if sent or recv:
                     rows.append((up + down, sent + recv, v, sent, recv, up, down))
+            rates.forget_except(running)       # завершившиеся процессы скорость не копят
             rows.sort(key=lambda r: (r[0], r[1]), reverse=True)
             st = monitor.status()
             out = ['\x1b[2J\x1b[H',
@@ -143,11 +148,12 @@ def run_firewall_cli(backend, args):
     Логика та же, что в окне: новые правила создаются раньше, чем убираются старые,
     а итог проверяется повторным чтением правил.
     """
-    services = [s.strip() for item in args.service for s in item.replace(';', ',').split(',')
-                if s.strip()]
+    services = split_services(' '.join(args.service))
     code = 0
     if args.block:
-        path = os.path.abspath(args.block) if os.name == 'nt' else args.block
+        # путь — как есть (с переменными вроде %SystemRoot%), без достраивания до текущей
+        # папки: «explorer.exe» в текущей папке — не тот explorer.exe, который нужно запретить
+        path = clean_path(args.block)
         error = check_blockable(path, services)
         if error:
             print(error)
@@ -165,7 +171,11 @@ def run_firewall_cli(backend, args):
                                                    if services else '', directions_label(directions)),
                          {entry_key(path, s) for s in services or ['']})
     if args.unblock:
-        target = normalize_path(os.path.abspath(args.unblock) if os.name == 'nt' else args.unblock)
+        if not is_full_path(args.unblock):
+            print('Нужен полный путь к программе — как в списке --blocked, например '
+                  'C:\\Windows\\explorer.exe.')
+            return 1
+        target = normalize_path(args.unblock)
         wanted = {s.lower() for s in services}
         try:
             rules, _profiles = backend.state()

@@ -11,7 +11,7 @@ import ntpath
 import re
 import threading
 import time
-from collections import namedtuple
+from collections import deque, namedtuple
 
 from util import ip_category, ip_from_bytes, parse_dns_results
 
@@ -28,21 +28,28 @@ SPECIAL_NAMES = {0: 'Ядро (PID 0)', 4: 'System'}
 # а ядро ещё недолго отправляет данные уже завершённого процесса. Применяется, только
 # если событие не попало точно ни в чьё время жизни.
 SLACK = 0.25
-INSTANCES_PER_PID = 4  # сколько последних экземпляров с одним PID помнить
+INSTANCES_PER_PID = 8  # сколько последних экземпляров с одним PID помнить
 # Время создания процесса из Windows, время событий ETW (сеанс пишет системное время)
 # и момент, когда мы видели процесс, берутся из одних часов; допуск — только их шаг.
 CLOCK_EPS = 0.05
 # Событие ETW о запуске пишется тем же системным вызовом, что создаёт процесс: от времени
 # создания (GetProcessTimes) до него — миллисекунды. Четверть секунды — с большим запасом.
 START_LAG = 0.25
-# Время создания одного и того же процесса Windows сообщает одинаково (GetProcessTimes),
-# поэтому у записи из истории и у работающего процесса оно совпадает, а не «близко».
-SAME_CREATED = 0.001
+# «Время запуска» System и процесса простоя (PID 4 и 0) — время загрузки Windows. Его не
+# читают, а вычисляют по часам и счётчику времени работы, поэтому от запуска к запуску
+# монитора оно немного «плавает» (шаг таймера, подстройка часов). Между двумя загрузками
+# Windows проходят минуты, так что минута допуска их не спутает.
+BOOT_MATCH = 60.0
 BOUNDS_PER_PID = 8    # сколько последних запусков/остановок PID помнить в накопителе
-STOPS_PER_PID = 4     # сколько «ничьих» событий о завершении PID помнить
+STOPS_PER_PID = 16    # сколько последних событий о завершении PID помнить
 # Событие о завершении может обогнать событие о запуске и пакеты того же процесса только
 # на время доставки событий ETW (секунды); полминуты — с большим запасом.
 EARLY_STOP_WINDOW = 30.0
+# Сколько секунд (по времени событий) помнить, какому экземпляру записана каждая пачка
+# трафика. Если за это время выяснится, что PID тогда принадлежал другому процессу
+# (событие о запуске или завершении дошло позже пакетов), пачка переписывается ему.
+# Доставка событий ETW занимает до пары секунд, снимок процессов — раз в 2 с.
+RECENT_WINDOW = 10.0
 _DRIVE_PATH = re.compile(r'^[a-z]:\\')
 
 
@@ -100,7 +107,7 @@ class Proc:
                  'ended', 'first_seen', 'last_seen', 'sent', 'recv', 'lo_sent', 'lo_recv',
                  'endpoints', 'lo_eps', 'conns', 'dirty', 'dirty_eps', 'persisted',
                  'need_details', 'absent', 'accept_ports', 'own_start', 'adopted', 'etw_seen',
-                 'end_exact')
+                 'end_exact', 'end_guess', 'exit_known', 'born', 'snap_time', 'own_path')
 
     def __init__(self, uid, pid, ts):
         self.uid = uid
@@ -125,9 +132,15 @@ class Proc:
         self.absent = False
         self.accept_ports = set()   # локальные порты, на которые этот экземпляр принимал TCP
         self.own_start = None       # время события ETW о запуске, принятого за запуск экземпляра
+        self.own_path = ''          # образ (exe) из этого события
         self.adopted = frozenset()  # что взято из этого события на веру: 'path', 'started'
         self.etw_seen = None        # самое раннее событие ETW экземпляра: тогда он точно работал
-        self.end_exact = False      # ended — из события о завершении, а не догадка
+        # ended выводится в Model._settle из событий о завершении и догадок:
+        self.end_exact = False      # ended — из события о завершении (или от Windows), а не догадка
+        self.end_guess = None       # процесса уже нет (пропал из снимка, PID занят): конец не позже
+        self.exit_known = None      # время завершения, которое сообщила Windows (GetProcessTimes)
+        self.born = 0               # номер по порядку событий, когда заведена запись
+        self.snap_time = None       # когда был снимок, из которого взято snap_name
 
     @property
     def has_net(self):
@@ -201,7 +214,12 @@ class Model:
         self.listen_table = set()    # (pid, порт) — слушающие TCP-сокеты
         self.listen_known = False
         self._instances = {}         # pid -> последние экземпляры с этим PID (новые в конце)
-        self._early_stops = {}       # pid -> события о завершении, пришедшие раньше записи
+        self._stops = {}             # pid -> [(время, номер прихода)] событий о завершении
+        self._arrivals = 0           # номер прихода последнего события (поток ETW)
+        self._born_at = None         # номер прихода события, которое сейчас обрабатывается
+        self._recent = {}            # pid -> [[t0, ключ потока, значения, экземпляр, адресат]]
+        self._newest = float('-inf')  # самое позднее время среди пачек трафика
+        self._recent_count = 0
         self._conn_uids = set()      # uid процессов с ненулевым числом открытых соединений
         self.local_ips = {'127.0.0.1', '::1'}
         self._resumable = {}         # pid -> Proc из истории, который, возможно, ещё работает
@@ -234,22 +252,29 @@ class Model:
             a = self._acc.get(key)
             if a is None:
                 self._acc[key] = [size, 1, 0, 0, ts, ts] if send else [0, 0, size, 1, ts, ts]
-            elif send:
+                return
+            if send:
                 a[0] += size
                 a[1] += 1
-                a[5] = ts
             else:
                 a[2] += size
                 a[3] += 1
+            # события приходят не по порядку: храним самое раннее и самое позднее время
+            if ts < a[4]:
+                a[4] = ts
+            elif ts > a[5]:
                 a[5] = ts
 
     def _push(self, item, pid=None, boundary=None):
-        # порядок важен: накопленный трафик — раньше следующего события
+        # накопленный трафик уходит в очередь раньше следующего события; у каждого элемента
+        # очереди — номер прихода (по нему видно, что пришло раньше появления записи)
         with self._acc_lock:
             if self._acc:
-                self._queue.append(('traffic', self._acc))
+                self._arrivals += 1
+                self._queue.append(('traffic', self._acc, self._arrivals))
                 self._acc = {}
-            self._queue.append(item)
+            self._arrivals += 1
+            self._queue.append(item + (self._arrivals,))
             if boundary is not None:
                 bounds = self._bounds.get(pid)
                 if bounds is None:
@@ -269,32 +294,61 @@ class Model:
         self._push(('stop', pid, ts), pid, ts)
 
     def on_dns(self, pid, name, results, ts):
-        self._push(('dns', pid, name, results))
+        self._push(('dns', pid, name, results, ts))
 
     # ================================================ обработка (рабочий поток)
 
     def process_pending(self):
+        """Применяет накопленные события в порядке их времени.
+
+        События Kernel-Process и Kernel-Network доходят из разных буферов ETW и не по
+        порядку: пакет нового процесса часто приходит раньше события о его запуске,
+        а завершение — раньше пакетов. Внутри пачки (её собирают раз в полсекунду)
+        настоящий порядок восстанавливается по времени событий. При одинаковом времени
+        запуск идёт раньше пакетов, а завершение — позже. Что пришло в разных пачках,
+        разбирают _settle и _reconsider.
+        """
         with self._acc_lock:
             items = self._queue
             if self._acc:
-                items.append(('traffic', self._acc))
+                self._arrivals += 1
+                items.append(('traffic', self._acc, self._arrivals))
             self._queue = []
             self._acc = {}
         if not items:
             return 0
+        events = []
+        last_ts = float('-inf')
+        for n, item in enumerate(items):
+            kind = item[0]
+            if kind == 'traffic':
+                for key, value in item[1].items():
+                    events.append((value[4], 2, n, kind, (key, value), item[2]))
+                continue
+            ts = item[2] if kind in ('start', 'stop') else item[3] if kind == 'accept' else item[4]
+            if ts is None:
+                ts = last_ts          # время неизвестно — там же, где пришло
+            else:
+                last_ts = max(last_ts, ts)
+            rank = {'start': 0, 'accept': 1, 'dns': 1, 'stop': 3}[kind]
+            events.append((ts, rank, n, kind, item[1:-1], item[-1]))
+        events.sort(key=lambda e: e[:3])
         with self.lock:
-            for item in items:
-                kind = item[0]
-                if kind == 'traffic':
-                    self._apply_traffic(item[1])
-                elif kind == 'start':
-                    self._apply_start(*item[1:])
-                elif kind == 'stop':
-                    self._apply_stop(*item[1:])
-                elif kind == 'dns':
-                    self._apply_dns(*item[1:])
-                elif kind == 'accept':
-                    self._apply_accept(*item[1:])
+            try:
+                for _ts, _rank, _n, kind, args, arrival in events:
+                    self._born_at = arrival
+                    if kind == 'traffic':
+                        self._apply_flow(*args)
+                    elif kind == 'start':
+                        self._apply_start(*args)
+                    elif kind == 'stop':
+                        self._apply_stop(*args, arrival=arrival)
+                    elif kind == 'dns':
+                        self._apply_dns(*args[:3])
+                    else:
+                        self._apply_accept(*args)
+            finally:
+                self._born_at = None
         return len(items)
 
     def _ip(self, raw):
@@ -310,10 +364,11 @@ class Model:
     def _new_proc(self, pid, ts, name=None, path='', started=None):
         proc = Proc(self._next_uid, pid, ts)
         self._next_uid += 1
+        proc.born = self._arrivals if self._born_at is None else self._born_at
         if pid in SPECIAL_NAMES:
             proc.name = SPECIAL_NAMES[pid]
         else:
-            proc.name = name or self.snap_names.get(pid) or _default_name(pid)
+            self._set_name(proc, name or self.snap_names.get(pid) or _default_name(pid))
         proc.path = path or ''
         proc.started = started
         self.procs[proc.uid] = proc
@@ -321,17 +376,140 @@ class Model:
         instances = self._instances.setdefault(pid, [])
         instances.append(proc)
         del instances[:-INSTANCES_PER_PID]
-        if started is not None:
-            self._clamp_previous(proc)
-        if proc.name.lower() == 'svchost.exe':
-            self._want_services = True
+        self._settle(pid)
         return proc
 
-    def _end(self, proc, ts):
-        if proc.ended is None:
-            proc.ended = ts
+    def _insert_proc(self, pid, index, ts, name, path):
+        """Запись о процессе, который владел PID раньше уже известных (его запуск дошёл
+        позже). Текущим владельцем PID она не становится."""
+        instances = self._instances[pid]
+        if index == 0 and len(instances) >= INSTANCES_PER_PID:
+            return            # старше всех, кого помним: такую запись пришлось бы сразу забыть
+        proc = Proc(self._next_uid, pid, ts)
+        self._next_uid += 1
+        proc.born = self._arrivals if self._born_at is None else self._born_at
+        proc.name = SPECIAL_NAMES.get(pid) or name or _default_name(pid)
+        proc.path = path or ''
+        proc.started = proc.own_start = proc.etw_seen = ts
+        proc.own_path = path or ''
+        proc.need_details = False     # по PID сейчас читаются сведения другого процесса
+        self.procs[proc.uid] = proc
+        instances.insert(index, proc)
+        del instances[:-INSTANCES_PER_PID]
+        self._settle(pid)
+
+    def _set_name(self, proc, name):
+        proc.name = name
+        if name.lower() == 'svchost.exe':
+            self._want_services = True     # у svchost.exe нужно узнать службы, и поскорее
+
+    def _guess_end(self, proc, ts):
+        """Процесса уже нет (пропал из снимка, его PID занял другой процесс): он завершился
+        не позже ts. Точное время даст событие о завершении, если оно есть."""
+        if proc.end_guess is None or ts < proc.end_guess:
+            proc.end_guess = ts
+        if any(p is proc for p in self._instances.get(proc.pid, ())):
+            self._settle(proc.pid)
+        elif proc.ended is None:
+            self._set_end(proc, ts, False)
+
+    @staticmethod
+    def _set_end(proc, end, exact):
+        if proc.ended == end and proc.end_exact == exact:
+            return
+        if end is not None and proc.ended is None:
             proc.conns = 0
-            proc.dirty = True
+        proc.ended, proc.end_exact = end, exact
+        proc.dirty = True
+
+    def _alive_from(self, proc):
+        """Нижняя граница завершения экземпляра: тогда он ещё точно работал (начало жизни)."""
+        marks = [proc.first_seen - SLACK]
+        if proc.started is not None:
+            marks.append(proc.started)
+        if proc.etw_seen is not None:
+            marks.append(proc.etw_seen)
+        return max(marks)
+
+    @staticmethod
+    def _begin_of(proc):
+        """Момент, когда экземпляр уже существовал: прежний владелец PID к тому времени ушёл."""
+        if proc.started is not None:
+            return proc.started
+        if proc.etw_seen is not None:
+            return min(proc.etw_seen, proc.first_seen)
+        return proc.first_seen
+
+    def _settle(self, pid):
+        """Время завершения экземпляров PID по событиям о завершении и догадкам.
+
+        События о завершении хранятся (последние STOPS_PER_PID) и при каждом изменении
+        распределяются заново, поэтому порядок, в котором они дошли, не важен. Экземпляры
+        просматриваются от старого к новому; каждому достаётся самое раннее свободное
+        событие, которое не раньше, чем экземпляр точно работал, и не позже появления
+        следующего владельца PID (а если процесс пропал из снимка — не позже этого).
+        Событие, которого не досталось никому, — от процесса, о котором записи нет.
+        """
+        instances = self._instances.get(pid, ())
+        stops = self._stops.get(pid, ())
+        used = set()
+        for i, proc in enumerate(instances):
+            low = self._alive_from(proc)
+            high = self._begin_of(instances[i + 1]) if i + 1 < len(instances) else None
+            limit = high
+            for bound in (proc.end_guess, proc.exit_known):
+                if bound is not None:
+                    limit = bound + CLOCK_EPS if limit is None else min(limit, bound + CLOCK_EPS)
+            end = None
+            for j, (ts, seq) in enumerate(stops):
+                if j in used or ts < low:
+                    continue
+                if limit is not None and ts > limit:
+                    break
+                if seq < proc.born and ts - low > EARLY_STOP_WINDOW:
+                    continue   # пришло задолго до записи, а время намного позже её начала
+                end = ts
+                used.add(j)
+                break
+            if end is not None or proc.exit_known is not None:
+                self._set_end(proc, proc.exit_known if end is None else end, True)
+                continue
+            guess = proc.end_guess
+            if high is not None:
+                guess = high if guess is None else min(guess, high)
+            # не раньше, чем экземпляр точно работал
+            self._set_end(proc, None if guess is None else max(guess, low), False)
+        # границы жизни могли сдвинуться (и начало, и конец) — недавний трафик сверяется заново
+        if len(instances) > 1 and self._recent.get(pid):
+            self._reconsider(pid)
+
+    def _reconsider(self, pid):
+        """Недавние пачки трафика PID, которые по нынешним сведениям попали точно во время
+        жизни другого экземпляра, переписываются ему.
+
+        Так бывает, когда пакеты обработаны раньше, чем стало известно о смене владельца
+        PID: событие о запуске или завершении дошло позже, или время создания процесса
+        сообщила Windows.
+        """
+        instances = self._instances.get(pid, [])
+        for entry in self._recent.get(pid, ()):
+            t0, key, value, proc, ep_key = entry
+            owner, exact = self._instance_at(pid, t0)
+            if not exact or owner is None or owner is proc:
+                continue
+            if not any(p is proc for p in instances):
+                continue
+            # переписывается, только если это следует из того, что известно точно, а не из
+            # догадок о границах: более новый владелец к моменту пакета уже существовал,
+            # а более старый — значит, нынешний тогда ещё не существовал
+            newer = instances.index(owner) > instances.index(proc)
+            if newer and not self._begin_of(owner) < t0:
+                continue
+            if not newer and not self._begin_of(proc) > t0:
+                continue
+            self._subtract_flow(proc, ep_key, value)
+            entry[3] = owner
+            entry[4] = self._add_flow(owner, key, value, count=False)
 
     def _lifetimes(self, pid):
         """[(экземпляр, начало, конец)] для экземпляров PID в порядке появления.
@@ -392,30 +570,11 @@ class Model:
             marks.append(proc.ended)
         return max(marks)
 
-    def _clamp_previous(self, proc):
-        """Предыдущие владельцы PID завершились до запуска proc.
-
-        Уточняется только время завершения «по догадке» (процесс пропал из снимка, PID
-        занял другой процесс). Время из события о завершении не меняется, и раньше
-        момента, когда прежний процесс точно работал, его конец не ставится.
-        """
-        if proc.started is None:
-            return
-        for other in self._instances.get(proc.pid, ()):
-            if other is proc:
-                break
-            if other.ended is None or other.end_exact:
-                continue
-            end = max(proc.started, self._held_until(other))
-            if end < other.ended:
-                other.ended = end
-                other.dirty = True
-
-    @staticmethod
-    def _note_etw(proc, ts):
+    def _note_etw(self, proc, ts):
         """Событие ETW в момент ts точно относится к экземпляру: тогда он работал."""
         if proc.etw_seen is None or ts < proc.etw_seen:
             proc.etw_seen = ts
+            self._settle(proc.pid)
 
     def _proc_at(self, pid, ts, etw=False):
         """Экземпляр, которому принадлежит событие; при необходимости создаёт новый.
@@ -431,8 +590,6 @@ class Model:
             # PID свободен или его прежний владелец уже завершился: это новый процесс,
             # о запуске которого мы ещё не знаем. Запись заводит само это событие
             proc, exact = self._new_proc(pid, ts), True
-            if etw:
-                self._take_early_stop(proc, ts)
         if etw and exact:
             self._note_etw(proc, ts)
         return proc
@@ -519,87 +676,55 @@ class Model:
             if self._own_start(proc, instances[i - 1] if i else None, ts, path):
                 # путь и время запуска берутся из события, только если точных сведений
                 # (из GetProcessTimes) нет; более поздний подходящий запуск их заменит
-                proc.own_start = ts
+                replaced, replaced_path = proc.own_start, proc.own_path
+                proc.own_start, proc.own_path = ts, path
                 if path and (not proc.path or 'path' in proc.adopted):
-                    proc.path, proc.name = path, name
+                    proc.path = path
+                    self._set_name(proc, name)
                     proc.adopted |= {'path'}
                     proc.dirty = True
                 if proc.started is None or 'started' in proc.adopted:
                     proc.started = ts
                     proc.adopted |= {'started'}
                     proc.dirty = True
-                    self._clamp_previous(proc)
+                self._settle(pid)
+                if replaced is not None:
+                    # прежний «свой» запуск оказался запуском процесса, который владел PID
+                    # раньше: о нём заводится отдельная запись
+                    self._insert_proc(pid, instances.index(proc), replaced,
+                                      ntpath.basename(replaced_path) or None, replaced_path)
                 return
             if self._began_before(proc, ts):
                 if i < last:
-                    return   # процесс жил между двумя известными экземплярами; записи о нём нет
+                    # процесс жил между двумя известными экземплярами: его запуск дошёл позже
+                    # запуска следующего. Запись о нём встаёт на своё место
+                    self._insert_proc(pid, i + 1, ts, name, path)
+                    return
                 break        # процесс новее всех известных
         else:
             if instances:
-                return       # запоздавший запуск того, кто владел PID до всех известных
+                # запоздавший запуск того, кто владел PID раньше всех известных
+                self._insert_proc(pid, 0, ts, name, path)
+                return
         cur = self.by_pid.get(pid)
         if cur is not None:
-            # PID уже у нового процесса: прежний завершился, а событие об этом
-            # потеряно или ещё не дошло (если уже дошло, время завершения не меняется)
-            self._end(cur, ts)
+            # PID уже у нового процесса: прежний завершился не позже, а событие об этом
+            # потеряно или ещё не дошло
+            self._guess_end(cur, ts)
         proc = self._new_proc(pid, ts, name=name, path=path, started=ts)
         proc.own_start = proc.etw_seen = ts     # запись заведена самим событием о запуске
-        self._take_early_stop(proc, ts)
+        proc.own_path = path
+        self._settle(pid)
 
-    def _apply_stop(self, pid, ts):
-        """Событие ETW о завершении: чьё оно?
-
-        Завершиться мог только экземпляр, который в момент ts уже работал и у которого
-        события о завершении ещё не было. Экземпляры просматриваются от нового к старому.
-        """
-        instances = self._instances.get(pid, ())
-        for i in range(len(instances) - 1, -1, -1):
-            proc = instances[i]
-            prev = instances[i - 1] if i else None
-            if proc.started is not None:
-                if proc.started > ts:
-                    continue      # запущен позже этого события
-            elif proc.etw_seen is not None and proc.etw_seen > ts:
-                continue          # событие ETW от него было позже: в момент ts он не завершался
-            elif proc.first_seen > ts + SLACK:
-                continue          # увидели заметно позже
-            elif prev is not None and (ts < self._held_until(prev) or (
-                    proc.first_seen > ts and prev.ended is not None and not prev.end_exact
-                    and prev.ended >= ts)):
-                # PID тогда был ещё у предыдущего владельца; либо предыдущий уже считается
-                # завершённым «по догадке», а этот экземпляр увидели после ts — событие
-                # уточняет конец предыдущего, а не завершает нового
-                continue
-            if not proc.end_exact and (proc.ended is None or ts <= proc.ended):
-                self._end_exactly(proc, ts)
-                return
-            break                 # у этого экземпляра событие о завершении уже было
-        # Записи о завершившемся процессе ещё нет: у короткоживущих процессов событие
-        # о завершении иногда приходит раньше события о запуске и пакетов. Запоминаем его
-        if len(self._early_stops) > 10000:
-            self._early_stops.clear()
-        stops = self._early_stops.setdefault(pid, [])
-        bisect.insort(stops, ts)
+    def _apply_stop(self, pid, ts, arrival=None):
+        """Событие ETW о завершении. Чьё оно, решает _settle: события о завершении PID
+        хранятся и распределяются между экземплярами заново при каждом изменении."""
+        if len(self._stops) > 10000:
+            self._stops = {p: v for p, v in self._stops.items() if p in self._instances}
+        stops = self._stops.setdefault(pid, [])
+        bisect.insort(stops, (ts, self._arrivals if arrival is None else arrival))
         del stops[:-STOPS_PER_PID]
-
-    def _end_exactly(self, proc, ts):
-        """Время завершения из события о завершении: оно точнее, чем время из догадок."""
-        proc.ended = ts
-        proc.end_exact = True
-        proc.conns = 0
-        proc.dirty = True
-
-    def _take_early_stop(self, proc, since):
-        """Запись только что заведена событием ETW в момент since. Если событие о завершении
-        этого процесса пришло раньше неё, это первое завершение не раньше since."""
-        stops = self._early_stops.get(proc.pid)
-        if not stops:
-            return
-        i = bisect.bisect_left(stops, since)
-        if i < len(stops) and stops[i] - since <= EARLY_STOP_WINDOW:
-            self._end_exactly(proc, stops.pop(i))
-        if not stops:
-            del self._early_stops[proc.pid]
+        self._settle(pid)
 
     def _apply_accept(self, pid, port, ts):
         proc = self._proc_at(pid, time.time() if ts is None else ts, ts is not None)
@@ -643,37 +768,105 @@ class Model:
             proc.dirty_eps.add(key)
         return ep
 
-    def _apply_traffic(self, acc):
-        local = self.local_ips
-        for (pid, _life, proto, daddr, dport, saddr, sport), (s, ps, r, pr, t0, t1) in acc.items():
-            proc = self._proc_at(pid, t0, True)
-            # адреса уже приведены к виду «daddr — удалённый, saddr — наш» (см. etw.py)
-            rip, lip = self._ip(daddr), self._ip(saddr)
-            rport, lport = _port(dport), _port(sport)
-            lcat = ip_category(lip)
-            if lcat in ('multicast', 'broadcast'):
-                if rip in local:
-                    # наша же групповая рассылка вернулась к нам: показываем группу
-                    rip, lip, rport, lport = lip, rip, lport, rport
-            elif lcat != 'unspecified':
-                local.add(lip)               # адрес нашего сокета — значит, наш адрес
-            ep = self._endpoint(proc, proto, rip, rport, lport, t0)
-            ep.sent += s
-            ep.recv += r
-            ep.psent += ps
-            ep.precv += pr
-            if t1 > ep.last:
-                ep.last = t1
-            proc.sent += s
-            proc.recv += r
-            if ip_category(rip) == 'loopback':
-                proc.lo_sent += s
-                proc.lo_recv += r
-            if t1 > proc.last_seen:
-                proc.last_seen = t1
-            proc.dirty = True
-            proc.dirty_eps.add(ep.key)
+    def _apply_flow(self, key, value):
+        """Накопленные пакеты одного потока: (PID, «жизнь», протокол, адреса, порты)."""
+        pid = key[0]
+        proc = self._proc_at(pid, value[4], True)
+        ep_key = self._add_flow(proc, key, value)
+        self._remember(key, value, proc, ep_key)
+
+    def _remember(self, key, value, proc, ep_key):
+        """Запомнить, кому записана пачка: её ещё можно переписать (см. RECENT_WINDOW)."""
+        pid, t0, t1 = key[0], value[4], value[5]
+        if t1 > self._newest:
+            self._newest = t1
+        cutoff = self._newest - RECENT_WINDOW
+        entries = self._recent.get(pid)
+        if entries is None:
+            entries = self._recent[pid] = deque()
+        entries.append([t0, key, value, proc, ep_key])
+        while entries and entries[0][2][5] < cutoff:
+            entries.popleft()            # пачки идут почти по порядку: устаревшие — в начале
+        self._recent_count += 1
+        if self._recent_count % 5000 == 0:
+            for other in list(self._recent):
+                kept = deque(e for e in self._recent[other] if e[2][5] >= cutoff)
+                if kept:
+                    self._recent[other] = kept
+                else:
+                    del self._recent[other]
+
+    def _subtract_flow(self, proc, ep_key, value):
+        """Убрать пачку трафика из экземпляра (она переписывается другому)."""
+        s, ps, r, pr, _t0, t1 = value
+        ep = proc.endpoints.get(ep_key)
+        if ep is None:
+            return
+        lo = ip_category(ep.ip) == 'loopback'
+        ep.sent -= s
+        ep.recv -= r
+        ep.psent -= ps
+        ep.precv -= pr
+        proc.sent -= s
+        proc.recv -= r
+        if lo:
+            proc.lo_sent -= s
+            proc.lo_recv -= r
+        proc.dirty = True
+        if ep.sent or ep.recv or ep.psent or ep.precv or ep.conns:
+            proc.dirty_eps.add(ep_key)
+        else:
+            # других пакетов у адресата не было: его не было и у процесса
+            del proc.endpoints[ep_key]
+            proc.dirty_eps.discard(ep_key)
+            if lo:
+                proc.lo_eps -= 1
+            lst = self._ep_index.get(ep.ip, [])
+            lst[:] = [item for item in lst if item[1] is not ep]
+            if proc.persisted:
+                if proc.has_net:
+                    self._deleted.append((proc.uid,) + ep_key)    # строка адресата в истории
+                else:
+                    self._deleted.append(proc.uid)                # без сети в истории не нужен
+                    proc.persisted = False
+        if t1 >= proc.last_seen:
+            proc.last_seen = max([proc.first_seen] + [e.last for e in proc.endpoints.values()])
+
+    def _add_flow(self, proc, key, value, count=True):
+        """Добавить пачку трафика к экземпляру. Возвращает ключ адресата."""
+        _pid, _life, proto, daddr, dport, saddr, sport = key
+        s, ps, r, pr, t0, t1 = value
+        # адреса уже приведены к виду «daddr — удалённый, saddr — наш» (см. etw.py)
+        rip, lip = self._ip(daddr), self._ip(saddr)
+        rport, lport = _port(dport), _port(sport)
+        lcat = ip_category(lip)
+        if lcat in ('multicast', 'broadcast'):
+            if rip in self.local_ips:
+                # наша же групповая рассылка вернулась к нам: показываем группу
+                rip, lip, rport, lport = lip, rip, lport, rport
+        elif lcat != 'unspecified':
+            self.local_ips.add(lip)          # адрес нашего сокета — значит, наш адрес
+        ep = self._endpoint(proc, proto, rip, rport, lport, t0)
+        ep.sent += s
+        ep.recv += r
+        ep.psent += ps
+        ep.precv += pr
+        if t0 < ep.first:
+            ep.first = t0
+        if t1 > ep.last:
+            ep.last = t1
+        proc.sent += s
+        proc.recv += r
+        if ip_category(rip) == 'loopback':
+            proc.lo_sent += s
+            proc.lo_recv += r
+        if t1 > proc.last_seen:
+            proc.last_seen = t1
+        proc.dirty = True
+        proc.dirty_eps.add(ep.key)
+        if count:
             self.total_events += ps + pr
+        return ep.key
 
     def _apply_dns(self, pid, name, results):
         name = name.strip().rstrip('.').lower()
@@ -714,10 +907,10 @@ class Model:
             return   # пустой снимок — сбой чтения списка процессов, а не «всё завершилось»
         with self.lock:
             self.snap_names = {pid: item[0] for pid, item in snapshot.items()}
-            for pid, proc in self.by_pid.items():
+            for pid, proc in list(self.by_pid.items()):
                 if pid not in snapshot:
                     proc.absent = True
-                    self._end(proc, now)
+                    self._guess_end(proc, now)
             for pid, item in snapshot.items():
                 name = item[0]
                 proc = self.by_pid.get(pid)
@@ -731,12 +924,15 @@ class Model:
                      known.lower() != name.lower()))
                 if proc is None or reused:
                     if proc is not None:
-                        self._end(proc, now)
+                        self._guess_end(proc, now)
                     proc = self._new_proc(pid, now, name=name)
-                if proc.snap_name is None:
+                if proc.snap_name is None and proc.ended is None:
+                    # имя из снимка — только работающей записи: у завершившейся в снимке может
+                    # быть уже следующий владелец PID, а по имени сверяется, чей это запуск
                     proc.snap_name = name
+                    proc.snap_time = now
                     if proc.name.startswith('PID ') and name:
-                        proc.name = name
+                        self._set_name(proc, name)
             for pid in [pid for pid in self._resumable if pid not in snapshot]:
                 self._finalize(self._resumable.pop(pid))
 
@@ -790,13 +986,18 @@ class Model:
             self._conn_uids = conn_uids
 
     def set_services(self, mapping):
-        """mapping: {pid: [имена служб]}."""
+        """mapping: {pid: [имена служб, работающих сейчас]}.
+
+        Службы, которые за время жизни процесса остановились, из записи не убираются:
+        трафик, который они успели передать, тоже записан на этот процесс.
+        """
         with self.lock:
             self._want_services = False
             for pid, names in mapping.items():
                 proc = self.by_pid.get(pid)
                 if proc is not None and proc.ended is None:
-                    text = ', '.join(sorted(names))
+                    known = set(proc.services.split(', ')) if proc.services else set()
+                    text = ', '.join(sorted(known | set(names)))
                     if text != proc.services:
                         proc.services = text
                         proc.dirty = True
@@ -841,11 +1042,17 @@ class Model:
 
         Пока монитор был закрыт, PID мог достаться другой программе, в том числе с тем же
         именем файла, или тому же exe, запущенному заново. Поэтому нужны то же время
-        создания и тот же exe: полный путь, если он известен у обоих, иначе имя файла.
+        создания (с точностью до START_LAG) и тот же exe: полный путь, если он известен
+        у обоих, иначе имя файла. У System и процесса простоя — та же загрузка Windows.
         """
         if not (proc.started and cand.started):
             return False
-        if abs(proc.started - cand.started) > SAME_CREATED:
+        if proc.pid in SPECIAL_NAMES:
+            # время загрузки Windows: в пределах одной загрузки — то же самое
+            return abs(proc.started - cand.started) <= BOOT_MATCH
+        # время из GetProcessTimes совпадает точно; если в прошлый раз запись получила время
+        # из события ETW о запуске, оно позже времени создания на миллисекунды
+        if abs(proc.started - cand.started) > START_LAG:
             return False
         old_key, new_key = _path_key(cand.path), _path_key(proc.path)
         if old_key and new_key:
@@ -872,10 +1079,20 @@ class Model:
                 return
             if info is not None and not self._same_instance(proc, info):
                 # PID уже принадлежит другому процессу: прежний завершился до его запуска
-                ends = [t for t in (info.get('started'), proc.last_seen, proc.started) if t]
-                self._end(proc, max(ends) if ends else now)
-                proc = self._new_proc(proc.pid, now)
+                old = proc
+                ends = [t for t in (info.get('started'), old.last_seen, old.started) if t]
+                self._guess_end(old, max(ends) if ends else now)
+                proc = self._new_proc(old.pid, now)
                 proc.need_details = False
+                created = info.get('started')
+                if (old.snap_name and old.snap_time is not None and created is not None
+                        and created <= old.snap_time):
+                    # снимок, давший прежней записи имя, сделан уже при новом процессе:
+                    # это имя нового процесса
+                    proc.snap_name, proc.snap_time = old.snap_name, old.snap_time
+                    if not old.path and old.name == old.snap_name:
+                        old.name = _default_name(old.pid)
+                    old.snap_name = old.snap_time = None
             cand = self._resumable.pop(proc.pid, None)
             if info is None:
                 if cand is not None:
@@ -885,16 +1102,15 @@ class Model:
                 proc.path = self.nt_path(info['path'])
                 proc.adopted -= {'path'}       # теперь путь известен точно
                 if proc.pid not in SPECIAL_NAMES:
-                    proc.name = ntpath.basename(proc.path) or proc.name
+                    self._set_name(proc, ntpath.basename(proc.path) or proc.name)
             if info.get('started'):
                 proc.started = info['started']
                 proc.adopted -= {'started'}
-                self._clamp_previous(proc)
             if info.get('cmdline'):
                 proc.cmdline = info['cmdline']
             if info.get('exited'):
-                self._end(proc, info['exited'])
-                proc.end_exact = True      # время завершения сообщила сама Windows
+                proc.exit_known = info['exited']   # время завершения сообщила сама Windows
+            self._settle(proc.pid)
             proc.dirty = True
             if cand is not None:
                 if self._continues(cand, proc):
@@ -934,6 +1150,9 @@ class Model:
                     self._ep_index.setdefault(ep.ip, []).append((proc, ep))
                     if ip_category(ep.ip) == 'loopback':
                         proc.lo_eps += 1
+                    if ep.inbound and ep.proto == 'TCP':
+                        # если процесс продолжится, его принятые соединения — по-прежнему входящие
+                        proc.accept_ports.add(ep.port)
                 if proc.ended is None:
                     # на момент прошлого выхода процесс работал — может, работает и сейчас
                     proc.ended = proc.last_seen
@@ -960,8 +1179,12 @@ class Model:
         """Процесс из истории всё ещё работает: продолжаем его старую запись."""
         cand.ended = None
         cand.end_exact = False
+        cand.end_guess = new.end_guess
+        cand.exit_known = new.exit_known
+        cand.born = new.born
+        cand.started = new.started or cand.started     # точное время от Windows
         cand.absent = False
-        cand.own_start = new.own_start
+        cand.own_start, cand.own_path = new.own_start, new.own_path
         cand.adopted = frozenset()
         cand.etw_seen = new.etw_seen
         cand.snap_name = new.snap_name
@@ -1002,8 +1225,12 @@ class Model:
         cand.accept_ports |= new.accept_ports
         instances = self._instances.get(new.pid, [])
         instances[:] = [cand if p is new else p for p in instances]
+        for entry in self._recent.get(new.pid, ()):
+            if entry[3] is new:
+                entry[3] = cand
         cand.dirty = True
         self.by_pid[new.pid] = cand
+        self._settle(new.pid)
         del self.procs[new.uid]
         if new.persisted:
             self._deleted.append(new.uid)
@@ -1055,7 +1282,9 @@ class Model:
             self._resumable.clear()
             self._open_eps.clear()
             self._instances.clear()
-            self._early_stops.clear()
+            self._stops.clear()
+            self._recent.clear()
+            self._newest = float('-inf')
             self._conn_uids.clear()
             self._deleted = []
             self.total_events = 0
@@ -1110,12 +1339,17 @@ class Model:
                         keys.add(key)
         return len(keys)
 
-    def uids_matching_endpoints(self, text):
-        """uid процессов, у которых адрес или имя хоста содержит text."""
+    def uids_matching_endpoints(self, text, skip_loopback=False):
+        """uid процессов, у которых адрес или имя хоста содержит text.
+
+        skip_loopback: обмен внутри компьютера не показывается — по нему и не ищем.
+        """
         text = text.lower()
         found = set()
         with self.lock:
             for ip, items in self._ep_index.items():
+                if skip_loopback and ip_category(ip) == 'loopback':
+                    continue
                 ip_hit = text in ip
                 for proc, ep in items:
                     if ip_hit or (ep.host and text in ep.host.lower()):

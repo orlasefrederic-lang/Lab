@@ -19,6 +19,7 @@ from util import RateTracker, fmt_bytes, ip_category, parse_dns_results  # noqa:
 from winapi import parse_tcp_table_v4, parse_tcp_table_v6  # noqa: E402
 
 LOCAL = '192.168.1.5'
+SVCHOST = 'C:\\Windows\\System32\\svchost.exe'
 
 
 def v4(ip):
@@ -109,6 +110,16 @@ class TrafficTest(unittest.TestCase):
         self.m.process_pending()
         p = proc_by_pid(self.m, 400)
         self.assertEqual((p.sent, p.lo_sent, p.lo_eps), (1010, 1000, 1))
+
+    def test_search_by_address_respects_localhost_filter(self):
+        # отчёт 1.5, п. 9: когда обмен внутри компьютера скрыт, поиск по нему не находит процесс
+        traffic(self.m, 10, '127.0.0.1', 8080, 50000, sent=5, local='127.0.0.1')
+        traffic(self.m, 11, '93.184.215.14', 443, 50001, sent=5)
+        self.m.process_pending()
+        uid10, uid11 = proc_by_pid(self.m, 10).uid, proc_by_pid(self.m, 11).uid
+        self.assertEqual(self.m.uids_matching_endpoints('127.0.0'), {uid10})
+        self.assertEqual(self.m.uids_matching_endpoints('127.0.0', skip_loopback=True), set())
+        self.assertEqual(self.m.uids_matching_endpoints('93.184', skip_loopback=True), {uid11})
 
     def test_dns_names(self):
         self.m.on_dns(500, 'GitHub.com.', 'type:  5 x.net;::ffff:140.82.121.4;', 0)
@@ -592,37 +603,74 @@ class LifecycleTest(unittest.TestCase):
             m.on_process_start(100, 10.015, path)
             traffic(m, 100, '1.1.1.1', 443, 50000, sent=9, ts=10.03)
             m.process_pending()
-            self.assertEqual([(p.path, p.started, p.ended, p.sent) for p in m.procs.values()],
-                             [(path, 10.01, None, 19)], old_path)
+            current = proc_by_pid(m, 100)
+            self.assertEqual((current.path, current.started, current.ended, current.sent),
+                             (path, 10.01, None, 19), old_path)
+            # прежний владелец PID получил свою запись (без сети) и завершился до текущего
+            others = [(p.path, p.started, p.ended, p.sent) for p in m.procs.values()
+                      if p is not current]
+            self.assertEqual(others, [(old_path, 10.0, 10.01, 0)], old_path)
 
     def test_latest_matching_start_wins(self):
-        # запись создана пакетом; дошли два запоздавших запуска: прежнего владельца PID
-        # и самого процесса. Своим считается более поздний, путь и время берутся из него
+        # запись создана пакетом (в прошлой пачке событий); потом дошли два запоздавших
+        # запуска: прежнего владельца PID и самого процесса. Своим считается более поздний,
+        # путь и время берутся из него
+        traffic(self.m, 100, '1.1.1.1', 443, 50000, sent=10, ts=10.025)
+        self.m.process_pending()
+        self.m.on_process_start(100, 10.0, 'C:\\Old\\app.exe')
+        self.m.on_process_start(100, 10.015, 'C:\\New\\app.exe')
+        traffic(self.m, 100, '1.1.1.1', 443, 50000, sent=9, ts=10.03)
+        self.m.process_pending()
+        p = proc_by_pid(self.m, 100)
+        self.assertEqual((p.path, p.name, p.started, p.ended, p.sent),
+                         ('C:\\New\\app.exe', 'app.exe', 10.015, None, 19))
+        # вытесненный запуск — прежнего владельца PID: у него отдельная запись без сети
+        self.assertEqual(sorted((q.path, q.started, q.ended, q.sent) for q in self.m.procs.values()),
+                         [('C:\\New\\app.exe', 10.015, None, 19),
+                          ('C:\\Old\\app.exe', 10.0, 10.015, 0)])
+        self.m.on_process_start(100, 10.005, 'C:\\Older\\app.exe')     # ещё более ранний — не его
+        self.m.process_pending()
+        self.assertEqual((p.path, p.started, p.sent), ('C:\\New\\app.exe', 10.015, 19))
+        self.assertEqual(sorted((q.path, q.started, q.ended, q.sent) for q in self.m.procs.values()),
+                         [('C:\\New\\app.exe', 10.015, None, 19),
+                          ('C:\\Old\\app.exe', 10.0, 10.005, 0),
+                          ('C:\\Older\\app.exe', 10.005, 10.015, 0)])
+
+    def test_events_of_one_batch_are_applied_in_time_order(self):
+        # те же события, но все в одной пачке: по времени это запуск Old.exe, запуск New.exe
+        # и пакеты. Значит, Old.exe — прежний владелец PID (без сети), пакеты — New.exe
         traffic(self.m, 100, '1.1.1.1', 443, 50000, sent=10, ts=10.025)
         self.m.on_process_start(100, 10.0, 'C:\\Old\\app.exe')
         self.m.on_process_start(100, 10.015, 'C:\\New\\app.exe')
         traffic(self.m, 100, '1.1.1.1', 443, 50000, sent=9, ts=10.03)
         self.m.process_pending()
-        (p,) = self.m.procs.values()
-        self.assertEqual((p.path, p.name, p.started, p.ended, p.sent),
-                         ('C:\\New\\app.exe', 'app.exe', 10.015, None, 19))
-        self.m.on_process_start(100, 10.005, 'C:\\Older\\app.exe')     # ещё более ранний — не его
-        self.m.process_pending()
-        self.assertEqual((len(self.m.procs), p.path, p.started), (1, 'C:\\New\\app.exe', 10.015))
+        self.assertEqual(sorted((p.path, p.started, p.ended, p.sent) for p in self.m.procs.values()),
+                         [('C:\\New\\app.exe', 10.015, None, 19),
+                          ('C:\\Old\\app.exe', 10.0, 10.015, 0)])
 
-    def test_start_earlier_than_accepted_one_is_ignored(self):
-        # запись из снимка (10.0) уже приняла запуск в 10.04; запуск в 10.02 дошёл позже —
-        # это прежний владелец PID: запись не завершается, новая не создаётся
-        self.m.sync_processes({100: ('app.exe', 1)}, now=10.0)
-        self.m.on_process_start(100, 10.04, 'C:\\app.exe')
-        self.m.on_process_start(100, 10.02, 'C:\\app.exe')
-        self.m.process_pending()
-        self.assertEqual([(p.started, p.ended) for p in self.m.procs.values()], [(10.04, None)])
+    def test_earlier_of_two_matching_starts_is_previous_owner(self):
+        # запись из снимка (10.0) приняла запуск в 10.04; запуск в 10.02 дошёл позже (или в той
+        # же пачке). Запусков два — значит, и процессов два: запись остаётся работающей
+        # с запуском 10.04, а запуск 10.02 — прежнего владельца PID (своя запись без сети)
+        for separate in (True, False):
+            m = self._fresh()
+            m.sync_processes({100: ('app.exe', 1)}, now=10.0)
+            current = proc_by_pid(m, 100)
+            m.on_process_start(100, 10.04, 'C:\\app.exe')
+            if separate:
+                m.process_pending()
+            m.on_process_start(100, 10.02, 'C:\\app.exe')
+            m.process_pending()
+            self.assertIs(proc_by_pid(m, 100), current, separate)
+            self.assertEqual(sorted((p.started, p.ended, p.path) for p in m.procs.values()),
+                             [(10.02, 10.04, 'C:\\app.exe'), (10.04, None, 'C:\\app.exe')],
+                             separate)
 
     def test_path_taken_from_late_start_is_corrected_by_details(self):
         # путь из запоздавшего запуска взят на веру (он мог быть от прежнего владельца PID);
         # точные сведения от Windows его исправляют, а не считаются чужими
         traffic(self.m, 100, '1.1.1.1', 443, 50000, sent=10, ts=10.025)
+        self.m.process_pending()
         self.m.on_process_start(100, 10.0, 'C:\\Old\\app.exe')
         self.m.process_pending()
         (p,) = self.m.procs.values()
@@ -630,6 +678,19 @@ class LifecycleTest(unittest.TestCase):
         self.m.fill_details(p.uid, {'path': 'C:\\New\\app.exe', 'started': 10.012}, now=10.5)
         self.assertEqual([(q.path, q.started, q.sent) for q in self.m.procs.values()],
                          [('C:\\New\\app.exe', 10.012, 10)])
+
+    def test_traffic_moves_to_owner_revealed_by_details(self):
+        # запуск Old.exe и пакет пришли в одной пачке: пакет сначала достался Old.exe.
+        # Windows сообщает, что PID сейчас у New.exe, созданного в 10.012, — раньше пакета.
+        # Адресат, впервые замеченный уже при New.exe, переходит к нему
+        traffic(self.m, 100, '1.1.1.1', 443, 50000, sent=10, ts=10.025)
+        self.m.on_process_start(100, 10.0, 'C:\\Old\\app.exe')
+        self.m.process_pending()
+        old = proc_by_pid(self.m, 100)
+        self.m.fill_details(old.uid, {'path': 'C:\\New\\app.exe', 'started': 10.012}, now=10.5)
+        self.assertEqual(sorted((p.path, p.started, p.ended, p.sent) for p in self.m.procs.values()),
+                         [('C:\\New\\app.exe', 10.012, None, 10),
+                          ('C:\\Old\\app.exe', 10.0, 10.012, 0)])
 
     def test_record_from_snapshot_does_not_absorb_next_start(self):
         # отчёт 1.4, V14-3: запись из снимка, от процесса уже был пакет. Следующий запуск
@@ -748,12 +809,134 @@ class LifecycleTest(unittest.TestCase):
         m.process_pending()
         self.assertEqual([(p.started, p.ended) for p in m.procs.values()], [(8.0, None)])
 
-    def test_second_stop_event_does_not_move_known_end(self):
+    def test_process_ends_at_first_stop_after_its_start(self):
+        # процесс запущен в 1.0; событий о завершении два — в 2.0 и в 3.0. В 2.0 PID ещё был
+        # у него (или у того, кто занял PID после него), значит, он завершился не позже 2.0;
+        # событие в 3.0 — от процесса, о котором записи нет. Порядок прихода не важен,
+        # и в одной пачке, и в разных
+        for stops in ((3.0, 2.0), (2.0, 3.0)):
+            for separate in (False, True):
+                m = self._fresh()
+                m.on_process_start(100, 1.0, 'C:\\old.exe')
+                for ts in stops:
+                    m.on_process_stop(100, ts)
+                    if separate:
+                        m.process_pending()
+                m.process_pending()
+                self.assertEqual(proc_by_pid(m, 100).ended, 2.0, (stops, separate))
+
+    def test_stop_events_are_shared_out_in_any_order(self):
+        # отчёт 1.5, п. 1: p1 работал 10–11, p2 с тем же PID — 12–13. Событие о завершении p2
+        # пришло раньше запуска p2 и завершения p1 (или раньше запуска p1). Каждый получает своё
+        orders = (
+            [('start', 10.0, 'C:\\p1.exe'), ('stop', 13.0), ('start', 12.0, 'C:\\p2.exe'), ('stop', 11.0)],
+            [('stop', 13.0), ('start', 10.0, 'C:\\p1.exe'), ('stop', 11.0), ('start', 12.0, 'C:\\p2.exe')],
+            [('stop', 13.0), ('stop', 11.0), ('start', 12.0, 'C:\\p2.exe'), ('start', 10.0, 'C:\\p1.exe')],
+        )
+        for order in orders:
+            for separate in (False, True):
+                m = self._fresh()
+                for event in order:
+                    if event[0] == 'start':
+                        m.on_process_start(100, event[1], event[2])
+                    else:
+                        m.on_process_stop(100, event[1])
+                    if separate:
+                        m.process_pending()
+                m.process_pending()
+                self.assertEqual(sorted((p.name, p.started, p.ended) for p in m.procs.values()),
+                                 [('p1.exe', 10.0, 11.0), ('p2.exe', 12.0, 13.0)], (order, separate))
+
+    def test_traffic_before_lifecycle_events_in_one_batch(self):
+        # отчёт 1.5, п. 3: пакеты старого (10.0) и нового (15.0) процесса пришли раньше
+        # событий о завершении старого (11.0) и запуске нового (12.0) в той же пачке
         self.m.on_process_start(100, 1.0, 'C:\\old.exe')
-        self.m.on_process_stop(100, 3.0)
-        self.m.on_process_stop(100, 2.0)
+        traffic(self.m, 100, '1.1.1.1', 443, 50000, sent=10, ts=10.0)
+        traffic(self.m, 100, '2.2.2.2', 443, 50001, sent=25, ts=15.0)
+        self.m.on_process_stop(100, 11.0)
+        self.m.on_process_start(100, 12.0, 'C:\\new.exe')
         self.m.process_pending()
-        self.assertEqual(proc_by_pid(self.m, 100).ended, 3.0)
+        self.assertEqual({p.name: p.sent for p in self.m.procs.values()},
+                         {'old.exe': 10, 'new.exe': 25})
+
+    def test_late_start_moves_traffic_of_same_address(self):
+        # пакет нового процесса к тому же адресату, что и у прежнего, пришёл раньше событий
+        # о смене владельца PID (в другой пачке): он переходит к новому
+        self.m.on_process_start(100, 1.0, 'C:\\old.exe')
+        traffic(self.m, 100, '1.1.1.1', 443, 50000, sent=10, ts=2.0)
+        self.m.process_pending()
+        traffic(self.m, 100, '1.1.1.1', 443, 50001, sent=25, ts=3.3)
+        self.m.process_pending()
+        self.m.on_process_stop(100, 3.0)
+        self.m.on_process_start(100, 3.2, 'C:\\new.exe')
+        self.m.process_pending()
+        self.assertEqual({p.name: p.sent for p in self.m.procs.values()},
+                         {'old.exe': 10, 'new.exe': 25})
+        old = [p for p in self.m.procs.values() if p.name == 'old.exe'][0]
+        self.assertEqual(old.endpoints[('TCP', '1.1.1.1', 443, False)].sent, 10)
+
+    def test_out_of_order_packets_keep_first_and_last_time(self):
+        # отчёт 1.5, п. 3: пакеты одного потока не по порядку
+        for ts, size in ((10.0, 10), (20.0, 20), (5.0, 5)):
+            traffic(self.m, 100, '1.1.1.1', 443, 50000, sent=size, ts=ts)
+        self.m.process_pending()
+        ep = proc_by_pid(self.m, 100).endpoints[('TCP', '1.1.1.1', 443, False)]
+        self.assertEqual((ep.first, ep.last, ep.sent), (5.0, 20.0, 35))
+        traffic(self.m, 100, '1.1.1.1', 443, 50000, sent=1, ts=4.0)      # ещё раньше, другая пачка
+        self.m.process_pending()
+        self.assertEqual((ep.first, ep.last), (4.0, 20.0))
+
+    def test_snapshot_name_is_not_given_to_ended_record(self):
+        # процесс известен только по пакетам и уже завершился; снимок показывает следующего
+        # владельца PID. Его имя не мешает потом узнать собственный запуск процесса
+        traffic(self.m, 100, '1.1.1.1', 443, 50000, sent=10, ts=10.2)
+        self.m.on_process_stop(100, 10.5)
+        self.m.process_pending()
+        self.m.sync_processes({100: ('tool.exe', 1)}, now=11.0)
+        old = [p for p in self.m.procs.values() if p.sent == 10][0]
+        self.assertEqual((old.name, old.snap_name), ('PID 100', None))
+        self.m.on_process_start(100, 10.1, 'C:\\app.exe')                # его запуск дошёл позже
+        self.m.process_pending()
+        self.assertEqual((old.path, old.started, old.ended, old.sent), ('C:\\app.exe', 10.1, 10.5, 10))
+
+    def test_snapshot_name_goes_to_process_the_snapshot_saw(self):
+        # запись заведена пакетом старого процесса; снимок в 11.5 застал уже новый (other.exe,
+        # создан в 11.4 — это сообщает Windows). Имя из снимка — нового процесса, а у старой
+        # записи по-прежнему можно узнать её собственный запуск
+        traffic(self.m, 100, '1.1.1.1', 443, 50000, sent=1, ts=10.96)
+        self.m.process_pending()
+        self.m.sync_processes({100: ('other.exe', 1)}, now=11.5)
+        old = proc_by_pid(self.m, 100)
+        self.m.fill_details(old.uid, {'path': 'C:\\other.exe', 'started': 11.4}, now=11.51)
+        new = proc_by_pid(self.m, 100)
+        self.assertEqual((old.name, old.snap_name, new.snap_name), ('PID 100', None, 'other.exe'))
+        self.m.on_process_start(100, 10.74, 'C:\\tool.exe')
+        self.m.process_pending()
+        self.assertEqual((old.path, old.started, old.sent), ('C:\\tool.exe', 10.74, 1))
+
+    def test_services_seen_stay_with_shared_svchost(self):
+        # отчёт 1.5, п. 4: служба остановилась, а общий svchost.exe работает дальше
+        self.m.sync_processes({500: ('svchost.exe', 1)}, now=1.0)
+        self.m.set_services({500: ['BITS', 'wuauserv']})
+        self.m.set_services({500: ['wuauserv']})
+        self.assertEqual(proc_by_pid(self.m, 500).services, 'BITS, wuauserv')
+
+    def test_svchost_name_learned_later_asks_for_services(self):
+        # отчёт 1.5, п. 4: запись заведена пакетом, имя svchost.exe узнаётся позже
+        for learn in ('details', 'snapshot', 'start'):
+            m = self._fresh()
+            traffic(m, 500, '1.1.1.1', 443, 50000, sent=10, ts=10.0)
+            m.process_pending()
+            m.set_services({})
+            self.assertFalse(m.want_services(), learn)
+            if learn == 'details':
+                m.fill_details(proc_by_pid(m, 500).uid, {'path': SVCHOST, 'started': 9.0}, now=10.5)
+            elif learn == 'snapshot':
+                m.sync_processes({500: ('svchost.exe', 1)}, now=10.5)
+            else:
+                m.on_process_start(500, 9.9, SVCHOST)
+                m.process_pending()
+            self.assertTrue(m.want_services(), learn)
 
     def test_group_views(self):
         for pid in (10, 11):
@@ -773,9 +956,10 @@ class RandomHistoriesTest(unittest.TestCase):
 
     Несколько процессов подряд получают один PID; события ETW доходят с задержкой и не по
     порядку, часть событий о запуске и завершении теряется, раз в 2 секунды делается снимок
-    процессов. Пока задержка событий меньше промежутка между процессами, каждый пакет должен
-    попасть в запись своего процесса. Пакеты экземпляра номер k имеют размер 1000**k, поэтому
-    по сумме байт записи видно, чьи пакеты и сколько в неё попало.
+    процессов. Каждый пакет должен попасть в запись своего процесса — и тогда, когда события
+    задерживаются дольше, чем длится промежуток между процессами (отчёт 1.5, п. 1): у каждого
+    процесса свой локальный порт, как у настоящих программ. Пакеты экземпляра номер k имеют
+    размер 1000**k, поэтому по сумме байт записи видно, чьи пакеты и сколько в неё попало.
     """
 
     PATHS = ('C:\\A\\app.exe', 'C:\\B\\app.exe', 'C:\\A\\tool.exe', 'C:\\C\\other.exe')
@@ -803,7 +987,8 @@ class RandomHistoriesTest(unittest.TestCase):
                 return k
         return None
 
-    def play(self, seed, gap, delay, life=(0.2, 6.0), details=True, lose_start=0.0, lose_stop=0.0):
+    def play(self, seed, gap, delay, life=(0.2, 6.0), details=True, lose_start=0.0, lose_stop=0.0,
+             own_ports=True):
         rng = random.Random(seed)
         truth = self.history(rng, gap, life)
         events = []
@@ -813,7 +998,7 @@ class RandomHistoriesTest(unittest.TestCase):
             if inst['stop'] is not None and rng.random() >= lose_stop:
                 events.append((inst['stop'] + rng.random() * delay, 'stop', inst['stop'], None))
             for ts in inst['packets']:
-                events.append((ts + rng.random() * delay, 'packet', ts, 1000 ** k))
+                events.append((ts + rng.random() * delay, 'packet', ts, (1000 ** k, k)))
         events.sort(key=lambda e: e[0])
         end = max([e[0] for e in events] + [truth[-1]['stop'] or truth[-1]['start']]) + 5.0
         m = Model()
@@ -828,7 +1013,9 @@ class RandomHistoriesTest(unittest.TestCase):
                 elif kind == 'stop':
                     m.on_process_stop(100, ts)
                 else:
-                    m.on_traffic(100, 'TCP', True, extra, '1.1.1.1', 443, '10.0.0.1', 50000, ts)
+                    size, k = extra
+                    m.on_traffic(100, 'TCP', True, size, '1.1.1.1', 443, '10.0.0.1',
+                                 50000 + k if own_ports else 50000, ts)
             m.process_pending()
             if tick >= next_snapshot:
                 next_snapshot = tick + 2.0
@@ -882,6 +1069,12 @@ class RandomHistoriesTest(unittest.TestCase):
             ('процессы живут 0.02–0.5 с', dict(gap=2.0, delay=1.5, life=(0.02, 0.5))),
             ('промежуток от 0.3 с, задержка до 0.25 с', dict(gap=0.3, delay=0.25)),
             ('то же, процессы живут 0.02–0.5 с', dict(gap=0.3, delay=0.25, life=(0.02, 0.5))),
+            ('промежуток от 0.05 с, задержка до 0.04 с', dict(gap=0.05, delay=0.04)),
+            ('задержка до 1 с дольше промежутка от 0.3 с', dict(gap=0.3, delay=1.0)),
+            ('задержка до 1.5 с, промежуток от 0.05 с, процессы живут 0.02–0.5 с',
+             dict(gap=0.05, delay=1.5, life=(0.02, 0.5))),
+            ('то же, один локальный порт у всех, но задержка меньше промежутка',
+             dict(gap=0.3, delay=0.25, life=(0.02, 0.5), own_ports=False)),
         )
         for label, options in regimes:
             for seed in range(150):
@@ -982,6 +1175,85 @@ class HistoryTest(unittest.TestCase):
             st.close()
             self.assertEqual(saved, sorted([('C:\\Old\\app.exe', 100.0, 10), (path, started, 20)]),
                              (path, started))
+
+    def test_system_and_processes_with_etw_start_time_continue(self):
+        # отчёт 1.5, п. 2: время System — время загрузки, его вычисляют, и оно «плавает»;
+        # в прошлый раз запись могла получить время из события о запуске (позже на мс)
+        cases = ((4, 'System', 'C:\\Windows\\System32\\ntoskrnl.exe', 1000.0, 1000.0156),
+                 (4, 'System', 'C:\\Windows\\System32\\ntoskrnl.exe', 1000.0, 1012.0),
+                 (50, 'app.exe', 'C:\\App\\app.exe', 100.01, 100.0))
+        for pid, name, path, before, now_started in cases:
+            m = Model()
+            m.resolve_names = False
+            m.load_history([{'id': 1, 'pid': pid, 'name': name, 'path': path, 'cmdline': '',
+                             'services': '', 'started': before, 'ended': None, 'first_seen': 1010.0,
+                             'last_seen': 1050.0, 'sent': 500, 'recv': 500, 'lo_sent': 0,
+                             'lo_recv': 0, 'endpoints': []}])
+            m.sync_processes({pid: (name, 0)}, now=1100.0)
+            for uid, _pid in m.pending_details():
+                m.fill_details(uid, {'path': path, 'started': now_started}, now=1100.0)
+            self.assertEqual((len(m.procs), m.by_pid[pid].uid, m.by_pid[pid].sent), (1, 1, 500),
+                             (pid, now_started))
+        # другая загрузка Windows — другая запись System
+        m = Model()
+        m.load_history([{'id': 1, 'pid': 4, 'name': 'System', 'path': '', 'cmdline': '',
+                         'services': '', 'started': 1000.0, 'ended': None, 'first_seen': 1010.0,
+                         'last_seen': 1050.0, 'sent': 5, 'recv': 5, 'lo_sent': 0, 'lo_recv': 0,
+                         'endpoints': []}])
+        m.sync_processes({4: ('System', 0)}, now=9000.0)
+        for uid, _pid in m.pending_details():
+            m.fill_details(uid, {'path': '', 'started': 8000.0}, now=9000.0)
+        self.assertEqual(len(m.procs), 2)
+
+    def test_reattached_process_keeps_inbound_connections(self):
+        # отчёт 1.5, п. 4: после перезапуска монитора принятое соединение остаётся входящим,
+        # даже если слушающего сокета уже нет
+        rows = [{'id': 1, 'pid': 201, 'name': 'server.exe', 'path': 'C:\\server.exe',
+                 'cmdline': '', 'services': '', 'started': 5.0, 'ended': None,
+                 'first_seen': 10.0, 'last_seen': 11.0, 'sent': 100, 'recv': 0,
+                 'lo_sent': 0, 'lo_recv': 0,
+                 'endpoints': [{'proc_id': 1, 'proto': 'TCP', 'ip': '10.0.0.8', 'port': 9000,
+                                'inbound': 1, 'host': '', 'sent': 100, 'recv': 0, 'psent': 1,
+                                'precv': 0, 'first_seen': 11.0, 'last_seen': 11.0}]}]
+        m = Model()
+        m.resolve_names = False
+        m.load_history(rows)
+        m.sync_processes({201: ('server.exe', 1)}, now=20.0)
+        m.sync_tcp([], now=20.0)
+        for uid, _pid in m.pending_details():
+            m.fill_details(uid, {'path': 'C:\\server.exe', 'started': 5.0}, now=20.0)
+        traffic(m, 201, '10.0.0.8', 60000, 9000, sent=50, ts=21.0)
+        m.process_pending()
+        self.assertEqual(list(m.by_pid[201].endpoints), [('TCP', '10.0.0.8', 9000, True)])
+
+    def test_moved_traffic_is_moved_in_history_too(self):
+        # пачка трафика, уже сохранённая у прежнего процесса, переписана новому: в истории
+        # у прежнего не остаётся ни адресата, ни записи без сети
+        m = Model()
+        m.resolve_names = False
+        m.on_process_start(100, 1.0, 'C:\\old.exe')
+        traffic(m, 100, '1.1.1.1', 443, 50000, sent=10, ts=2.0)
+        traffic(m, 100, '2.2.2.2', 443, 50001, sent=25, ts=3.3)
+        m.process_pending()
+        self._save(m)
+        m.on_process_stop(100, 3.0)
+        m.on_process_start(100, 3.2, 'C:\\new.exe')
+        m.process_pending()
+        self._save(m)
+        st = Storage(self.path)
+        saved = sorted((r['name'], r['sent'], sorted((e['ip'], e['sent']) for e in r['endpoints']))
+                       for r in st.load())
+        st.close()
+        self.assertEqual(saved, [('new.exe', 25, [('2.2.2.2', 25)]), ('old.exe', 10, [('1.1.1.1', 10)])])
+        # дошёл запуск mid.exe в 1.5: PID с 1.5 был у него, значит, old.exe завершился раньше,
+        # и пакет в 2.0 — его. У old.exe не остаётся сети, и в истории его больше нет
+        m.on_process_start(100, 1.5, 'C:\\mid.exe')
+        m.process_pending()
+        self._save(m)
+        st = Storage(self.path)
+        self.assertEqual(sorted((r['name'], r['sent'], len(r['endpoints'])) for r in st.load()),
+                         [('mid.exe', 10, 1), ('new.exe', 25, 1)])
+        st.close()
 
     def test_failed_save_keeps_deletions(self):
         # отчёт, п. 4: после сбоя записи и повторной удачной записи в БД нет лишней строки

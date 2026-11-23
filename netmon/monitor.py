@@ -130,6 +130,7 @@ class Monitor:
                     if self.storage is not None:
                         self.storage.clear()
                     next_snapshot = 0.0
+                    self._services_at = 0.0    # службы svchost.exe — сразу, а не через 30 с
                 self.model.process_pending()
                 now = time.time()
                 if now >= next_snapshot and not stopping:

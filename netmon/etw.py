@@ -366,10 +366,12 @@ def decode_payload(props, data, ptr_size):
             if count is None:
                 break
         length = prop.length
+        sized = bool(length)          # длина задана: строка не до нуля, двоичное поле — ровно столько
         if prop.flags & PROPERTY_PARAM_LENGTH:
             length = _ref_value(values, prop.length)
             if length is None:
                 break
+            sized = True              # длина из другого поля, в том числе 0 — пустое значение
         it = prop.intype
         if count != 1:
             size = fixed_size(it, length, prop.outtype, ptr_size)
@@ -378,7 +380,7 @@ def decode_payload(props, data, ptr_size):
             value = data[off:off + size * count]
             off += size * count
         elif it == TDH_INTYPE_UNICODESTRING:
-            if length:
+            if sized:
                 end = nxt = min(off + 2 * length, n)
             else:
                 end = _find_wnull(data, off)
@@ -389,7 +391,7 @@ def decode_payload(props, data, ptr_size):
             value = data[off:end].decode('utf-16-le', 'replace').rstrip('\x00')
             off = nxt
         elif it == TDH_INTYPE_ANSISTRING:
-            if length:
+            if sized:
                 end = nxt = min(off + length, n)
             else:
                 end = data.find(b'\x00', off)
@@ -415,7 +417,10 @@ def decode_payload(props, data, ptr_size):
             value = data[start:end]
             off = end
         else:
-            size = fixed_size(it, length, prop.outtype, ptr_size)
+            if it == TDH_INTYPE_BINARY and sized:
+                size = length
+            else:
+                size = fixed_size(it, length, prop.outtype, ptr_size)
             if size is None or off + size > n:
                 break
             raw = data[off:off + size]

@@ -55,13 +55,29 @@ class FirewallError(Exception):
 
 
 _ENV_RE = re.compile(r'%([^%]+)%')
+_ABS_PATH = re.compile(r'^(?:[a-zA-Z]:\\|\\\\[^\\]+\\[^\\]+\\)')   # C:\… или \\сервер\ресурс\…
+
+
+def clean_path(path):
+    """Путь к exe в том виде, в каком он попадает в правило: без кавычек и пробелов по краям,
+    с обратными косыми чертами и раскрытыми переменными (%SystemRoot%, %LOCALAPPDATA%).
+
+    Переменные раскрываются сразу: служба брандмауэра раскрыла бы их по-своему, а у
+    %LOCALAPPDATA% и подобных у неё значения не те, что у пользователя.
+    """
+    path = (path or '').strip().strip('"').strip()
+    path = _ENV_RE.sub(lambda m: os.environ.get(m.group(1), os.environ.get(m.group(1).upper(), m.group(0))), path)
+    return path.replace('/', '\\')
+
+
+def is_full_path(path):
+    """Путь с буквой диска или сетевой (\\\\сервер\\ресурс\\…), а не относительный и не «\\Windows\\…»."""
+    return bool(_ABS_PATH.match(clean_path(path)))
 
 
 def normalize_path(path):
-    """Путь для сравнения: переменные %SystemRoot% раскрыты, регистр не важен."""
-    path = (path or '').strip().strip('"')
-    path = _ENV_RE.sub(lambda m: os.environ.get(m.group(1), os.environ.get(m.group(1).upper(), m.group(0))), path)
-    return path.replace('/', '\\').lower()
+    """Путь для сравнения: переменные раскрыты, регистр не важен."""
+    return clean_path(path).lower()
 
 
 def split_services(text):
@@ -86,6 +102,7 @@ def rule_display_name(program, service, direction):
 
 def block_plan(program, services=(), directions=('out', 'in')):
     """Описания правил, которые нужно создать."""
+    program = clean_path(program)
     created = time.strftime('%d.%m.%Y %H:%M')
     plan = []
     for service in list(services) or ['']:
@@ -137,14 +154,15 @@ def check_services(services):
 
 def check_blockable(program, services, pid=None):
     """Текст ошибки, если такую программу запрещать нельзя, иначе None."""
-    if pid in (0, 4) or (program or '').strip().lower() == 'system':
+    path = clean_path(program)
+    if pid in (0, 4) or path.lower() == 'system' or ntpath.basename(path).lower() == 'ntoskrnl.exe':
         return ('Это ядро Windows (System). Через него идут общие папки и служебный '
                 'трафик; запрет сломал бы сеть, поэтому он недоступен.')
-    if not (program or '').strip():
+    if not path:
         return 'Не указан файл программы. Выберите .exe кнопкой «Обзор…».'
-    if not ntpath.isabs(program.strip().strip('"')):
+    if not is_full_path(path):
         return 'Нужен полный путь к файлу программы, например C:\\Program Files\\...\\app.exe.'
-    if ntpath.basename(normalize_path(program)) == 'svchost.exe' and not services:
+    if ntpath.basename(path).lower() == 'svchost.exe' and not services:
         return ('svchost.exe — общий процесс для служб Windows. Запрет его целиком отрежет от '
                 'сети почти всю систему. Укажите, каким службам запретить сеть.')
     return check_services(services)
@@ -700,9 +718,16 @@ class FirewallManager:
         with self._lock:
             index = self._index
             known = self.state_known
+            loaded = self.loaded
+            failed = bool(self.error)
             uncertain = set(self._uncertain)
+        if not loaded:
+            # правила ещё ни разу не прочитаны: пока читаются — пусто, если чтение не удалось —
+            # неизвестно (запрет может и быть)
+            return ('unknown', 'неизвестно') if failed else ('', '')
         path = normalize_path(program)
-        keys = {(path, '')} | {(path, s.lower()) for s in split_services(services_text)}
+        services = split_services(services_text)
+        keys = {(path, '')} | {(path, s.lower()) for s in services}
         if keys & uncertain or (not known and any(k in index for k in keys)):
             return 'unknown', 'неизвестно'
         whole = index.get((path, ''))
@@ -713,14 +738,18 @@ class FirewallManager:
             if whole.enabled is False:
                 return 'allowed', 'запрет выключен'
             return 'partial', 'частично'
-        services = split_services(services_text)
-        blocked = [s for s in services
-                   if getattr(index.get((path, s.lower())), 'enabled', None) is True]
-        if blocked and len(blocked) == len(services):
+        found = [(s, index[(path, s.lower())]) for s in services if (path, s.lower()) in index]
+        if not found:
+            return '', ''
+        blocked = [s for s, e in found if e.enabled is True]
+        if len(blocked) == len(services):
             return 'blocked', 'запрещена'
         if blocked:
             return 'partial', 'частично: %s' % ', '.join(blocked)
-        return '', ''
+        if all(e.enabled is False for _s, e in found):
+            return 'allowed', 'запрет выключен'
+        # у какой-то службы включено одно правило из двух
+        return 'partial', 'частично: %s' % ', '.join(s for s, e in found if e.enabled is None)
 
     def entries_for(self, program, services_text=''):
         """Строки списка, относящиеся к программе (для «Разрешить доступ в сеть»)."""
